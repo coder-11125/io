@@ -1,7 +1,8 @@
-# Force GitHub to detect this as a Rust project
+# Force GitHub linguist to count Rust files
 *.rs linguist-language=Rust
+*.rs linguist-detectable=true
 
 # Exclude non-code from language stats
-*.md linguist-documentation
-*.toml linguist-data
-assets/* linguist-documentation
+*.md linguist-documentation=true
+*.toml linguist-documentation=true
+assets/* linguist-documentation=true
