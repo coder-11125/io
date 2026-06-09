@@ -1,0 +1,9 @@
+target/
+Cargo.lock
+.idea/
+.vscode/
+.omc/
+.claude/
+.DS_Store
+node_modules/
+dist/

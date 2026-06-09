@@ -1,0 +1,156 @@
+use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use crate::config::PermissionConfig;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermissionLevel {
+    Allow,
+    Prompt,
+    Deny,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionRule {
+    pub tool_name: Option<String>,
+    pub command_pattern: Option<String>,
+    pub level: PermissionLevel,
+}
+
+pub struct PermissionChecker {
+    mode: PermissionLevel,
+    allowlist: HashSet<String>,
+    denylist: HashSet<String>,
+}
+
+impl PermissionChecker {
+    pub fn new(mode_str: &str) -> Self {
+        let mode = match mode_str {
+            "allow" => PermissionLevel::Allow,
+            "deny" => PermissionLevel::Deny,
+            _ => PermissionLevel::Prompt,
+        };
+
+        Self { mode, allowlist: HashSet::new(), denylist: HashSet::new() }
+    }
+
+    pub fn add_allow(&mut self, pattern: String) {
+        self.allowlist.insert(pattern);
+    }
+
+    pub fn add_deny(&mut self, pattern: String) {
+        self.denylist.insert(pattern);
+    }
+
+    pub fn check_tool(&self, tool_name: &str, _input: &serde_json::Value) -> bool {
+        match self.mode {
+            PermissionLevel::Allow => true,
+            PermissionLevel::Deny => false,
+            PermissionLevel::Prompt => {
+                if self.denylist.contains(tool_name) { return false; }
+                if self.allowlist.contains(tool_name) { return true; }
+                true
+            }
+        }
+    }
+
+    pub fn check_command(&self, command: &str) -> PermissionLevel {
+        let tokens = shell_tokens(command);
+        for denied in &self.denylist {
+            if tokens.iter().any(|t| t == denied) { return PermissionLevel::Deny; }
+        }
+        for allowed in &self.allowlist {
+            if tokens.iter().any(|t| t == allowed) { return PermissionLevel::Allow; }
+        }
+        self.mode
+    }
+
+    pub fn mode(&self) -> PermissionLevel {
+        self.mode
+    }
+}
+
+/// Extracts command basenames from a shell command string for deny/allow matching.
+/// Splits on shell metacharacters, strips backslash escapes, and resolves basenames
+/// so that `r\m`, `/bin/rm`, and `rm` all produce the token `rm`.
+fn shell_tokens(command: &str) -> Vec<String> {
+    command
+        .split(|c: char| matches!(c, ' ' | '|' | ';' | '&' | '(' | ')' | '`' | '\n' | '\t' | '{' | '}'))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            // Strip backslash escapes (r\m → rm)
+            let unescaped: String = t.chars().filter(|&c| c != '\\').collect();
+            // Strip leading $( for command substitution
+            let cleaned = unescaped.trim_start_matches("$(").trim_end_matches(')');
+            // Return basename so /bin/rm → rm
+            std::path::Path::new(cleaned)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(cleaned)
+                .to_string()
+        })
+        .collect()
+}
+
+impl From<&PermissionConfig> for PermissionChecker {
+    fn from(config: &PermissionConfig) -> Self {
+        let mut checker = PermissionChecker::new(&config.default);
+        for cmd in &config.allowed_commands { checker.add_allow(cmd.clone()); }
+        for cmd in &config.denied_commands { checker.add_deny(cmd.clone()); }
+        checker
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allow_mode_permits_all_tools() {
+        let checker = PermissionChecker::new("allow");
+        assert!(checker.check_tool("bash", &serde_json::json!({})));
+        assert!(checker.check_tool("read", &serde_json::json!({})));
+    }
+
+    #[test]
+    fn deny_mode_blocks_all_tools() {
+        let checker = PermissionChecker::new("deny");
+        assert!(!checker.check_tool("bash", &serde_json::json!({})));
+        assert!(!checker.check_tool("read", &serde_json::json!({})));
+    }
+
+    #[test]
+    fn prompt_mode_allows_by_default() {
+        let checker = PermissionChecker::new("prompt");
+        assert!(checker.check_tool("read", &serde_json::json!({})));
+    }
+
+    #[test]
+    fn denylist_blocks_specific_tool_in_prompt_mode() {
+        let mut checker = PermissionChecker::new("prompt");
+        checker.add_deny("bash".to_string());
+        assert!(!checker.check_tool("bash", &serde_json::json!({})));
+        assert!(checker.check_tool("read", &serde_json::json!({})));
+    }
+
+    #[test]
+    fn check_command_deny_matches_basename() {
+        let mut checker = PermissionChecker::new("prompt");
+        checker.add_deny("rm".to_string());
+        assert_eq!(checker.check_command("rm -rf /tmp/x"), PermissionLevel::Deny);
+        assert_eq!(checker.check_command("/bin/rm -rf /tmp/x"), PermissionLevel::Deny);
+    }
+
+    #[test]
+    fn check_command_allow_matches_token() {
+        let mut checker = PermissionChecker::new("prompt");
+        checker.add_allow("echo".to_string());
+        assert_eq!(checker.check_command("echo hello"), PermissionLevel::Allow);
+    }
+
+    #[test]
+    fn check_command_falls_back_to_mode() {
+        let checker = PermissionChecker::new("prompt");
+        assert_eq!(checker.check_command("ls -la"), PermissionLevel::Prompt);
+    }
+}
