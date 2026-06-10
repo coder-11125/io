@@ -21,7 +21,8 @@ pub fn config() -> AgentConfig {
 
             Be precise: cite file paths and line numbers. When summarising, focus on
             structure and relationships rather than re-printing code verbatim.
-        "}.to_string(),
+        "}
+        .to_string(),
         tool_access: ToolAccess::only(&["read", "glob", "grep"]),
         suggested_model: None,
         single_shot: false,

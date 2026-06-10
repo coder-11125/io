@@ -31,7 +31,8 @@ pub fn config() -> AgentConfig {
               why.
             - If you spot a bug while reading the code, report it separately from the
               coverage analysis.
-        "}.to_string(),
+        "}
+        .to_string(),
         tool_access: ToolAccess::only(&["read", "glob", "grep"]),
         suggested_model: None,
         single_shot: false,

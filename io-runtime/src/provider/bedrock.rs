@@ -1,7 +1,7 @@
 use super::anthropic::{build_messages, parse_and_convert_response};
 use super::{CompletionModel, CompletionRequest, CompletionResponse, StreamEvent};
-use hmac::{Hmac, Mac};
 use crate::config::BedrockConfig;
+use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -12,7 +12,11 @@ pub struct BedrockProvider {
     client: reqwest::Client,
 }
 
-struct AwsCredentials { access_key_id: String, secret_access_key: String, session_token: Option<String> }
+struct AwsCredentials {
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: Option<String>,
+}
 
 impl BedrockProvider {
     pub fn new(config: BedrockConfig) -> Self {
@@ -24,7 +28,9 @@ impl BedrockProvider {
     }
 
     fn region(&self) -> String {
-        self.config.region.clone()
+        self.config
+            .region
+            .clone()
             .or_else(|| std::env::var("AWS_REGION").ok())
             .unwrap_or_else(|| "us-east-1".to_string())
     }
@@ -35,7 +41,11 @@ impl BedrockProvider {
         let secret_access_key = std::env::var("AWS_SECRET_ACCESS_KEY")
             .map_err(|_| anyhow::anyhow!("missing AWS_SECRET_ACCESS_KEY environment variable"))?;
         let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
-        Ok(AwsCredentials { access_key_id, secret_access_key, session_token })
+        Ok(AwsCredentials {
+            access_key_id,
+            secret_access_key,
+            session_token,
+        })
     }
 }
 
@@ -53,8 +63,12 @@ fn sha256_hex(data: &[u8]) -> String {
 
 #[async_trait::async_trait]
 impl CompletionModel for BedrockProvider {
-    fn provider_name(&self) -> &'static str { "bedrock" }
-    fn context_window(&self) -> u64 { super::context_window_for_model(&self.config.model) }
+    fn provider_name(&self) -> &'static str {
+        "bedrock"
+    }
+    fn context_window(&self) -> u64 {
+        super::context_window_for_model(&self.config.model)
+    }
 
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse> {
         let creds = self.credentials()?;
@@ -67,16 +81,21 @@ impl CompletionModel for BedrockProvider {
 
         let mut body = serde_json::json!({
             "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": request.max_tokens.unwrap_or(8192),
+            "max_tokens": request.max_tokens.unwrap_or(16384),
             "messages": build_messages(&request),
         });
-        if let Some(temp) = request.temperature { body["temperature"] = serde_json::json!(temp); }
+        if let Some(temp) = request.temperature {
+            body["temperature"] = serde_json::json!(temp);
+        }
         if !request.tools.is_empty() {
-            body["tools"] = serde_json::json!(request.tools.iter().map(|t| serde_json::json!({
+            body["tools"] =
+                serde_json::json!(request.tools.iter().map(|t| serde_json::json!({
                 "name": t.name, "description": t.description, "input_schema": t.input_schema,
             })).collect::<Vec<_>>());
         }
-        if let Some(ref system) = request.system_prompt { body["system"] = serde_json::json!(system); }
+        if let Some(ref system) = request.system_prompt {
+            body["system"] = serde_json::json!(system);
+        }
 
         let payload = serde_json::to_vec(&body)?;
         let payload_hash = sha256_hex(&payload);
@@ -85,15 +104,23 @@ impl CompletionModel for BedrockProvider {
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = now.format("%Y%m%d").to_string();
 
-        let canonical_uri = path.split('/').map(|seg| urlencode_segment(seg)).collect::<Vec<_>>().join("/");
+        let canonical_uri = path
+            .split('/')
+            .map(urlencode_segment)
+            .collect::<Vec<_>>()
+            .join("/");
         let canonical_querystring = "";
 
-        let mut signed_headers_list = vec!["content-type", "host", "x-amz-content-sha256", "x-amz-date"];
+        let mut signed_headers_list =
+            vec!["content-type", "host", "x-amz-content-sha256", "x-amz-date"];
         let mut canonical_headers = format!(
             "content-type:application/json\nhost:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
         );
         if creds.session_token.is_some() {
-            canonical_headers.push_str(&format!("x-amz-security-token:{}\n", creds.session_token.as_deref().unwrap()));
+            canonical_headers.push_str(&format!(
+                "x-amz-security-token:{}\n",
+                creds.session_token.as_deref().unwrap()
+            ));
             signed_headers_list.push("x-amz-security-token");
         }
         let signed_headers = signed_headers_list.join(";");
@@ -109,7 +136,10 @@ impl CompletionModel for BedrockProvider {
             sha256_hex(canonical_request.as_bytes())
         );
 
-        let k_date = hmac(format!("AWS4{}", creds.secret_access_key).as_bytes(), date_stamp.as_bytes());
+        let k_date = hmac(
+            format!("AWS4{}", creds.secret_access_key).as_bytes(),
+            date_stamp.as_bytes(),
+        );
         let k_region = hmac(&k_date, region.as_bytes());
         let k_service = hmac(&k_region, service.as_bytes());
         let k_signing = hmac(&k_service, b"aws4_request");
@@ -120,7 +150,8 @@ impl CompletionModel for BedrockProvider {
             creds.access_key_id
         );
 
-        let mut req = self.client
+        let mut req = self
+            .client
             .post(&url)
             .header("content-type", "application/json")
             .header("host", &host)
@@ -143,7 +174,10 @@ impl CompletionModel for BedrockProvider {
         parse_and_convert_response(&resp.text().await?)
     }
 
-    async fn complete_stream(&self, _request: CompletionRequest) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<StreamEvent>>> {
+    async fn complete_stream(
+        &self,
+        _request: CompletionRequest,
+    ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<StreamEvent>>> {
         anyhow::bail!("Bedrock streaming not yet implemented")
     }
 }
@@ -152,7 +186,9 @@ fn urlencode_segment(seg: &str) -> String {
     let mut out = String::new();
     for byte in seg.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }

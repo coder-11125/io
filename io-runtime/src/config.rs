@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -73,8 +73,12 @@ impl Default for OpenAIConfig {
     }
 }
 
-fn default_openai_model() -> String { "gpt-4o".to_string() }
-fn default_openai_base_url() -> String { "https://api.openai.com/v1".to_string() }
+fn default_openai_model() -> String {
+    "gpt-4o".to_string()
+}
+fn default_openai_base_url() -> String {
+    "https://api.openai.com/v1".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicConfig {
@@ -98,8 +102,12 @@ impl Default for AnthropicConfig {
     }
 }
 
-fn default_anthropic_model() -> String { "claude-sonnet-4-20250514".to_string() }
-fn default_anthropic_base_url() -> String { "https://api.anthropic.com/v1".to_string() }
+fn default_anthropic_model() -> String {
+    "claude-sonnet-4-20250514".to_string()
+}
+fn default_anthropic_base_url() -> String {
+    "https://api.anthropic.com/v1".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeminiConfig {
@@ -123,8 +131,12 @@ impl Default for GeminiConfig {
     }
 }
 
-fn default_gemini_model() -> String { "gemini-2.5-pro".to_string() }
-fn default_gemini_base_url() -> String { "https://generativelanguage.googleapis.com/v1beta".to_string() }
+fn default_gemini_model() -> String {
+    "gemini-2.5-pro".to_string()
+}
+fn default_gemini_base_url() -> String {
+    "https://generativelanguage.googleapis.com/v1beta".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroqConfig {
@@ -137,11 +149,17 @@ pub struct GroqConfig {
 
 impl Default for GroqConfig {
     fn default() -> Self {
-        Self { model: default_groq_model(), api_key_env: None, api_key: None }
+        Self {
+            model: default_groq_model(),
+            api_key_env: None,
+            api_key: None,
+        }
     }
 }
 
-fn default_groq_model() -> String { "llama-3.3-70b-versatile".to_string() }
+fn default_groq_model() -> String {
+    "llama-3.3-70b-versatile".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OllamaConfig {
@@ -152,11 +170,16 @@ pub struct OllamaConfig {
 
 impl Default for OllamaConfig {
     fn default() -> Self {
-        Self { model: default_ollama_model(), endpoint: None }
+        Self {
+            model: default_ollama_model(),
+            endpoint: None,
+        }
     }
 }
 
-fn default_ollama_model() -> String { "llama3.2".to_string() }
+fn default_ollama_model() -> String {
+    "llama3.2".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AzureConfig {
@@ -182,8 +205,12 @@ impl Default for AzureConfig {
     }
 }
 
-fn default_azure_deployment() -> String { "gpt-4o".to_string() }
-fn default_azure_api_version() -> String { "2024-12-01-preview".to_string() }
+fn default_azure_deployment() -> String {
+    "gpt-4o".to_string()
+}
+fn default_azure_api_version() -> String {
+    "2024-12-01-preview".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BedrockConfig {
@@ -194,11 +221,16 @@ pub struct BedrockConfig {
 
 impl Default for BedrockConfig {
     fn default() -> Self {
-        Self { model: default_bedrock_model(), region: None }
+        Self {
+            model: default_bedrock_model(),
+            region: None,
+        }
     }
 }
 
-fn default_bedrock_model() -> String { "amazon.nova-pro-v1:0".to_string() }
+fn default_bedrock_model() -> String {
+    "amazon.nova-pro-v1:0".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MistralConfig {
@@ -211,11 +243,17 @@ pub struct MistralConfig {
 
 impl Default for MistralConfig {
     fn default() -> Self {
-        Self { model: default_mistral_model(), api_key_env: None, api_key: None }
+        Self {
+            model: default_mistral_model(),
+            api_key_env: None,
+            api_key: None,
+        }
     }
 }
 
-fn default_mistral_model() -> String { "mistral-large-latest".to_string() }
+fn default_mistral_model() -> String {
+    "mistral-large-latest".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeepSeekConfig {
@@ -228,11 +266,17 @@ pub struct DeepSeekConfig {
 
 impl Default for DeepSeekConfig {
     fn default() -> Self {
-        Self { model: default_deepseek_model(), api_key_env: None, api_key: None }
+        Self {
+            model: default_deepseek_model(),
+            api_key_env: None,
+            api_key: None,
+        }
     }
 }
 
-fn default_deepseek_model() -> String { "deepseek-chat".to_string() }
+fn default_deepseek_model() -> String {
+    "deepseek-chat".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenRouterConfig {
@@ -245,11 +289,17 @@ pub struct OpenRouterConfig {
 
 impl Default for OpenRouterConfig {
     fn default() -> Self {
-        Self { model: default_openrouter_model(), api_key_env: None, api_key: None }
+        Self {
+            model: default_openrouter_model(),
+            api_key_env: None,
+            api_key: None,
+        }
     }
 }
 
-fn default_openrouter_model() -> String { "openai/gpt-4o".to_string() }
+fn default_openrouter_model() -> String {
+    "openai/gpt-4o".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct XAIConfig {
@@ -262,11 +312,17 @@ pub struct XAIConfig {
 
 impl Default for XAIConfig {
     fn default() -> Self {
-        Self { model: default_xai_model(), api_key_env: None, api_key: None }
+        Self {
+            model: default_xai_model(),
+            api_key_env: None,
+            api_key: None,
+        }
     }
 }
 
-fn default_xai_model() -> String { "grok-3-beta".to_string() }
+fn default_xai_model() -> String {
+    "grok-3-beta".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCodeGoConfig {
@@ -279,11 +335,17 @@ pub struct OpenCodeGoConfig {
 
 impl Default for OpenCodeGoConfig {
     fn default() -> Self {
-        Self { model: default_opencode_go_model(), api_key_env: None, api_key: None }
+        Self {
+            model: default_opencode_go_model(),
+            api_key_env: None,
+            api_key: None,
+        }
     }
 }
 
-fn default_opencode_go_model() -> String { "deepseek-v3".to_string() }
+fn default_opencode_go_model() -> String {
+    "deepseek-v3".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenCodeZenConfig {
@@ -296,11 +358,17 @@ pub struct OpenCodeZenConfig {
 
 impl Default for OpenCodeZenConfig {
     fn default() -> Self {
-        Self { model: default_opencode_zen_model(), api_key_env: None, api_key: None }
+        Self {
+            model: default_opencode_zen_model(),
+            api_key_env: None,
+            api_key: None,
+        }
     }
 }
 
-fn default_opencode_zen_model() -> String { "opencode/deepseek-v3".to_string() }
+fn default_opencode_zen_model() -> String {
+    "opencode/deepseek-v3".to_string()
+}
 
 // ── Session / Permission configs ──────────────────────────────────────────────
 
@@ -316,9 +384,15 @@ pub struct SessionConfig {
     pub max_tokens: u32,
 }
 
-fn default_true() -> bool { true }
-fn default_max_turns() -> usize { 100 }
-fn default_max_tokens() -> u32 { 8192 }
+fn default_true() -> bool {
+    true
+}
+fn default_max_turns() -> usize {
+    100
+}
+fn default_max_tokens() -> u32 {
+    16384
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionConfig {
@@ -330,7 +404,9 @@ pub struct PermissionConfig {
     pub denied_commands: Vec<String>,
 }
 
-fn default_permission_mode() -> String { "prompt".to_string() }
+fn default_permission_mode() -> String {
+    "prompt".to_string()
+}
 
 impl Default for Config {
     fn default() -> Self {
@@ -359,7 +435,12 @@ impl Default for Config {
 
 impl Default for SessionConfig {
     fn default() -> Self {
-        Self { auto_compact: true, memory_enabled: true, max_turns: 100, max_tokens: 8192 }
+        Self {
+            auto_compact: true,
+            memory_enabled: true,
+            max_turns: 100,
+            max_tokens: 16384,
+        }
     }
 }
 

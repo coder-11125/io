@@ -1,23 +1,23 @@
-use crate::connect::{PROVIDERS, fetch_openai_models, fetch_anthropic_models, fetch_gemini_models};
+use crate::connect::{fetch_anthropic_models, fetch_gemini_models, fetch_openai_models, PROVIDERS};
 use io_runtime::config::{Config, KeyStore};
 
 fn model_for<'a>(config: &'a Config, provider_id: &str) -> &'a str {
     let p = &config.provider;
     let m: Option<&str> = match provider_id {
-        "openai"       => p.openai.as_ref().map(|c| c.model.as_str()),
-        "anthropic"    => p.anthropic.as_ref().map(|c| c.model.as_str()),
-        "gemini"       => p.gemini.as_ref().map(|c| c.model.as_str()),
-        "groq"         => p.groq.as_ref().map(|c| c.model.as_str()),
-        "ollama"       => p.ollama.as_ref().map(|c| c.model.as_str()),
-        "azure"        => p.azure.as_ref().map(|c| c.deployment.as_str()),
-        "bedrock"      => p.bedrock.as_ref().map(|c| c.model.as_str()),
-        "mistral"      => p.mistral.as_ref().map(|c| c.model.as_str()),
-        "deepseek"     => p.deepseek.as_ref().map(|c| c.model.as_str()),
-        "openrouter"   => p.openrouter.as_ref().map(|c| c.model.as_str()),
-        "xai"          => p.xai.as_ref().map(|c| c.model.as_str()),
-        "opencode_go"  => p.opencode_go.as_ref().map(|c| c.model.as_str()),
+        "openai" => p.openai.as_ref().map(|c| c.model.as_str()),
+        "anthropic" => p.anthropic.as_ref().map(|c| c.model.as_str()),
+        "gemini" => p.gemini.as_ref().map(|c| c.model.as_str()),
+        "groq" => p.groq.as_ref().map(|c| c.model.as_str()),
+        "ollama" => p.ollama.as_ref().map(|c| c.model.as_str()),
+        "azure" => p.azure.as_ref().map(|c| c.deployment.as_str()),
+        "bedrock" => p.bedrock.as_ref().map(|c| c.model.as_str()),
+        "mistral" => p.mistral.as_ref().map(|c| c.model.as_str()),
+        "deepseek" => p.deepseek.as_ref().map(|c| c.model.as_str()),
+        "openrouter" => p.openrouter.as_ref().map(|c| c.model.as_str()),
+        "xai" => p.xai.as_ref().map(|c| c.model.as_str()),
+        "opencode_go" => p.opencode_go.as_ref().map(|c| c.model.as_str()),
         "opencode_zen" => p.opencode_zen.as_ref().map(|c| c.model.as_str()),
-        _              => None,
+        _ => None,
     };
     m.unwrap_or("")
 }
@@ -27,20 +27,24 @@ async fn fetch_for(provider_id: &'static str, config: Config, keys: KeyStore) ->
     let p = &config.provider;
 
     match provider_id {
-        "openai"      => fetch_openai_models("https://api.openai.com/v1", &key).await,
-        "anthropic"   => fetch_anthropic_models(&key).await,
-        "gemini"      => fetch_gemini_models(&key).await,
-        "groq"        => fetch_openai_models("https://api.groq.com/openai/v1", &key).await,
+        "openai" => fetch_openai_models("https://api.openai.com/v1", &key).await,
+        "anthropic" => fetch_anthropic_models(&key).await,
+        "gemini" => fetch_gemini_models(&key).await,
+        "groq" => fetch_openai_models("https://api.groq.com/openai/v1", &key).await,
         "ollama" => {
-            let ep = p.ollama.as_ref().and_then(|c| c.endpoint.as_deref())
-                .unwrap_or("http://localhost:11434/v1").to_string();
+            let ep = p
+                .ollama
+                .as_ref()
+                .and_then(|c| c.endpoint.as_deref())
+                .unwrap_or("http://localhost:11434/v1")
+                .to_string();
             fetch_openai_models(&ep, "").await
         }
-        "mistral"      => fetch_openai_models("https://api.mistral.ai/v1", &key).await,
-        "deepseek"     => fetch_openai_models("https://api.deepseek.com/v1", &key).await,
-        "openrouter"   => fetch_openai_models("https://openrouter.ai/api/v1", &key).await,
-        "xai"          => fetch_openai_models("https://api.x.ai/v1", &key).await,
-        "opencode_go"  => fetch_openai_models("https://opencode.ai/zen/go/v1", &key).await,
+        "mistral" => fetch_openai_models("https://api.mistral.ai/v1", &key).await,
+        "deepseek" => fetch_openai_models("https://api.deepseek.com/v1", &key).await,
+        "openrouter" => fetch_openai_models("https://openrouter.ai/api/v1", &key).await,
+        "xai" => fetch_openai_models("https://api.x.ai/v1", &key).await,
+        "opencode_go" => fetch_openai_models("https://opencode.ai/zen/go/v1", &key).await,
         "opencode_zen" => fetch_openai_models("https://opencode.ai/zen/v1", &key).await,
         _ => vec![],
     }
@@ -50,19 +54,45 @@ fn set_model(config: &mut Config, provider_id: &str, model_id: &str) {
     let m = model_id.to_string();
     let p = &mut config.provider;
     match provider_id {
-        "openai"       => { p.openai.get_or_insert_with(Default::default).model = m; }
-        "anthropic"    => { p.anthropic.get_or_insert_with(Default::default).model = m; }
-        "gemini"       => { p.gemini.get_or_insert_with(Default::default).model = m; }
-        "groq"         => { p.groq.get_or_insert_with(Default::default).model = m; }
-        "ollama"       => { p.ollama.get_or_insert_with(Default::default).model = m; }
-        "azure"        => { p.azure.get_or_insert_with(Default::default).deployment = m; }
-        "bedrock"      => { p.bedrock.get_or_insert_with(Default::default).model = m; }
-        "mistral"      => { p.mistral.get_or_insert_with(Default::default).model = m; }
-        "deepseek"     => { p.deepseek.get_or_insert_with(Default::default).model = m; }
-        "openrouter"   => { p.openrouter.get_or_insert_with(Default::default).model = m; }
-        "xai"          => { p.xai.get_or_insert_with(Default::default).model = m; }
-        "opencode_go"  => { p.opencode_go.get_or_insert_with(Default::default).model = m; }
-        "opencode_zen" => { p.opencode_zen.get_or_insert_with(Default::default).model = m; }
+        "openai" => {
+            p.openai.get_or_insert_with(Default::default).model = m;
+        }
+        "anthropic" => {
+            p.anthropic.get_or_insert_with(Default::default).model = m;
+        }
+        "gemini" => {
+            p.gemini.get_or_insert_with(Default::default).model = m;
+        }
+        "groq" => {
+            p.groq.get_or_insert_with(Default::default).model = m;
+        }
+        "ollama" => {
+            p.ollama.get_or_insert_with(Default::default).model = m;
+        }
+        "azure" => {
+            p.azure.get_or_insert_with(Default::default).deployment = m;
+        }
+        "bedrock" => {
+            p.bedrock.get_or_insert_with(Default::default).model = m;
+        }
+        "mistral" => {
+            p.mistral.get_or_insert_with(Default::default).model = m;
+        }
+        "deepseek" => {
+            p.deepseek.get_or_insert_with(Default::default).model = m;
+        }
+        "openrouter" => {
+            p.openrouter.get_or_insert_with(Default::default).model = m;
+        }
+        "xai" => {
+            p.xai.get_or_insert_with(Default::default).model = m;
+        }
+        "opencode_go" => {
+            p.opencode_go.get_or_insert_with(Default::default).model = m;
+        }
+        "opencode_zen" => {
+            p.opencode_zen.get_or_insert_with(Default::default).model = m;
+        }
         _ => {}
     }
 }
@@ -92,17 +122,22 @@ pub async fn run() -> anyhow::Result<()> {
     print!("\n  Fetching models...");
     std::io::stdout().flush().ok();
 
-    let handles: Vec<_> = available.iter().map(|&(pid, plabel)| {
-        let config_c = config.clone();
-        let keys_c = keys.clone();
-        tokio::spawn(async move {
-            let models = tokio::time::timeout(
-                std::time::Duration::from_secs(4),
-                fetch_for(pid, config_c, keys_c),
-            ).await.unwrap_or_default();
-            (pid, plabel, models)
+    let handles: Vec<_> = available
+        .iter()
+        .map(|&(pid, plabel)| {
+            let config_c = config.clone();
+            let keys_c = keys.clone();
+            tokio::spawn(async move {
+                let models = tokio::time::timeout(
+                    std::time::Duration::from_secs(4),
+                    fetch_for(pid, config_c, keys_c),
+                )
+                .await
+                .unwrap_or_default();
+                (pid, plabel, models)
+            })
         })
-    }).collect();
+        .collect();
 
     let mut entries: Vec<(String, &'static str, &'static str)> = vec![];
     for h in handles {
@@ -128,9 +163,9 @@ pub async fn run() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let current_pos = entries.iter().position(|(mid, pid, _)| {
-        *pid == active_provider.as_str() && mid == &active_model
-    });
+    let current_pos = entries
+        .iter()
+        .position(|(mid, pid, _)| *pid == active_provider.as_str() && mid == &active_model);
 
     let items: Vec<(&str, &str)> = entries.iter().map(|(m, _, pl)| (m.as_str(), *pl)).collect();
 

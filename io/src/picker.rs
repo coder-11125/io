@@ -99,7 +99,11 @@ fn pick_hint_loop(
             let idx = viewport_start + i;
             let (label, hint) = items[idx];
             let pad = " ".repeat(col.saturating_sub(label.len()));
-            queue!(stdout, cursor::MoveToColumn(0), terminal::Clear(ClearType::CurrentLine))?;
+            queue!(
+                stdout,
+                cursor::MoveToColumn(0),
+                terminal::Clear(ClearType::CurrentLine)
+            )?;
 
             if idx == selected {
                 queue!(
@@ -150,16 +154,20 @@ fn pick_hint_loop(
         // MoveUp(visible) on next frame returns exactly to R.
         drawn_items = visible;
 
-        match event::read()? {
-            Event::Key(key) => match key.code {
+        if let Event::Key(key) = event::read()? {
+            match key.code {
                 KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
-                    selected = if selected > 0 { selected - 1 } else { items.len() - 1 };
+                    selected = if selected > 0 {
+                        selected - 1
+                    } else {
+                        items.len() - 1
+                    };
                 }
                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
                     selected = (selected + 1) % items.len();
                 }
                 KeyCode::Home => selected = 0,
-                KeyCode::End  => selected = items.len() - 1,
+                KeyCode::End => selected = items.len() - 1,
                 KeyCode::Enter => {
                     clear_picker(stdout, drawn_items)?;
                     execute!(stdout, cursor::Show)?;
@@ -179,8 +187,7 @@ fn pick_hint_loop(
                     return Err(anyhow::anyhow!("Interrupted"));
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         }
     }
 }
@@ -224,7 +231,11 @@ fn pick_loop(
         for i in 0..visible {
             let idx = viewport_start + i;
             let label = items[idx];
-            queue!(stdout, cursor::MoveToColumn(0), terminal::Clear(ClearType::CurrentLine))?;
+            queue!(
+                stdout,
+                cursor::MoveToColumn(0),
+                terminal::Clear(ClearType::CurrentLine)
+            )?;
 
             if idx == selected {
                 queue!(
@@ -265,16 +276,20 @@ fn pick_loop(
 
         drawn_items = visible;
 
-        match event::read()? {
-            Event::Key(key) => match key.code {
+        if let Event::Key(key) = event::read()? {
+            match key.code {
                 KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
-                    selected = if selected > 0 { selected - 1 } else { items.len() - 1 };
+                    selected = if selected > 0 {
+                        selected - 1
+                    } else {
+                        items.len() - 1
+                    };
                 }
                 KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
                     selected = (selected + 1) % items.len();
                 }
                 KeyCode::Home => selected = 0,
-                KeyCode::End  => selected = items.len() - 1,
+                KeyCode::End => selected = items.len() - 1,
                 KeyCode::Enter => {
                     clear_picker(stdout, drawn_items)?;
                     execute!(stdout, cursor::Show)?;
@@ -294,8 +309,7 @@ fn pick_loop(
                     return Err(anyhow::anyhow!("Interrupted"));
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         }
     }
 }

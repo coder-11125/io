@@ -1,6 +1,6 @@
-use crate::types::Session;
 use crate::provider::{ContentBlock, Message, Role};
 use crate::tools::ToolSpec;
+use crate::types::Session;
 
 pub struct ContextManager {
     #[allow(dead_code)]
@@ -10,20 +10,34 @@ pub struct ContextManager {
 
 impl ContextManager {
     pub fn new(max_tokens: usize) -> Self {
-        Self { max_tokens, system_prompt: String::new() }
+        Self {
+            max_tokens,
+            system_prompt: String::new(),
+        }
     }
 
     pub fn set_system_prompt(&mut self, prompt: String) {
         self.system_prompt = prompt;
     }
 
-    pub fn build_messages(&self, session: &Session, user_input: &str, tools: &[ToolSpec]) -> Vec<Message> {
+    pub fn build_messages(
+        &self,
+        session: &Session,
+        user_input: &str,
+        tools: &[ToolSpec],
+    ) -> Vec<Message> {
         let mut messages = Vec::new();
 
         if !self.system_prompt.is_empty() {
-            let tool_descriptions: Vec<String> = tools.iter().map(|t| {
-                format!("- `{}`: {} (input: {})", t.name, t.description, t.input_schema)
-            }).collect();
+            let tool_descriptions: Vec<String> = tools
+                .iter()
+                .map(|t| {
+                    format!(
+                        "- `{}`: {} (input: {})",
+                        t.name, t.description, t.input_schema
+                    )
+                })
+                .collect();
 
             let system_text = format!(
                 "{}\n\n## Available Tools\n\n{}",
@@ -40,13 +54,17 @@ impl ContextManager {
         for turn in &session.turns {
             messages.push(Message {
                 role: Role::User,
-                content: vec![ContentBlock::Text { text: turn.user_message.clone() }],
+                content: vec![ContentBlock::Text {
+                    text: turn.user_message.clone(),
+                }],
             });
 
             if let Some(ref reply) = turn.assistant_message {
                 messages.push(Message {
                     role: Role::Assistant,
-                    content: vec![ContentBlock::Text { text: reply.clone() }],
+                    content: vec![ContentBlock::Text {
+                        text: reply.clone(),
+                    }],
                 });
             }
 
@@ -73,7 +91,9 @@ impl ContextManager {
 
         messages.push(Message {
             role: Role::User,
-            content: vec![ContentBlock::Text { text: user_input.to_string() }],
+            content: vec![ContentBlock::Text {
+                text: user_input.to_string(),
+            }],
         });
 
         messages

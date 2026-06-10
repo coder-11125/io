@@ -1,4 +1,7 @@
-use super::{CompletionModel, CompletionRequest, CompletionResponse, ContentBlock, Message, Role, StreamEvent, Usage};
+use super::{
+    CompletionModel, CompletionRequest, CompletionResponse, ContentBlock, Message, Role,
+    StreamEvent, Usage,
+};
 use crate::config::OpenAIConfig;
 
 #[derive(Debug, Clone)]
@@ -17,9 +20,16 @@ impl OpenAIProvider {
     }
 
     fn api_key(&self) -> anyhow::Result<String> {
-        if let Some(ref key) = self.config.api_key { return Ok(key.clone()); }
-        let env_var = self.config.api_key_env.as_deref().unwrap_or("OPENAI_API_KEY");
-        std::env::var(env_var).map_err(|_| anyhow::anyhow!("missing {env_var} environment variable"))
+        if let Some(ref key) = self.config.api_key {
+            return Ok(key.clone());
+        }
+        let env_var = self
+            .config
+            .api_key_env
+            .as_deref()
+            .unwrap_or("OPENAI_API_KEY");
+        std::env::var(env_var)
+            .map_err(|_| anyhow::anyhow!("missing {env_var} environment variable"))
     }
 
     fn url(&self, path: &str) -> String {
@@ -29,10 +39,13 @@ impl OpenAIProvider {
 
 #[async_trait::async_trait]
 impl CompletionModel for OpenAIProvider {
-    fn provider_name(&self) -> &'static str { "openai" }
+    fn provider_name(&self) -> &'static str {
+        "openai"
+    }
 
     fn context_window(&self) -> u64 {
-        self.config.context_window
+        self.config
+            .context_window
             .unwrap_or_else(|| super::context_window_for_model(&self.config.model))
     }
 
@@ -40,7 +53,8 @@ impl CompletionModel for OpenAIProvider {
         let api_key = self.api_key()?;
         let body = build_chat_body(&self.config, &request, false);
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(self.url("chat/completions"))
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&body)
@@ -57,11 +71,15 @@ impl CompletionModel for OpenAIProvider {
         Ok(convert_chat_response(data))
     }
 
-    async fn complete_stream(&self, request: CompletionRequest) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<StreamEvent>>> {
+    async fn complete_stream(
+        &self,
+        request: CompletionRequest,
+    ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<StreamEvent>>> {
         let api_key = self.api_key()?;
         let body = build_chat_body(&self.config, &request, true);
 
-        let resp = self.client
+        let resp = self
+            .client
             .post(self.url("chat/completions"))
             .header("Authorization", format!("Bearer {api_key}"))
             .json(&body)
@@ -81,7 +99,8 @@ impl CompletionModel for OpenAIProvider {
             let mut stream = resp.bytes_stream();
             let mut buffer = String::new();
             // Accumulate tool call arguments by index: index -> (id, name, args_buf)
-            let mut pending: std::collections::HashMap<u32, (String, String, String)> = Default::default();
+            let mut pending: std::collections::HashMap<u32, (String, String, String)> =
+                Default::default();
 
             'outer: while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
@@ -90,8 +109,12 @@ impl CompletionModel for OpenAIProvider {
                         while let Some(line_end) = buffer.find('\n') {
                             let line = buffer[..line_end].trim().to_string();
                             buffer = buffer[line_end + 1..].to_string();
-                            if line.is_empty() { continue; }
-                            if !line.starts_with("data: ") { continue; }
+                            if line.is_empty() {
+                                continue;
+                            }
+                            if !line.starts_with("data: ") {
+                                continue;
+                            }
                             let data = &line[6..];
                             if data == "[DONE]" {
                                 // Emit accumulated tool calls in order
@@ -100,46 +123,90 @@ impl CompletionModel for OpenAIProvider {
                                 for (_, (id, name, args)) in calls {
                                     let input = serde_json::from_str::<serde_json::Value>(&args)
                                         .unwrap_or(serde_json::json!({}));
-                                    if tx.send(Ok(StreamEvent {
-                                        delta: None,
-                                        content_block: Some(ContentBlock::ToolUse { id, name, input }),
-                                        stop_reason: None,
-                                        usage: None,
-                                    })).await.is_err() { break 'outer; }
+                                    if tx
+                                        .send(Ok(StreamEvent {
+                                            delta: None,
+                                            content_block: Some(ContentBlock::ToolUse {
+                                                id,
+                                                name,
+                                                input,
+                                            }),
+                                            stop_reason: None,
+                                            usage: None,
+                                        }))
+                                        .await
+                                        .is_err()
+                                    {
+                                        break 'outer;
+                                    }
                                 }
-                                let _ = tx.send(Ok(StreamEvent {
-                                    delta: None, content_block: None,
-                                    stop_reason: Some("stop".to_string()), usage: None,
-                                })).await;
+                                let _ = tx
+                                    .send(Ok(StreamEvent {
+                                        delta: None,
+                                        content_block: None,
+                                        stop_reason: Some("stop".to_string()),
+                                        usage: None,
+                                    }))
+                                    .await;
                                 break 'outer;
                             }
                             match serde_json::from_str::<ChatChunk>(data) {
                                 Ok(chunk) => {
                                     // Emit usage when present (final chunk before [DONE])
                                     if let Some(ref u) = chunk.usage {
-                                        if tx.send(Ok(StreamEvent {
-                                            delta: None, content_block: None, stop_reason: None,
-                                            usage: Some(Usage { input_tokens: u.prompt_tokens, output_tokens: u.completion_tokens }),
-                                        })).await.is_err() { break 'outer; }
+                                        if tx
+                                            .send(Ok(StreamEvent {
+                                                delta: None,
+                                                content_block: None,
+                                                stop_reason: None,
+                                                usage: Some(Usage {
+                                                    input_tokens: u.prompt_tokens,
+                                                    output_tokens: u.completion_tokens,
+                                                }),
+                                            }))
+                                            .await
+                                            .is_err()
+                                        {
+                                            break 'outer;
+                                        }
                                     }
                                     for choice in chunk.choices {
                                         if let Some(ref c) = choice.delta.content {
-                                            if !c.is_empty() {
-                                                if tx.send(Ok(StreamEvent {
-                                                    delta: Some(c.clone()), content_block: None,
-                                                    stop_reason: None, usage: None,
-                                                })).await.is_err() { break 'outer; }
+                                            if !c.is_empty()
+                                                && tx
+                                                    .send(Ok(StreamEvent {
+                                                        delta: Some(c.clone()),
+                                                        content_block: None,
+                                                        stop_reason: None,
+                                                        usage: None,
+                                                    }))
+                                                    .await
+                                                    .is_err()
+                                            {
+                                                break 'outer;
                                             }
                                         }
                                         if let Some(ref calls) = choice.delta.tool_calls {
                                             for tc in calls {
                                                 let idx = tc.index.unwrap_or(0);
-                                                let entry = pending.entry(idx)
-                                                    .or_insert_with(|| (String::new(), String::new(), String::new()));
-                                                if let Some(ref id) = tc.id { entry.0 = id.clone(); }
+                                                let entry =
+                                                    pending.entry(idx).or_insert_with(|| {
+                                                        (
+                                                            String::new(),
+                                                            String::new(),
+                                                            String::new(),
+                                                        )
+                                                    });
+                                                if let Some(ref id) = tc.id {
+                                                    entry.0 = id.clone();
+                                                }
                                                 if let Some(ref f) = tc.function {
-                                                    if let Some(ref name) = f.name { entry.1 = name.clone(); }
-                                                    if let Some(ref args) = f.arguments { entry.2.push_str(args); }
+                                                    if let Some(ref name) = f.name {
+                                                        entry.1 = name.clone();
+                                                    }
+                                                    if let Some(ref args) = f.arguments {
+                                                        entry.2.push_str(args);
+                                                    }
                                                 }
                                             }
                                         }
@@ -152,7 +219,10 @@ impl CompletionModel for OpenAIProvider {
                             }
                         }
                     }
-                    Err(e) => { let _ = tx.send(Err(anyhow::anyhow!("stream error: {e}"))).await; break 'outer; }
+                    Err(e) => {
+                        let _ = tx.send(Err(anyhow::anyhow!("stream error: {e}"))).await;
+                        break 'outer;
+                    }
                 }
             }
         });
@@ -161,8 +231,18 @@ impl CompletionModel for OpenAIProvider {
     }
 }
 
-pub(crate) fn build_chat_body_with_model(model: &str, request: &CompletionRequest, stream: bool) -> serde_json::Value {
-    let cfg = OpenAIConfig { model: model.to_string(), base_url: String::new(), api_key_env: None, api_key: None, context_window: None };
+pub(crate) fn build_chat_body_with_model(
+    model: &str,
+    request: &CompletionRequest,
+    stream: bool,
+) -> serde_json::Value {
+    let cfg = OpenAIConfig {
+        model: model.to_string(),
+        base_url: String::new(),
+        api_key_env: None,
+        api_key: None,
+        context_window: None,
+    };
     build_chat_body(&cfg, request, stream)
 }
 
@@ -176,13 +256,24 @@ pub(crate) fn parse_and_convert_chunk(data: &str) -> anyhow::Result<StreamEvent>
     Ok(convert_chunk(chunk))
 }
 
-fn build_chat_body(config: &OpenAIConfig, request: &CompletionRequest, stream: bool) -> serde_json::Value {
+fn build_chat_body(
+    config: &OpenAIConfig,
+    request: &CompletionRequest,
+    stream: bool,
+) -> serde_json::Value {
     let messages = convert_messages(&request.messages);
-    let mut body = serde_json::json!({ "model": config.model, "messages": messages, "stream": stream });
+    let mut body =
+        serde_json::json!({ "model": config.model, "messages": messages, "stream": stream });
 
-    if stream { body["stream_options"] = serde_json::json!({ "include_usage": true }); }
-    if let Some(max_tokens) = request.max_tokens { body["max_tokens"] = serde_json::json!(max_tokens); }
-    if let Some(temp) = request.temperature { body["temperature"] = serde_json::json!(temp); }
+    if stream {
+        body["stream_options"] = serde_json::json!({ "include_usage": true });
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        body["max_tokens"] = serde_json::json!(max_tokens);
+    }
+    if let Some(temp) = request.temperature {
+        body["temperature"] = serde_json::json!(temp);
+    }
     if !request.tools.is_empty() {
         let tools: Vec<serde_json::Value> = request.tools.iter().map(|t| serde_json::json!({
             "type": "function",
@@ -192,7 +283,10 @@ fn build_chat_body(config: &OpenAIConfig, request: &CompletionRequest, stream: b
     }
     if let Some(ref system) = request.system_prompt {
         if let Some(arr) = body["messages"].as_array_mut() {
-            arr.insert(0, serde_json::json!({ "role": "system", "content": system }));
+            arr.insert(
+                0,
+                serde_json::json!({ "role": "system", "content": system }),
+            );
         }
     }
     body
@@ -205,16 +299,32 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
     for msg in messages {
         match msg.role {
             Role::System => {
-                let text = msg.content.iter()
-                    .find_map(|b| if let ContentBlock::Text { text } = b { Some(text.as_str()) } else { None })
+                let text = msg
+                    .content
+                    .iter()
+                    .find_map(|b| {
+                        if let ContentBlock::Text { text } = b {
+                            Some(text.as_str())
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or("");
                 out.push(serde_json::json!({ "role": "system", "content": text }));
             }
             Role::User => {
-                let has_results = msg.content.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+                let has_results = msg
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
                 if has_results {
                     for block in &msg.content {
-                        if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
+                        if let ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            ..
+                        } = block
+                        {
                             out.push(serde_json::json!({
                                 "role": "tool",
                                 "tool_call_id": tool_use_id,
@@ -223,9 +333,17 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                         }
                     }
                 } else {
-                    let content: Vec<serde_json::Value> = msg.content.iter().filter_map(|b| {
-                        if let ContentBlock::Text { text } = b { Some(serde_json::json!({"type": "text", "text": text})) } else { None }
-                    }).collect();
+                    let content: Vec<serde_json::Value> = msg
+                        .content
+                        .iter()
+                        .filter_map(|b| {
+                            if let ContentBlock::Text { text } = b {
+                                Some(serde_json::json!({"type": "text", "text": text}))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
                     out.push(serde_json::json!({ "role": "user", "content": content }));
                 }
             }
@@ -260,7 +378,12 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
             }
             Role::Tool => {
                 for block in &msg.content {
-                    if let ContentBlock::ToolResult { tool_use_id, content, .. } = block {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } = block
+                    {
                         out.push(serde_json::json!({
                             "role": "tool",
                             "tool_call_id": tool_use_id,
@@ -275,46 +398,92 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
 }
 
 #[derive(serde::Deserialize)]
-struct ChatResponse { choices: Vec<ChatChoice>, usage: Option<ChatUsage> }
+struct ChatResponse {
+    choices: Vec<ChatChoice>,
+    usage: Option<ChatUsage>,
+}
 #[derive(serde::Deserialize)]
-struct ChatChoice { message: ChatMessage }
+struct ChatChoice {
+    message: ChatMessage,
+}
 #[derive(serde::Deserialize)]
-struct ChatMessage { content: Option<String>, tool_calls: Option<Vec<ChatToolCall>> }
+struct ChatMessage {
+    content: Option<String>,
+    tool_calls: Option<Vec<ChatToolCall>>,
+}
 #[derive(serde::Deserialize)]
-struct ChatToolCall { id: String, function: ChatFunction }
+struct ChatToolCall {
+    id: String,
+    function: ChatFunction,
+}
 #[derive(serde::Deserialize)]
-struct ChatFunction { name: String, arguments: String }
+struct ChatFunction {
+    name: String,
+    arguments: String,
+}
 #[derive(serde::Deserialize)]
-struct ChatUsage { prompt_tokens: u32, completion_tokens: u32 }
+struct ChatUsage {
+    prompt_tokens: u32,
+    completion_tokens: u32,
+}
 
 fn convert_chat_response(data: ChatResponse) -> CompletionResponse {
     let mut content = Vec::new();
     for choice in data.choices {
         if let Some(text) = choice.message.content {
-            if !text.is_empty() { content.push(ContentBlock::Text { text }); }
+            if !text.is_empty() {
+                content.push(ContentBlock::Text { text });
+            }
         }
         if let Some(calls) = choice.message.tool_calls {
             for tc in calls {
                 if let Ok(input) = serde_json::from_str(&tc.function.arguments) {
-                    content.push(ContentBlock::ToolUse { id: tc.id, name: tc.function.name, input });
+                    content.push(ContentBlock::ToolUse {
+                        id: tc.id,
+                        name: tc.function.name,
+                        input,
+                    });
                 }
             }
         }
     }
-    let usage = data.usage.map(|u| Usage { input_tokens: u.prompt_tokens, output_tokens: u.completion_tokens });
-    CompletionResponse { content, stop_reason: None, usage }
+    let usage = data.usage.map(|u| Usage {
+        input_tokens: u.prompt_tokens,
+        output_tokens: u.completion_tokens,
+    });
+    CompletionResponse {
+        content,
+        stop_reason: None,
+        usage,
+    }
 }
 
 #[derive(serde::Deserialize)]
-struct ChatChunk { choices: Vec<ChatChunkChoice>, usage: Option<ChatUsage> }
+struct ChatChunk {
+    choices: Vec<ChatChunkChoice>,
+    usage: Option<ChatUsage>,
+}
 #[derive(serde::Deserialize)]
-struct ChatChunkChoice { delta: ChatChunkDelta, finish_reason: Option<String> }
+struct ChatChunkChoice {
+    delta: ChatChunkDelta,
+    finish_reason: Option<String>,
+}
 #[derive(serde::Deserialize)]
-struct ChatChunkDelta { content: Option<String>, tool_calls: Option<Vec<ChatChunkToolCall>> }
+struct ChatChunkDelta {
+    content: Option<String>,
+    tool_calls: Option<Vec<ChatChunkToolCall>>,
+}
 #[derive(serde::Deserialize)]
-struct ChatChunkToolCall { index: Option<u32>, id: Option<String>, function: Option<ChatChunkFunction> }
+struct ChatChunkToolCall {
+    index: Option<u32>,
+    id: Option<String>,
+    function: Option<ChatChunkFunction>,
+}
 #[derive(serde::Deserialize)]
-struct ChatChunkFunction { name: Option<String>, arguments: Option<String> }
+struct ChatChunkFunction {
+    name: Option<String>,
+    arguments: Option<String>,
+}
 
 fn convert_chunk(chunk: ChatChunk) -> StreamEvent {
     let mut delta = None;
@@ -323,22 +492,43 @@ fn convert_chunk(chunk: ChatChunk) -> StreamEvent {
 
     for choice in chunk.choices {
         if let Some(ref c) = choice.delta.content {
-            if !c.is_empty() { delta = choice.delta.content.clone(); }
+            if !c.is_empty() {
+                delta = choice.delta.content.clone();
+            }
         }
         if let Some(ref calls) = choice.delta.tool_calls {
             for tc in calls {
-                let args = tc.function.as_ref().and_then(|f| f.arguments.clone()).unwrap_or_default();
-                let args_json = serde_json::from_str::<serde_json::Value>(&args).unwrap_or(serde_json::json!({}));
+                let args = tc
+                    .function
+                    .as_ref()
+                    .and_then(|f| f.arguments.clone())
+                    .unwrap_or_default();
+                let args_json = serde_json::from_str::<serde_json::Value>(&args)
+                    .unwrap_or(serde_json::json!({}));
                 content_block = Some(ContentBlock::ToolUse {
                     id: tc.id.clone().unwrap_or_default(),
-                    name: tc.function.as_ref().and_then(|f| f.name.clone()).unwrap_or_default(),
+                    name: tc
+                        .function
+                        .as_ref()
+                        .and_then(|f| f.name.clone())
+                        .unwrap_or_default(),
                     input: args_json,
                 });
             }
         }
-        if let Some(ref reason) = choice.finish_reason { stop_reason = Some(reason.clone()); }
+        if let Some(ref reason) = choice.finish_reason {
+            stop_reason = Some(reason.clone());
+        }
     }
 
-    let usage = chunk.usage.map(|u| Usage { input_tokens: u.prompt_tokens, output_tokens: u.completion_tokens });
-    StreamEvent { delta, content_block, stop_reason, usage }
+    let usage = chunk.usage.map(|u| Usage {
+        input_tokens: u.prompt_tokens,
+        output_tokens: u.completion_tokens,
+    });
+    StreamEvent {
+        delta,
+        content_block,
+        stop_reason,
+        usage,
+    }
 }

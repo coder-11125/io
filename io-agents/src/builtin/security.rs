@@ -4,7 +4,8 @@ pub fn config() -> AgentConfig {
     AgentConfig {
         id: "security",
         name: "Security",
-        description: "Read-only security review — vulnerabilities, unsafe patterns, and credential leaks.",
+        description:
+            "Read-only security review — vulnerabilities, unsafe patterns, and credential leaks.",
         system_prompt: indoc::indoc! {"
             You are io in Security mode — a read-only agent that audits code for
             security vulnerabilities. You do not modify files.
@@ -39,7 +40,8 @@ pub fn config() -> AgentConfig {
 
             Do not report theoretical issues with no realistic attack vector. Every
             finding must have a plausible exploitation path given the codebase context.
-        "}.to_string(),
+        "}
+        .to_string(),
         tool_access: ToolAccess::only(&["read", "glob", "grep"]),
         suggested_model: None,
         single_shot: false,

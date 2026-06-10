@@ -1,7 +1,7 @@
+use crate::types::{Session, SessionId};
+use rusqlite::Connection;
 use std::path::PathBuf;
 use std::str::FromStr;
-use rusqlite::Connection;
-use crate::types::{Session, SessionId};
 
 pub struct SessionStore {
     db_path: PathBuf,
@@ -48,7 +48,7 @@ impl SessionStore {
             );
 
             CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
-            CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);"
+            CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at);",
         )?;
         Ok(())
     }
@@ -93,7 +93,7 @@ impl SessionStore {
     pub fn list_sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
         let conn = Connection::open(&self.db_path)?;
         let mut stmt = conn.prepare(
-            "SELECT id, created_at, updated_at FROM sessions ORDER BY updated_at DESC LIMIT 50"
+            "SELECT id, created_at, updated_at FROM sessions ORDER BY updated_at DESC LIMIT 50",
         )?;
 
         let summaries = stmt.query_map([], |row| {
@@ -113,8 +113,14 @@ impl SessionStore {
     pub fn delete_session(&self, id: SessionId) -> anyhow::Result<()> {
         let conn = Connection::open(&self.db_path)?;
         let id_str = id.to_string();
-        conn.execute("DELETE FROM turns WHERE session_id = ?1", rusqlite::params![id_str])?;
-        conn.execute("DELETE FROM sessions WHERE id = ?1", rusqlite::params![id_str])?;
+        conn.execute(
+            "DELETE FROM turns WHERE session_id = ?1",
+            rusqlite::params![id_str],
+        )?;
+        conn.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            rusqlite::params![id_str],
+        )?;
         Ok(())
     }
 }

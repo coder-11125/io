@@ -38,7 +38,8 @@ pub fn config() -> AgentConfig {
             3. Write documentation that would help a new contributor understand and
                use the code correctly.
             4. Do not modify logic, signatures, or tests.
-        "}.to_string(),
+        "}
+        .to_string(),
         tool_access: ToolAccess::only(&["read", "write", "edit", "glob", "grep"]),
         suggested_model: None,
         single_shot: false,

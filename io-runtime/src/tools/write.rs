@@ -5,7 +5,9 @@ pub struct WriteTool;
 
 #[async_trait::async_trait]
 impl Tool for WriteTool {
-    fn name(&self) -> &str { "write" }
+    fn name(&self) -> &str {
+        "write"
+    }
 
     fn description(&self) -> &str {
         "Write content to a file, creating it or overwriting it. Returns a unified diff of what changed."
@@ -52,7 +54,10 @@ impl Tool for WriteTool {
 
         if is_new {
             // Return a synthetic "all additions" diff
-            let mut out = format!("--- /dev/null\n+++ {path}\n@@ -0,0 +1,{} @@\n", content.lines().count());
+            let mut out = format!(
+                "--- /dev/null\n+++ {path}\n@@ -0,0 +1,{} @@\n",
+                content.lines().count()
+            );
             for line in content.lines() {
                 out.push('+');
                 out.push_str(line);
@@ -73,17 +78,25 @@ pub fn make_diff(old: &str, new: &str, path: &str) -> String {
         let a1 = group.last().unwrap().old_range().end;
         let b0 = group[0].new_range().start;
         let b1 = group.last().unwrap().new_range().end;
-        out.push_str(&format!("@@ -{},{} +{},{} @@\n", a0 + 1, a1 - a0, b0 + 1, b1 - b0));
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            a0 + 1,
+            a1 - a0,
+            b0 + 1,
+            b1 - b0
+        ));
         for op in group {
             for change in diff.iter_changes(op) {
                 let prefix = match change.tag() {
                     ChangeTag::Delete => '-',
                     ChangeTag::Insert => '+',
-                    ChangeTag::Equal  => ' ',
+                    ChangeTag::Equal => ' ',
                 };
                 out.push(prefix);
                 out.push_str(change.value());
-                if !change.value().ends_with('\n') { out.push('\n'); }
+                if !change.value().ends_with('\n') {
+                    out.push('\n');
+                }
             }
         }
     }
@@ -97,7 +110,12 @@ mod tests {
     fn input(args: serde_json::Value) -> ToolInput {
         ToolInput {
             name: "write".into(),
-            args: args.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            args: args
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         }
     }
 
@@ -107,14 +125,18 @@ mod tests {
 
     #[tokio::test]
     async fn missing_path_returns_error() {
-        let out = WriteTool.execute(input(serde_json::json!({ "content": "hi" }))).await;
+        let out = WriteTool
+            .execute(input(serde_json::json!({ "content": "hi" })))
+            .await;
         assert!(!out.success);
         assert!(out.data.contains("missing required argument: path"));
     }
 
     #[tokio::test]
     async fn missing_content_returns_error() {
-        let out = WriteTool.execute(input(serde_json::json!({ "path": "/tmp/x" }))).await;
+        let out = WriteTool
+            .execute(input(serde_json::json!({ "path": "/tmp/x" })))
+            .await;
         assert!(!out.success);
         assert!(out.data.contains("missing required argument: content"));
     }
@@ -122,10 +144,12 @@ mod tests {
     #[tokio::test]
     async fn creates_new_file() {
         let path = temp_path("new.txt");
-        let out = WriteTool.execute(input(serde_json::json!({
-            "path": path.to_str().unwrap(),
-            "content": "hello world"
-        }))).await;
+        let out = WriteTool
+            .execute(input(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "content": "hello world"
+            })))
+            .await;
         let written = std::fs::read_to_string(&path).ok();
         std::fs::remove_file(&path).ok();
         assert!(out.success, "{}", out.data);
@@ -137,10 +161,12 @@ mod tests {
     async fn overwrites_existing_file_and_diffs() {
         let path = temp_path("overwrite.txt");
         std::fs::write(&path, "old content\n").unwrap();
-        let out = WriteTool.execute(input(serde_json::json!({
-            "path": path.to_str().unwrap(),
-            "content": "new content\n"
-        }))).await;
+        let out = WriteTool
+            .execute(input(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "content": "new content\n"
+            })))
+            .await;
         let written = std::fs::read_to_string(&path).ok();
         std::fs::remove_file(&path).ok();
         assert!(out.success, "{}", out.data);

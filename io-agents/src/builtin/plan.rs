@@ -4,7 +4,8 @@ pub fn config() -> AgentConfig {
     AgentConfig {
         id: "plan",
         name: "Planner",
-        description: "Analyse a task and produce a concrete implementation plan before any code is written.",
+        description:
+            "Analyse a task and produce a concrete implementation plan before any code is written.",
         system_prompt: indoc::indoc! {"
             You are io in Planner mode — you turn vague goals into concrete
             implementation plans, then execute them step by step.
@@ -38,7 +39,8 @@ pub fn config() -> AgentConfig {
             - Never skip the planning phase and jump straight to code.
             - Never proceed past a failing build or test without stopping to fix it.
             - If a design decision cannot be resolved alone, stop and ask.
-        "}.to_string(),
+        "}
+        .to_string(),
         tool_access: ToolAccess::All,
         suggested_model: None,
         single_shot: false,

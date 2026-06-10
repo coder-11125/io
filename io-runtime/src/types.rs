@@ -1,9 +1,9 @@
-use std::fmt;
-use std::str::FromStr;
+use crate::pricing::get_pricing_for_model;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 use uuid::Uuid;
-use crate::pricing::{get_pricing_for_model};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(Uuid);
@@ -123,6 +123,10 @@ impl Session {
 
     pub fn recent_turns(&self, n: usize) -> &[Turn] {
         let len = self.turns.len();
-        if len <= n { &self.turns } else { &self.turns[len - n..] }
+        if len <= n {
+            &self.turns
+        } else {
+            &self.turns[len - n..]
+        }
     }
 }

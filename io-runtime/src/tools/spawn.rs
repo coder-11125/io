@@ -1,12 +1,15 @@
-use std::sync::Arc;
-use std::sync::{Mutex, atomic::{AtomicBool, Ordering}};
+use crate::agent::Agent;
+use crate::memory::SessionStore;
+use crate::provider::CompletionModel;
+use crate::sandbox::PermissionChecker;
+use crate::tools::{filtered_registry, Tool, ToolInput, ToolOutput};
 use async_trait::async_trait;
 use io_agents::agent_config::ToolAccess;
-use crate::provider::ProviderKind;
-use crate::tools::{Tool, ToolInput, ToolOutput, filtered_registry};
-use crate::sandbox::PermissionChecker;
-use crate::memory::SessionStore;
-use crate::agent::Agent;
+use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Mutex,
+};
 
 /// A tool that lets a full agent delegate a scoped task to a sub-agent.
 ///
@@ -17,7 +20,7 @@ use crate::agent::Agent;
 /// Holds a shared cancellation flag — when set (e.g. by Esc in the UI),
 /// the spawned agent aborts early and returns a cancellation message.
 pub struct SpawnAgentTool {
-    provider: Arc<ProviderKind>,
+    provider: Arc<dyn CompletionModel>,
     model_id: String,
     max_tokens: u32,
     description: String,
@@ -25,7 +28,7 @@ pub struct SpawnAgentTool {
 }
 
 impl SpawnAgentTool {
-    pub fn new(provider: Arc<ProviderKind>, model_id: String, max_tokens: u32) -> Self {
+    pub fn new(provider: Arc<dyn CompletionModel>, model_id: String, max_tokens: u32) -> Self {
         let sub_agents: Vec<String> = io_agents::builtin::all()
             .into_iter()
             .filter(|a| a.tool_access != ToolAccess::All)
@@ -45,16 +48,25 @@ impl SpawnAgentTool {
                 .join("\n")
         );
 
-        Self { provider, model_id, max_tokens, description, cancel: Mutex::new(Arc::new(AtomicBool::new(false))) }
+        Self {
+            provider,
+            model_id,
+            max_tokens,
+            description,
+            cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
+        }
     }
-
 }
 
 #[async_trait]
 impl Tool for SpawnAgentTool {
-    fn name(&self) -> &str { "spawn_agent" }
+    fn name(&self) -> &str {
+        "spawn_agent"
+    }
 
-    fn description(&self) -> &str { &self.description }
+    fn description(&self) -> &str {
+        &self.description
+    }
 
     fn input_schema(&self) -> serde_json::Value {
         serde_json::json!({
@@ -98,15 +110,15 @@ impl Tool for SpawnAgentTool {
         let config = match io_agents::builtin::by_id(&agent_id) {
             Some(c) => c,
             None => return ToolOutput::err(
-                &format!("unknown agent_id '{agent_id}' — check available sub-agents in the tool description")
+                format!("unknown agent_id '{agent_id}' — check available sub-agents in the tool description")
             ),
         };
 
         // Block full agents from being spawned to prevent recursive loops.
         if config.tool_access == ToolAccess::All {
-            return ToolOutput::err(
-                &format!("'{agent_id}' is a full agent and cannot be spawned as a sub-agent")
-            );
+            return ToolOutput::err(format!(
+                "'{agent_id}' is a full agent and cannot be spawned as a sub-agent"
+            ));
         }
 
         let tools = match &config.tool_access {
@@ -123,10 +135,11 @@ impl Tool for SpawnAgentTool {
 
         let memory = match SessionStore::new() {
             Ok(m) => m,
-            Err(e) => return ToolOutput::err(&format!("failed to init session store: {e}")),
+            Err(e) => return ToolOutput::err(format!("failed to init session store: {e}")),
         };
 
-        let model_id = config.suggested_model
+        let model_id = config
+            .suggested_model
             .unwrap_or(self.model_id.as_str())
             .to_string();
 

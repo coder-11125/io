@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::memory::SessionStore;
-use crate::provider::{CompletionModel, CompletionRequest, ContentBlock, Message, ProviderKind, Role};
+use crate::provider::{CompletionModel, CompletionRequest, ContentBlock, Message, Role};
 use crate::types::Session;
 
 pub struct CompactResult {
@@ -12,7 +12,7 @@ pub struct CompactResult {
 
 pub async fn run(
     session: &Arc<Mutex<Session>>,
-    provider: &Arc<ProviderKind>,
+    provider: &Arc<dyn CompletionModel>,
     memory: &Arc<SessionStore>,
 ) -> anyhow::Result<CompactResult> {
     let turns = {
@@ -21,7 +21,10 @@ pub async fn run(
     };
 
     if turns.is_empty() {
-        return Ok(CompactResult { turns_compacted: 0, summary: String::new() });
+        return Ok(CompactResult {
+            turns_compacted: 0,
+            summary: String::new(),
+        });
     }
 
     let mut history = String::new();
@@ -78,11 +81,21 @@ pub async fn run(
         stream: false,
     };
 
-    let response = provider.complete(request).await
+    let response = provider
+        .complete(request)
+        .await
         .map_err(|e| anyhow::anyhow!("compact summarization failed: {e}"))?;
 
-    let summary = response.content.iter()
-        .filter_map(|b| if let ContentBlock::Text { text } = b { Some(text.as_str()) } else { None })
+    let summary = response
+        .content
+        .iter()
+        .filter_map(|b| {
+            if let ContentBlock::Text { text } = b {
+                Some(text.as_str())
+            } else {
+                None
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -105,5 +118,8 @@ pub async fn run(
         tracing::warn!("failed to save compacted session: {e}");
     }
 
-    Ok(CompactResult { turns_compacted, summary })
+    Ok(CompactResult {
+        turns_compacted,
+        summary,
+    })
 }

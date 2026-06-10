@@ -33,7 +33,8 @@ pub fn config() -> AgentConfig {
               these hide bugs rather than resolve them.
             - Keep a running \"evidence log\" in your responses so the user can follow
               your reasoning.
-        "}.to_string(),
+        "}
+        .to_string(),
         tool_access: ToolAccess::All,
         suggested_model: None,
         single_shot: false,
@@ -45,7 +46,8 @@ pub fn subagent_config() -> AgentConfig {
     AgentConfig {
         id: "diagnose",
         name: "Diagnose",
-        description: "Read-only root-cause analysis — identifies and explains bugs without fixing them.",
+        description:
+            "Read-only root-cause analysis — identifies and explains bugs without fixing them.",
         system_prompt: indoc::indoc! {"
             You are io in Diagnose mode — a read-only agent that investigates bugs and
             produces a precise root-cause report. You do not modify or execute code.
@@ -74,7 +76,8 @@ pub fn subagent_config() -> AgentConfig {
             - If two hypotheses remain equally plausible, report both with their
               evidence and state what additional information would distinguish them.
             - Do not suggest silencing errors or widening types as a fix.
-        "}.to_string(),
+        "}
+        .to_string(),
         tool_access: ToolAccess::only(&["read", "glob", "grep"]),
         suggested_model: None,
         single_shot: false,

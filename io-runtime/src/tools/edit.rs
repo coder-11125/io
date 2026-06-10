@@ -1,11 +1,13 @@
-use super::{Tool, ToolInput, ToolOutput};
 use super::write::make_diff;
+use super::{Tool, ToolInput, ToolOutput};
 
 pub struct EditTool;
 
 #[async_trait::async_trait]
 impl Tool for EditTool {
-    fn name(&self) -> &str { "edit" }
+    fn name(&self) -> &str {
+        "edit"
+    }
 
     fn description(&self) -> &str {
         "Replace the first occurrence of `old_string` with `new_string` in a file. \
@@ -68,43 +70,55 @@ mod tests {
     fn input(args: serde_json::Value) -> ToolInput {
         ToolInput {
             name: "edit".into(),
-            args: args.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            args: args
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         }
     }
 
     fn write_temp(name: &str, content: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("io_edit_test_{}_{}", uuid::Uuid::new_v4(), name));
+        let path =
+            std::env::temp_dir().join(format!("io_edit_test_{}_{}", uuid::Uuid::new_v4(), name));
         std::fs::write(&path, content).unwrap();
         path
     }
 
     #[tokio::test]
     async fn missing_path_returns_error() {
-        let out = EditTool.execute(input(serde_json::json!({
-            "old_string": "a", "new_string": "b"
-        }))).await;
+        let out = EditTool
+            .execute(input(serde_json::json!({
+                "old_string": "a", "new_string": "b"
+            })))
+            .await;
         assert!(!out.success);
         assert!(out.data.contains("missing required argument: path"));
     }
 
     #[tokio::test]
     async fn nonexistent_file_returns_error() {
-        let out = EditTool.execute(input(serde_json::json!({
-            "path": "/tmp/io_edit_nonexistent_xyz",
-            "old_string": "a",
-            "new_string": "b"
-        }))).await;
+        let out = EditTool
+            .execute(input(serde_json::json!({
+                "path": "/tmp/io_edit_nonexistent_xyz",
+                "old_string": "a",
+                "new_string": "b"
+            })))
+            .await;
         assert!(!out.success);
     }
 
     #[tokio::test]
     async fn old_string_not_found_returns_error() {
         let path = write_temp("notfound.txt", "hello world\n");
-        let out = EditTool.execute(input(serde_json::json!({
-            "path": path.to_str().unwrap(),
-            "old_string": "MISSING",
-            "new_string": "replacement"
-        }))).await;
+        let out = EditTool
+            .execute(input(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "MISSING",
+                "new_string": "replacement"
+            })))
+            .await;
         std::fs::remove_file(&path).ok();
         assert!(!out.success);
         assert!(out.data.contains("not found"));
@@ -113,11 +127,13 @@ mod tests {
     #[tokio::test]
     async fn replaces_first_occurrence() {
         let path = write_temp("replace.txt", "foo bar foo\n");
-        let out = EditTool.execute(input(serde_json::json!({
-            "path": path.to_str().unwrap(),
-            "old_string": "foo",
-            "new_string": "baz"
-        }))).await;
+        let out = EditTool
+            .execute(input(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "old_string": "foo",
+                "new_string": "baz"
+            })))
+            .await;
         let result = std::fs::read_to_string(&path).ok();
         std::fs::remove_file(&path).ok();
         assert!(out.success, "{}", out.data);

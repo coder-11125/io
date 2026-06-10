@@ -1,12 +1,12 @@
-use std::io::Write;
-use std::str::FromStr;
 use clap::{Parser, Subcommand};
 use io_runtime::types::SessionId;
+use std::io::Write;
+use std::str::FromStr;
 
 mod agent;
 mod connect;
-mod picker;
 mod model;
+mod picker;
 mod readline;
 
 fn print_banner() {
@@ -101,13 +101,16 @@ async fn handle_session(action: SessionAction) -> anyhow::Result<()> {
                 println!("No sessions found.");
             } else {
                 for s in sessions {
-                    println!("{}  (created: {}, updated: {})", s.id, s.created_at, s.updated_at);
+                    println!(
+                        "{}  (created: {}, updated: {})",
+                        s.id, s.created_at, s.updated_at
+                    );
                 }
             }
         }
         SessionAction::Show { id } => {
-            let session_id = SessionId::from_str(&id)
-                .map_err(|_| anyhow::anyhow!("invalid session id"))?;
+            let session_id =
+                SessionId::from_str(&id).map_err(|_| anyhow::anyhow!("invalid session id"))?;
             let session = store.load_session(session_id)?;
             println!("Session: {}", session.id);
             println!("Created: {}", session.created_at);
@@ -121,8 +124,8 @@ async fn handle_session(action: SessionAction) -> anyhow::Result<()> {
             }
         }
         SessionAction::Delete { id } => {
-            let session_id = SessionId::from_str(&id)
-                .map_err(|_| anyhow::anyhow!("invalid session id"))?;
+            let session_id =
+                SessionId::from_str(&id).map_err(|_| anyhow::anyhow!("invalid session id"))?;
             store.delete_session(session_id)?;
             println!("Session {id} deleted.");
         }
@@ -138,16 +141,120 @@ fn handle_config(action: ConfigAction) -> anyhow::Result<()> {
         }
         ConfigAction::Set { key, value } => {
             let mut config = io_runtime::config::Config::load()?;
-            match key.as_str() {
-                "provider.default" => config.provider.default = value.clone(),
-                "session.auto_compact" => config.session.auto_compact = value.parse().unwrap_or(true),
-                "session.memory_enabled" => config.session.memory_enabled = value.parse().unwrap_or(true),
-                "permissions.default" => config.permissions.default = value.clone(),
-                _ => anyhow::bail!("unknown config key: {key}"),
-            }
+            set_config_key(&mut config, &key, &value)?;
             config.save()?;
             println!("Set {key} = {value}");
         }
+    }
+    Ok(())
+}
+
+/// Apply a `config set <key> <value>` assignment. Supports the top-level
+/// session/permission keys plus per-provider `model` and `api_key_env`
+/// (e.g. `provider.anthropic.model`). Unknown keys and unparsable values
+/// are errors rather than silent defaults.
+fn set_config_key(
+    config: &mut io_runtime::config::Config,
+    key: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    fn parse_bool(key: &str, value: &str) -> anyhow::Result<bool> {
+        value
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid value for {key}: expected true or false"))
+    }
+
+    let parts: Vec<&str> = key.split('.').collect();
+    match parts.as_slice() {
+        ["provider", "default"] => config.provider.default = value.to_string(),
+        ["session", "auto_compact"] => config.session.auto_compact = parse_bool(key, value)?,
+        ["session", "memory_enabled"] => config.session.memory_enabled = parse_bool(key, value)?,
+        ["session", "max_turns"] => {
+            config.session.max_turns = value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid value for {key}: expected a number"))?;
+        }
+        ["session", "max_tokens"] => {
+            config.session.max_tokens = value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid value for {key}: expected a number"))?;
+        }
+        ["permissions", "default"] => {
+            if !matches!(value, "allow" | "prompt" | "deny") {
+                anyhow::bail!("invalid value for {key}: expected allow, prompt, or deny");
+            }
+            config.permissions.default = value.to_string();
+        }
+        ["provider", provider, field @ ("model" | "api_key_env" | "deployment")] => {
+            set_provider_field(config, provider, field, value)?;
+        }
+        _ => anyhow::bail!(
+            "unknown config key: {key}\nSupported: provider.default, provider.<name>.model, \
+             provider.<name>.api_key_env, provider.azure.deployment, session.auto_compact, \
+             session.memory_enabled, session.max_turns, session.max_tokens, permissions.default"
+        ),
+    }
+    Ok(())
+}
+
+fn set_provider_field(
+    config: &mut io_runtime::config::Config,
+    provider: &str,
+    field: &str,
+    value: &str,
+) -> anyhow::Result<()> {
+    let p = &mut config.provider;
+    let value = value.to_string();
+
+    // Each arm materializes the provider's config (with defaults) if absent,
+    // then assigns the requested field.
+    macro_rules! set_field {
+        ($slot:expr) => {{
+            let cfg = $slot.get_or_insert_with(Default::default);
+            match field {
+                "model" => cfg.model = value,
+                "api_key_env" => cfg.api_key_env = Some(value),
+                _ => anyhow::bail!("provider.{provider} has no field '{field}'"),
+            }
+        }};
+    }
+
+    match provider {
+        "openai" => set_field!(p.openai),
+        "anthropic" => set_field!(p.anthropic),
+        "gemini" => set_field!(p.gemini),
+        "groq" => set_field!(p.groq),
+        "mistral" => set_field!(p.mistral),
+        "deepseek" => set_field!(p.deepseek),
+        "openrouter" => set_field!(p.openrouter),
+        "xai" => set_field!(p.xai),
+        "opencode_go" => set_field!(p.opencode_go),
+        "opencode_zen" => set_field!(p.opencode_zen),
+        "ollama" => {
+            let cfg = p.ollama.get_or_insert_with(Default::default);
+            match field {
+                "model" => cfg.model = value,
+                _ => anyhow::bail!("provider.ollama has no field '{field}' (no API key needed)"),
+            }
+        }
+        "azure" => {
+            let cfg = p.azure.get_or_insert_with(Default::default);
+            match field {
+                "deployment" | "model" => cfg.deployment = value,
+                "api_key_env" => cfg.api_key_env = Some(value),
+                _ => anyhow::bail!("provider.azure has no field '{field}'"),
+            }
+        }
+        "bedrock" => {
+            let cfg = p.bedrock.get_or_insert_with(Default::default);
+            match field {
+                "model" => cfg.model = value,
+                _ => {
+                    anyhow::bail!("provider.bedrock has no field '{field}' (uses AWS credentials)")
+                }
+            }
+        }
+        _ => anyhow::bail!("unknown provider: {provider}"),
     }
     Ok(())
 }
@@ -173,25 +280,39 @@ fn handle_init() -> anyhow::Result<()> {
 fn active_model_id(config: &io_runtime::config::Config) -> String {
     let p = &config.provider;
     let model = match p.default.as_str() {
-        "openai"       => p.openai.as_ref().map(|c| c.model.as_str()),
-        "anthropic"    => p.anthropic.as_ref().map(|c| c.model.as_str()),
-        "gemini"       => p.gemini.as_ref().map(|c| c.model.as_str()),
-        "groq"         => p.groq.as_ref().map(|c| c.model.as_str()),
-        "ollama"       => p.ollama.as_ref().map(|c| c.model.as_str()),
-        "azure"        => p.azure.as_ref().map(|c| c.deployment.as_str()),
-        "bedrock"      => p.bedrock.as_ref().map(|c| c.model.as_str()),
-        "mistral"      => p.mistral.as_ref().map(|c| c.model.as_str()),
-        "deepseek"     => p.deepseek.as_ref().map(|c| c.model.as_str()),
-        "openrouter"   => p.openrouter.as_ref().map(|c| c.model.as_str()),
-        "xai"          => p.xai.as_ref().map(|c| c.model.as_str()),
-        "opencode_go"  => p.opencode_go.as_ref().map(|c| c.model.as_str()),
+        "openai" => p.openai.as_ref().map(|c| c.model.as_str()),
+        "anthropic" => p.anthropic.as_ref().map(|c| c.model.as_str()),
+        "gemini" => p.gemini.as_ref().map(|c| c.model.as_str()),
+        "groq" => p.groq.as_ref().map(|c| c.model.as_str()),
+        "ollama" => p.ollama.as_ref().map(|c| c.model.as_str()),
+        "azure" => p.azure.as_ref().map(|c| c.deployment.as_str()),
+        "bedrock" => p.bedrock.as_ref().map(|c| c.model.as_str()),
+        "mistral" => p.mistral.as_ref().map(|c| c.model.as_str()),
+        "deepseek" => p.deepseek.as_ref().map(|c| c.model.as_str()),
+        "openrouter" => p.openrouter.as_ref().map(|c| c.model.as_str()),
+        "xai" => p.xai.as_ref().map(|c| c.model.as_str()),
+        "opencode_go" => p.opencode_go.as_ref().map(|c| c.model.as_str()),
         "opencode_zen" => p.opencode_zen.as_ref().map(|c| c.model.as_str()),
-        _              => None,
+        _ => None,
     };
     model.unwrap_or(p.default.as_str()).to_string()
 }
 
-async fn build_agent(new_session: bool, continue_session: bool, system_prompt: String) -> anyhow::Result<io_runtime::Agent> {
+/// Which session the agent should run in.
+enum SessionChoice {
+    /// Start a fresh session.
+    New,
+    /// Resume the most recently updated session (--continue).
+    Continue,
+    /// Keep a specific session — used when switching agent/provider/model
+    /// mid-conversation so history is preserved.
+    Existing(SessionId),
+}
+
+async fn build_agent(
+    session: SessionChoice,
+    system_prompt: String,
+) -> anyhow::Result<io_runtime::Agent> {
     let config = io_runtime::config::Config::load()?;
     let keys = io_runtime::config::KeyStore::load();
     let model_id = active_model_id(&config);
@@ -199,11 +320,13 @@ async fn build_agent(new_session: bool, continue_session: bool, system_prompt: S
     let memory = io_runtime::memory::SessionStore::new()?;
     let permissions = io_runtime::sandbox::PermissionChecker::from(&config.permissions);
 
-    let session_id = if new_session || !continue_session {
-        None
-    } else {
-        let sessions = memory.list_sessions()?;
-        sessions.first().map(|s| s.id)
+    let session_id = match session {
+        SessionChoice::New => None,
+        SessionChoice::Continue => {
+            let sessions = memory.list_sessions()?;
+            sessions.first().map(|s| s.id)
+        }
+        SessionChoice::Existing(id) => Some(id),
     };
 
     let mut tools = io_runtime::tools::default_registry();
@@ -214,7 +337,17 @@ async fn build_agent(new_session: bool, continue_session: bool, system_prompt: S
     );
     tools.register(Box::new(spawn_tool));
 
-    Ok(io_runtime::Agent::new(provider, tools, memory, permissions, system_prompt, session_id, model_id, config.session.max_tokens, config.session.auto_compact))
+    Ok(io_runtime::Agent::new(
+        provider,
+        tools,
+        memory,
+        permissions,
+        system_prompt,
+        session_id,
+        model_id,
+        config.session.max_tokens,
+        config.session.auto_compact,
+    ))
 }
 
 async fn show_cost_summary(agent: &io_runtime::Agent) -> anyhow::Result<()> {
@@ -370,11 +503,18 @@ fn read_at_path(path: &str) -> Option<String> {
             .map(|e| {
                 let name = e.file_name().into_string().unwrap_or_default();
                 let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                if is_dir { format!("{name}/") } else { name }
+                if is_dir {
+                    format!("{name}/")
+                } else {
+                    name
+                }
             })
             .collect();
         lines.sort_by(|a, b| b.ends_with('/').cmp(&a.ends_with('/')).then(a.cmp(b)));
-        Some(format!("<file path=\"{path}\">\n{}\n</file>", lines.join("\n")))
+        Some(format!(
+            "<file path=\"{path}\">\n{}\n</file>",
+            lines.join("\n")
+        ))
     } else if p.is_file() {
         let raw = std::fs::read(p).ok()?;
         if raw.len() > MAX_AT_FILE_BYTES {
@@ -390,11 +530,47 @@ fn read_at_path(path: &str) -> Option<String> {
     }
 }
 
+/// Slot holding the responder for an in-flight permission prompt. Filled by
+/// the event printer when the agent asks, answered by the key listener.
+type PendingPermission = std::sync::Arc<
+    std::sync::Mutex<Option<tokio::sync::oneshot::Sender<io_runtime::PermissionReply>>>,
+>;
+
+/// Blocking stdin permission prompt for single-shot mode (no raw-mode UI).
+fn prompt_on_stdin(name: &str, input: &serde_json::Value) -> io_runtime::PermissionReply {
+    let detail = tool_detail(name, input);
+    if detail.is_empty() {
+        print!("  allow tool \"{name}\"? [y]es / [a]lways / [N]o: ");
+    } else {
+        print!("  allow tool \"{name}\" ({detail})? [y]es / [a]lways / [N]o: ");
+    }
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return io_runtime::PermissionReply::Deny;
+    }
+    match line.trim().to_lowercase().as_str() {
+        "y" | "yes" => io_runtime::PermissionReply::AllowOnce,
+        "a" | "always" => io_runtime::PermissionReply::AllowSession,
+        _ => io_runtime::PermissionReply::Deny,
+    }
+}
+
 async fn run_single_shot(prompt: &str) -> anyhow::Result<()> {
+    let config = io_runtime::config::Config::load()?;
+    let keys = io_runtime::config::KeyStore::load();
+    if let Some(env) = io_runtime::provider::missing_api_key(&config, &keys) {
+        anyhow::bail!(
+            "no API key found for provider \"{}\".\nExport {env}, or run `io` and use /connect to set one up.",
+            config.provider.default
+        );
+    }
+
     let system_prompt = io_agents::builtin::by_id("build")
         .expect("build agent must exist")
         .system_prompt;
-    let agent = build_agent(false, false, system_prompt).await?;
+    let agent = build_agent(SessionChoice::New, system_prompt).await?;
+    agent.set_prompt_fn(std::sync::Arc::new(prompt_on_stdin));
     let response = agent.run_turn(&resolve_at_mentions(prompt)).await?;
     println!("{response}");
     Ok(())
@@ -407,9 +583,30 @@ async fn run_interactive(
 ) -> anyhow::Result<()> {
     print_banner();
 
-    let mut current_agent = io_agents::builtin::by_id("build")
-        .expect("build agent must exist");
-    let mut agent = build_agent(new_session, continue_session, current_agent.system_prompt.clone()).await?;
+    {
+        let config = io_runtime::config::Config::load()?;
+        let keys = io_runtime::config::KeyStore::load();
+        if let Some(env) = io_runtime::provider::missing_api_key(&config, &keys) {
+            use crossterm::style::Stylize;
+            println!(
+                "{}",
+                format!(
+                    "warning: no API key found for provider \"{}\" — requests will fail.\n         run /connect to set one up, or export {env}.",
+                    config.provider.default
+                )
+                .yellow()
+            );
+            println!();
+        }
+    }
+
+    let mut current_agent = io_agents::builtin::by_id("build").expect("build agent must exist");
+    let startup_session = if continue_session && !new_session {
+        SessionChoice::Continue
+    } else {
+        SessionChoice::New
+    };
+    let mut agent = build_agent(startup_session, current_agent.system_prompt.clone()).await?;
 
     let sid = agent.session_id().await;
     let short_id = &sid.to_string()[..8];
@@ -422,12 +619,18 @@ async fn run_interactive(
         print_prompt(&agent, last_input_tokens, current_agent.id);
 
         let full_agents = io_agents::builtin::full_agents();
-        let tab_current = full_agents.iter().position(|a| a.id == current_agent.id).unwrap_or(0);
+        let tab_current = full_agents
+            .iter()
+            .position(|a| a.id == current_agent.id)
+            .unwrap_or(0);
         let tab_statuses: Vec<String> = full_agents
             .iter()
             .map(|a| format!("  {} · {} · {}", a.id, agent.provider_id, agent.model_id))
             .collect();
-        let ctx = readline::ReadLineCtx { tab_statuses, tab_current };
+        let ctx = readline::ReadLineCtx {
+            tab_statuses,
+            tab_current,
+        };
 
         let output = match tokio::task::spawn_blocking(move || readline::read_line(ctx)).await?? {
             Some(out) => out,
@@ -438,7 +641,13 @@ async fn run_interactive(
         if output.agent_idx != tab_current {
             if let Some(picked) = full_agents.into_iter().nth(output.agent_idx) {
                 current_agent = picked;
-                match build_agent(false, false, current_agent.system_prompt.clone()).await {
+                let sid = agent.session_id().await;
+                match build_agent(
+                    SessionChoice::Existing(sid),
+                    current_agent.system_prompt.clone(),
+                )
+                .await
+                {
                     Ok(new_agent) => agent = new_agent,
                     Err(e) => eprintln!("error switching agent: {e}"),
                 }
@@ -447,7 +656,9 @@ async fn run_interactive(
 
         let input = output.text.trim().to_string();
 
-        if input.is_empty() { continue; }
+        if input.is_empty() {
+            continue;
+        }
 
         match input.as_str() {
             "/exit" | "/quit" | "/q" => break,
@@ -494,7 +705,13 @@ async fn run_interactive(
                         println!("  Agent: {}", new_config.name);
                         println!();
                         current_agent = new_config;
-                        match build_agent(false, false, current_agent.system_prompt.clone()).await {
+                        let sid = agent.session_id().await;
+                        match build_agent(
+                            SessionChoice::Existing(sid),
+                            current_agent.system_prompt.clone(),
+                        )
+                        .await
+                        {
                             Ok(new_agent) => agent = new_agent,
                             Err(e) => eprintln!("error reloading agent: {e}"),
                         }
@@ -509,7 +726,13 @@ async fn run_interactive(
             "/connect" => {
                 match connect::run().await {
                     Ok(()) => {
-                        match build_agent(false, false, current_agent.system_prompt.clone()).await {
+                        let sid = agent.session_id().await;
+                        match build_agent(
+                            SessionChoice::Existing(sid),
+                            current_agent.system_prompt.clone(),
+                        )
+                        .await
+                        {
                             Ok(new_agent) => agent = new_agent,
                             Err(e) => eprintln!("error reloading provider: {e}"),
                         }
@@ -521,7 +744,13 @@ async fn run_interactive(
             "/model" => {
                 match model::run().await {
                     Ok(()) => {
-                        match build_agent(false, false, current_agent.system_prompt.clone()).await {
+                        let sid = agent.session_id().await;
+                        match build_agent(
+                            SessionChoice::Existing(sid),
+                            current_agent.system_prompt.clone(),
+                        )
+                        .await
+                        {
                             Ok(new_agent) => agent = new_agent,
                             Err(e) => eprintln!("error reloading provider: {e}"),
                         }
@@ -547,20 +776,57 @@ async fn run_interactive(
         agent.set_cancel(cancel_flag.clone());
 
         let (token_tx, token_rx) = tokio::sync::mpsc::channel::<io_runtime::AgentEvent>(64);
-        let print_task = tokio::spawn(blink_and_print(token_rx));
+        let pending_perm: PendingPermission = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let print_task = tokio::spawn(blink_and_print(token_rx, pending_perm.clone()));
 
-        // Background thread: poll for Esc and signal cancellation.
+        // Background thread: poll keys — answer permission prompts (y/a/n),
+        // otherwise Esc signals cancellation.
         let cancel_for_listener = cancel_flag.clone();
+        let pending_for_listener = pending_perm.clone();
         let streaming_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let streaming_done2 = streaming_done.clone();
         let (esc_tx, esc_rx) = tokio::sync::oneshot::channel::<()>();
         let key_listener = tokio::task::spawn_blocking(move || {
             use crossterm::{event, terminal};
+            use io_runtime::PermissionReply;
             let _ = terminal::enable_raw_mode();
             loop {
-                if streaming_done2.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                if streaming_done2.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 if event::poll(std::time::Duration::from_millis(50)).unwrap_or(false) {
                     if let Ok(event::Event::Key(k)) = event::read() {
+                        let mut slot = pending_for_listener.lock().unwrap();
+                        if slot.is_some() {
+                            // A permission prompt is on screen — interpret the
+                            // key as an answer; ignore anything unrecognized.
+                            let reply = match k.code {
+                                event::KeyCode::Char('y')
+                                | event::KeyCode::Char('Y')
+                                | event::KeyCode::Enter => Some(PermissionReply::AllowOnce),
+                                event::KeyCode::Char('a') | event::KeyCode::Char('A') => {
+                                    Some(PermissionReply::AllowSession)
+                                }
+                                event::KeyCode::Char('n')
+                                | event::KeyCode::Char('N')
+                                | event::KeyCode::Esc => Some(PermissionReply::Deny),
+                                _ => None,
+                            };
+                            if let Some(reply) = reply {
+                                let label = match reply {
+                                    PermissionReply::AllowOnce => "yes",
+                                    PermissionReply::AllowSession => "always",
+                                    PermissionReply::Deny => "no",
+                                };
+                                print!("{label}\r\n");
+                                let _ = std::io::stdout().flush();
+                                if let Some(tx) = slot.take() {
+                                    let _ = tx.send(reply);
+                                }
+                            }
+                            continue;
+                        }
+                        drop(slot);
                         if k.code == event::KeyCode::Esc {
                             cancel_for_listener.store(true, std::sync::atomic::Ordering::Relaxed);
                             let _ = esc_tx.send(());
@@ -588,7 +854,9 @@ async fn run_interactive(
         let _ = key_listener.await;
 
         let (agent_thoughts, turn_input_tokens) = print_task.await.ok().unwrap_or((None, 0));
-        if turn_input_tokens > 0 { last_input_tokens = turn_input_tokens; }
+        if turn_input_tokens > 0 {
+            last_input_tokens = turn_input_tokens;
+        }
         println!();
         if let Some(ref t) = agent_thoughts {
             render_thoughts(t);
@@ -615,7 +883,10 @@ struct ThinkParser {
 
 impl ThinkParser {
     fn new() -> Self {
-        Self { pending: String::new(), in_think: false }
+        Self {
+            pending: String::new(),
+            in_think: false,
+        }
     }
 
     /// Feed a streaming delta. Returns `(display_text, thinking_text)`.
@@ -657,7 +928,11 @@ impl ThinkParser {
     /// Flush any remaining buffered bytes at end-of-stream.
     fn flush(&mut self) -> (String, String) {
         let text = std::mem::take(&mut self.pending);
-        if self.in_think { (String::new(), text) } else { (text, String::new()) }
+        if self.in_think {
+            (String::new(), text)
+        } else {
+            (text, String::new())
+        }
     }
 }
 
@@ -666,6 +941,7 @@ fn process_ev(
     text: &mut String,
     think: &mut String,
     parser: &mut ThinkParser,
+    pending_perm: &PendingPermission,
 ) {
     use io_runtime::AgentEvent;
     match ev {
@@ -678,17 +954,34 @@ fn process_ev(
             think.push_str(&delta);
         }
         AgentEvent::ToolStart { name, input } => render_tool_start(&name, &input),
-        AgentEvent::ToolDone { name, output, success } => render_tool_done(&name, &output, success),
+        AgentEvent::ToolDone {
+            name,
+            output,
+            success,
+        } => render_tool_done(&name, &output, success),
+        AgentEvent::PermissionRequest { respond, .. } => {
+            // The ToolStart line above already shows what will run; the key
+            // listener picks the answer up from the shared slot.
+            use crossterm::style::Stylize;
+            print!("  {} ", "allow? [y]es / [a]lways / [n]o:".yellow());
+            let _ = std::io::stdout().flush();
+            *pending_perm.lock().unwrap() = Some(respond);
+        }
         AgentEvent::Usage { .. } => {} // captured at call site
         AgentEvent::AutoCompact { turns_compacted } => {
-            print!("\r\n  [auto-compact] Compacted {turns_compacted} turn{} into a summary.\r\n",
-                if turns_compacted == 1 { "" } else { "s" });
+            print!(
+                "\r\n  [auto-compact] Compacted {turns_compacted} turn{} into a summary.\r\n",
+                if turns_compacted == 1 { "" } else { "s" }
+            );
             let _ = std::io::stdout().flush();
         }
     }
 }
 
-async fn blink_and_print(mut rx: tokio::sync::mpsc::Receiver<io_runtime::AgentEvent>) -> (Option<String>, u32) {
+async fn blink_and_print(
+    mut rx: tokio::sync::mpsc::Receiver<io_runtime::AgentEvent>,
+    pending_perm: PendingPermission,
+) -> (Option<String>, u32) {
     let on = "  +  +  +  +  +";
     let mut phase = false;
 
@@ -713,15 +1006,33 @@ async fn blink_and_print(mut rx: tokio::sync::mpsc::Receiver<io_runtime::AgentEv
     let mut input_tokens: u32 = 0;
 
     if let Some(ev) = first {
-        if let io_runtime::AgentEvent::Usage { input_tokens: n, .. } = &ev {
+        if let io_runtime::AgentEvent::Usage {
+            input_tokens: n, ..
+        } = &ev
+        {
             input_tokens = *n;
         }
-        process_ev(ev, &mut text_buf, &mut think_buf, &mut parser);
+        process_ev(
+            ev,
+            &mut text_buf,
+            &mut think_buf,
+            &mut parser,
+            &pending_perm,
+        );
         while let Some(ev) = rx.recv().await {
-            if let io_runtime::AgentEvent::Usage { input_tokens: n, .. } = &ev {
+            if let io_runtime::AgentEvent::Usage {
+                input_tokens: n, ..
+            } = &ev
+            {
                 input_tokens = *n;
             }
-            process_ev(ev, &mut text_buf, &mut think_buf, &mut parser);
+            process_ev(
+                ev,
+                &mut text_buf,
+                &mut think_buf,
+                &mut parser,
+                &pending_perm,
+            );
         }
     }
 
@@ -735,7 +1046,11 @@ async fn blink_and_print(mut rx: tokio::sync::mpsc::Receiver<io_runtime::AgentEv
         render_markdown(&text_buf);
     }
 
-    let thoughts = if think_buf.trim().is_empty() { None } else { Some(think_buf) };
+    let thoughts = if think_buf.trim().is_empty() {
+        None
+    } else {
+        Some(think_buf)
+    };
     (thoughts, input_tokens)
 }
 
@@ -750,14 +1065,23 @@ fn render_context_bar(input_tokens: u32, context_window: u64) -> String {
     } else {
         format!("{}K", context_window / 1_000)
     };
-    format!("ctx [{}{}] {}% of {}", "█".repeat(filled), "░".repeat(empty), pct, window_label)
+    format!(
+        "ctx [{}{}] {}% of {}",
+        "█".repeat(filled),
+        "░".repeat(empty),
+        pct,
+        window_label
+    )
 }
 
 fn print_prompt(agent: &io_runtime::Agent, input_tokens: u32, agent_id: &str) {
     use crossterm::style::Stylize;
     use std::io::Write;
 
-    let provider_model = format!("  {} · {} · {}", agent_id, agent.provider_id, agent.model_id);
+    let provider_model = format!(
+        "  {} · {} · {}",
+        agent_id, agent.provider_id, agent.model_id
+    );
     let status = if input_tokens > 0 {
         let bar = render_context_bar(input_tokens, agent.context_window());
         format!("{}  |  {}", provider_model, bar)
@@ -783,8 +1107,10 @@ fn render_markdown(text: &str) {
     skin.headers[0].set_fg(termimad::crossterm::style::Color::Green);
     skin.headers[0].add_attr(termimad::crossterm::style::Attribute::Bold);
     skin.bold.set_fg(termimad::crossterm::style::Color::Green);
-    skin.inline_code.set_fg(termimad::crossterm::style::Color::Yellow);
-    skin.code_block.set_fg(termimad::crossterm::style::Color::Yellow);
+    skin.inline_code
+        .set_fg(termimad::crossterm::style::Color::Yellow);
+    skin.code_block
+        .set_fg(termimad::crossterm::style::Color::Yellow);
     skin.italic.set_fg(termimad::crossterm::style::Color::White);
     skin.table.align = termimad::Alignment::Left;
     skin.table.left_margin = 0;
@@ -846,17 +1172,37 @@ fn render_thoughts(thoughts: &str) {
     println!();
 }
 
-fn render_tool_start(name: &str, input: &serde_json::Value) {
-    use crossterm::style::{Stylize, Color};
-    let label = format!(" {name} ").with(Color::Black).on(Color::DarkGrey);
-    let detail = match name {
-        "bash"  => input.get("command").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        "read"  => input.get("file_path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        "write" => input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        "edit"  => input.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        "glob"  => input.get("pattern").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        "grep"  => {
-            let pat  = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
+/// One-line human-readable summary of a tool call's input, shared by the
+/// tool-start renderer and the permission prompts.
+fn tool_detail(name: &str, input: &serde_json::Value) -> String {
+    match name {
+        "bash" => input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "read" => input
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "write" => input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "edit" => input
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "glob" => input
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "grep" => {
+            let pat = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             format!("{pat}  in  {path}")
         }
@@ -876,7 +1222,13 @@ fn render_tool_start(name: &str, input: &serde_json::Value) {
             format!("[{agent_name}]  {task_preview}")
         }
         _ => String::new(),
-    };
+    }
+}
+
+fn render_tool_start(name: &str, input: &serde_json::Value) {
+    use crossterm::style::{Color, Stylize};
+    let label = format!(" {name} ").with(Color::Black).on(Color::DarkGrey);
+    let detail = tool_detail(name, input);
     if detail.is_empty() {
         print!("  {label}\r\n");
     } else {
@@ -911,7 +1263,8 @@ fn render_diff(diff: &str) {
     for raw in diff.lines() {
         if raw.starts_with("--- ") || raw.starts_with("+++ ") {
             // file header — dim grey
-            let _ = execute!(stdout(),
+            let _ = execute!(
+                stdout(),
                 SetForegroundColor(Color::DarkGrey),
                 Print(format!("  {raw}\r\n")),
                 ResetColor
@@ -922,13 +1275,15 @@ fn render_diff(diff: &str) {
                 old_line = a;
                 new_line = b;
             }
-            let _ = execute!(stdout(),
+            let _ = execute!(
+                stdout(),
                 SetForegroundColor(Color::DarkCyan),
                 Print(format!("  @@ {rest}\r\n")),
                 ResetColor
             );
         } else if let Some(content) = raw.strip_prefix('-') {
-            let _ = execute!(stdout(),
+            let _ = execute!(
+                stdout(),
                 SetForegroundColor(Color::Red),
                 Print(format!("{:>5} ", old_line)),
                 SetForegroundColor(Color::Black),
@@ -943,7 +1298,8 @@ fn render_diff(diff: &str) {
             );
             old_line += 1;
         } else if let Some(content) = raw.strip_prefix('+') {
-            let _ = execute!(stdout(),
+            let _ = execute!(
+                stdout(),
                 SetForegroundColor(Color::Green),
                 Print(format!("{:>5} ", new_line)),
                 SetForegroundColor(Color::Black),
@@ -976,12 +1332,16 @@ fn parse_hunk(s: &str) -> Option<(u32, u32)> {
     Some((a, b))
 }
 
-
 async fn run_bash(cmd: &str) -> String {
     const ALLOWED_SHELLS: &[&str] = &[
-        "/bin/sh", "/bin/bash", "/usr/bin/bash",
-        "/bin/zsh", "/usr/bin/zsh",
-        "/usr/local/bin/bash", "/usr/local/bin/zsh", "/usr/local/bin/sh",
+        "/bin/sh",
+        "/bin/bash",
+        "/usr/bin/bash",
+        "/bin/zsh",
+        "/usr/bin/zsh",
+        "/usr/local/bin/bash",
+        "/usr/local/bin/zsh",
+        "/usr/local/bin/sh",
     ];
     let shell = std::env::var("SHELL")
         .ok()
@@ -989,8 +1349,12 @@ async fn run_bash(cmd: &str) -> String {
         .unwrap_or_else(|| "/bin/sh".to_string());
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(30),
-        tokio::process::Command::new(&shell).arg("-lc").arg(cmd).output(),
-    ).await;
+        tokio::process::Command::new(&shell)
+            .arg("-lc")
+            .arg(cmd)
+            .output(),
+    )
+    .await;
 
     match output {
         Ok(Ok(out)) => {

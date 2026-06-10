@@ -13,15 +13,42 @@ struct Cmd {
 }
 
 const COMMANDS: &[Cmd] = &[
-    Cmd { name: "/help",    desc: "Show available commands"                    },
-    Cmd { name: "/agent",   desc: "Switch agent mode"                          },
-    Cmd { name: "/connect", desc: "Set up a provider"                          },
-    Cmd { name: "/model",   desc: "Switch model"                               },
-    Cmd { name: "/cost",    desc: "Show API cost for current session"           },
-    Cmd { name: "/compact", desc: "Summarize and compress conversation history" },
-    Cmd { name: "/exit",    desc: "Exit"                                       },
-    Cmd { name: "/quit",    desc: "Exit"                                       },
-    Cmd { name: "/q",       desc: "Exit"                                       },
+    Cmd {
+        name: "/help",
+        desc: "Show available commands",
+    },
+    Cmd {
+        name: "/agent",
+        desc: "Switch agent mode",
+    },
+    Cmd {
+        name: "/connect",
+        desc: "Set up a provider",
+    },
+    Cmd {
+        name: "/model",
+        desc: "Switch model",
+    },
+    Cmd {
+        name: "/cost",
+        desc: "Show API cost for current session",
+    },
+    Cmd {
+        name: "/compact",
+        desc: "Summarize and compress conversation history",
+    },
+    Cmd {
+        name: "/exit",
+        desc: "Exit",
+    },
+    Cmd {
+        name: "/quit",
+        desc: "Exit",
+    },
+    Cmd {
+        name: "/q",
+        desc: "Exit",
+    },
 ];
 
 // Column index where user input starts — must match the width of ">>> "
@@ -95,24 +122,32 @@ fn list_files() -> Vec<String> {
         .unwrap_or_else(list_files_stdlib)
 }
 
-fn sort_entries(files: &mut Vec<String>) {
+fn sort_entries(files: &mut [String]) {
     files.sort_by(|a, b| b.ends_with('/').cmp(&a.ends_with('/')).then(a.cmp(b)));
 }
 
 fn list_files_fd() -> Option<Vec<String>> {
     let dirs = std::process::Command::new("fd")
         .args(["--type", "d", "--strip-cwd-prefix", "--color", "never"])
-        .output().ok().filter(|o| o.status.success())?;
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
     let files = std::process::Command::new("fd")
         .args(["--type", "f", "--strip-cwd-prefix", "--color", "never"])
-        .output().ok().filter(|o| o.status.success())?;
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
 
     let mut results = Vec::new();
     for line in String::from_utf8_lossy(&dirs.stdout).lines() {
-        if !line.is_empty() { results.push(format!("{}/", line.trim_end_matches('/'))); }
+        if !line.is_empty() {
+            results.push(format!("{}/", line.trim_end_matches('/')));
+        }
     }
     for line in String::from_utf8_lossy(&files.stdout).lines() {
-        if !line.is_empty() { results.push(line.to_string()); }
+        if !line.is_empty() {
+            results.push(line.to_string());
+        }
     }
     sort_entries(&mut results);
     Some(results)
@@ -121,10 +156,15 @@ fn list_files_fd() -> Option<Vec<String>> {
 fn list_files_rg() -> Option<Vec<String>> {
     let out = std::process::Command::new("rg")
         .args(["--files", "--color", "never"])
-        .output().ok().filter(|o| o.status.success())?;
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
 
     let mut results: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect();
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
 
     if let Ok(entries) = std::fs::read_dir(".") {
         for e in entries.filter_map(|e| e.ok()) {
@@ -149,14 +189,20 @@ fn list_files_git() -> Option<Vec<String>> {
         .filter(|o| o.status.success())?;
 
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut results: Vec<String> = text.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect();
+    let mut results: Vec<String> = text
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
 
     // Derive all ancestor directories from the file paths.
     let mut dirs = std::collections::HashSet::new();
     for path in &results {
         let mut p = std::path::Path::new(path);
         while let Some(parent) = p.parent() {
-            if parent == std::path::Path::new("") { break; }
+            if parent == std::path::Path::new("") {
+                break;
+            }
             dirs.insert(format!("{}/", parent.display()));
             p = parent;
         }
@@ -167,7 +213,9 @@ fn list_files_git() -> Option<Vec<String>> {
 }
 
 fn list_files_stdlib() -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(".") else { return vec![]; };
+    let Ok(entries) = std::fs::read_dir(".") else {
+        return vec![];
+    };
     let mut files: Vec<String> = entries
         .filter_map(|e| e.ok())
         .filter_map(|e| {
@@ -181,9 +229,14 @@ fn list_files_stdlib() -> Vec<String> {
 }
 
 fn filter_files(all: &[String], prefix: &str) -> Vec<String> {
-    if prefix.is_empty() { return all.to_vec(); }
+    if prefix.is_empty() {
+        return all.to_vec();
+    }
     let lower = prefix.to_ascii_lowercase();
-    all.iter().filter(|f| f.to_ascii_lowercase().starts_with(&lower)).cloned().collect()
+    all.iter()
+        .filter(|f| f.to_ascii_lowercase().starts_with(&lower))
+        .cloned()
+        .collect()
 }
 
 /// Print `buf` with any `@token` spans rendered in cyan.
@@ -191,14 +244,20 @@ fn render_buf(stdout: &mut impl Write, buf: &str) -> io::Result<()> {
     let mut rest = buf;
     while !rest.is_empty() {
         // Find the next @ that is at the start or preceded by whitespace.
-        let at_pos = rest.char_indices().find(|&(i, c)| {
-            c == '@' && (i == 0 || rest[..i].ends_with(char::is_whitespace))
-        }).map(|(i, _)| i);
+        let at_pos = rest
+            .char_indices()
+            .find(|&(i, c)| c == '@' && (i == 0 || rest[..i].ends_with(char::is_whitespace)))
+            .map(|(i, _)| i);
 
         match at_pos {
-            None => { queue!(stdout, Print(rest))?; break; }
+            None => {
+                queue!(stdout, Print(rest))?;
+                break;
+            }
             Some(i) => {
-                if i > 0 { queue!(stdout, Print(&rest[..i]))?; }
+                if i > 0 {
+                    queue!(stdout, Print(&rest[..i]))?;
+                }
                 let after = &rest[i + 1..];
                 let end = after.find(char::is_whitespace).unwrap_or(after.len());
                 queue!(
@@ -228,7 +287,11 @@ fn redraw(
     file_state: Option<(&[String], Option<usize>, usize)>,
     popup_capacity: usize,
 ) -> io::Result<usize> {
-    queue!(stdout, cursor::MoveToColumn(PROMPT_COL), terminal::Clear(ClearType::UntilNewLine))?;
+    queue!(
+        stdout,
+        cursor::MoveToColumn(PROMPT_COL),
+        terminal::Clear(ClearType::UntilNewLine)
+    )?;
     render_buf(stdout, buf)?;
 
     let input_end_col = PROMPT_COL + buf.len() as u16;
@@ -240,7 +303,9 @@ fn redraw(
             let has_above = scroll > 0;
             let mut item_rows = popup_capacity.saturating_sub(usize::from(has_above));
             let has_below = scroll + item_rows < items.len();
-            if has_below { item_rows = item_rows.saturating_sub(1); }
+            if has_below {
+                item_rows = item_rows.saturating_sub(1);
+            }
 
             let window = &items[scroll..(scroll + item_rows).min(items.len())];
             new_popup = usize::from(has_above) + window.len() + usize::from(has_below);
@@ -320,7 +385,11 @@ fn redraw(
             let max_lines = old_popup.max(new_popup);
 
             if max_lines > 0 {
-                let name_w = matches.iter().map(|&i| COMMANDS[i].name.len()).max().unwrap_or(0);
+                let name_w = matches
+                    .iter()
+                    .map(|&i| COMMANDS[i].name.len())
+                    .max()
+                    .unwrap_or(0);
                 queue!(stdout, cursor::MoveDown(1), cursor::MoveToColumn(0))?;
                 for i in 0..max_lines {
                     queue!(stdout, terminal::Clear(ClearType::CurrentLine))?;
@@ -344,7 +413,9 @@ fn redraw(
                             )?;
                         }
                     }
-                    if i + 1 < max_lines { queue!(stdout, cursor::MoveToNextLine(1))?; }
+                    if i + 1 < max_lines {
+                        queue!(stdout, cursor::MoveToNextLine(1))?;
+                    }
                 }
                 queue!(
                     stdout,
@@ -360,11 +431,15 @@ fn redraw(
 }
 
 fn clear_popup(stdout: &mut impl Write, popup_lines: usize) -> io::Result<()> {
-    if popup_lines == 0 { return Ok(()); }
+    if popup_lines == 0 {
+        return Ok(());
+    }
     queue!(stdout, cursor::MoveDown(1), cursor::MoveToColumn(0))?;
     for i in 0..popup_lines {
         queue!(stdout, terminal::Clear(ClearType::CurrentLine))?;
-        if i + 1 < popup_lines { queue!(stdout, cursor::MoveToNextLine(1))?; }
+        if i + 1 < popup_lines {
+            queue!(stdout, cursor::MoveToNextLine(1))?;
+        }
     }
     queue!(stdout, cursor::MoveUp(popup_lines as u16))?;
     Ok(())
@@ -404,7 +479,10 @@ fn input_loop(
     ctx: ReadLineCtx,
     popup_capacity: usize,
 ) -> anyhow::Result<Option<ReadLineOutput>> {
-    let ReadLineCtx { tab_statuses, mut tab_current } = ctx;
+    let ReadLineCtx {
+        tab_statuses,
+        mut tab_current,
+    } = ctx;
 
     let mut buf = String::new();
     let mut slash_selected: Option<usize> = None;
@@ -416,8 +494,12 @@ fn input_loop(
     let mut popup_lines = redraw(stdout, &buf, slash_selected, 0, None, popup_capacity)?;
 
     loop {
-        let Event::Key(key) = event::read()? else { continue; };
-        if key.kind == KeyEventKind::Release { continue; }
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
 
         match (key.code, key.modifiers) {
             // ── exit signals ─────────────────────────────────────────────
@@ -431,7 +513,10 @@ fn input_loop(
                 clear_popup(stdout, popup_lines)?;
                 queue!(stdout, Print("^C\n"))?;
                 stdout.flush()?;
-                return Ok(Some(ReadLineOutput { text: String::new(), agent_idx: tab_current }));
+                return Ok(Some(ReadLineOutput {
+                    text: String::new(),
+                    agent_idx: tab_current,
+                }));
             }
 
             // ── confirm ──────────────────────────────────────────────────
@@ -447,7 +532,14 @@ fn input_loop(
                                 file_filtered.clear();
                                 file_selected = None;
                                 file_scroll = 0;
-                                popup_lines = redraw(stdout, &buf, slash_selected, popup_lines, None, popup_capacity)?;
+                                popup_lines = redraw(
+                                    stdout,
+                                    &buf,
+                                    slash_selected,
+                                    popup_lines,
+                                    None,
+                                    popup_capacity,
+                                )?;
                                 continue;
                             }
                         }
@@ -464,7 +556,10 @@ fn input_loop(
                 clear_popup(stdout, popup_lines)?;
                 queue!(stdout, Print("\n"))?;
                 stdout.flush()?;
-                return Ok(Some(ReadLineOutput { text: buf, agent_idx: tab_current }));
+                return Ok(Some(ReadLineOutput {
+                    text: buf,
+                    agent_idx: tab_current,
+                }));
             }
 
             // ── editing ──────────────────────────────────────────────────
@@ -480,7 +575,11 @@ fn input_loop(
                         } else if let Some(all) = &file_all {
                             file_filtered = filter_files(all, prefix);
                         }
-                        file_selected = if file_filtered.is_empty() { None } else { Some(0) };
+                        file_selected = if file_filtered.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        };
                         file_scroll = 0;
                     }
                     None => {
@@ -490,8 +589,17 @@ fn input_loop(
                         file_scroll = 0;
                     }
                 }
-                let fs = file_all.as_ref().map(|_| (file_filtered.as_slice(), file_selected, file_scroll));
-                popup_lines = redraw(stdout, &buf, slash_selected, popup_lines, fs, popup_capacity)?;
+                let fs = file_all
+                    .as_ref()
+                    .map(|_| (file_filtered.as_slice(), file_selected, file_scroll));
+                popup_lines = redraw(
+                    stdout,
+                    &buf,
+                    slash_selected,
+                    popup_lines,
+                    fs,
+                    popup_capacity,
+                )?;
             }
             (KeyCode::Esc, _) => {
                 file_all = None;
@@ -499,7 +607,14 @@ fn input_loop(
                 file_selected = None;
                 file_scroll = 0;
                 slash_selected = None;
-                popup_lines = redraw(stdout, &buf, slash_selected, popup_lines, None, popup_capacity)?;
+                popup_lines = redraw(
+                    stdout,
+                    &buf,
+                    slash_selected,
+                    popup_lines,
+                    None,
+                    popup_capacity,
+                )?;
             }
 
             // ── Tab ───────────────────────────────────────────────────────
@@ -510,11 +625,20 @@ fn input_loop(
                         redraw_status(stdout, &tab_statuses[tab_current])?;
                     }
                 } else if file_all.is_some() && !file_filtered.is_empty() {
-                    let next = file_selected.map(|s| (s + 1) % file_filtered.len()).unwrap_or(0);
+                    let next = file_selected
+                        .map(|s| (s + 1) % file_filtered.len())
+                        .unwrap_or(0);
                     file_selected = Some(next);
                     adjust_scroll(next, &mut file_scroll, popup_capacity);
                     let fs = Some((file_filtered.as_slice(), file_selected, file_scroll));
-                    popup_lines = redraw(stdout, &buf, slash_selected, popup_lines, fs, popup_capacity)?;
+                    popup_lines = redraw(
+                        stdout,
+                        &buf,
+                        slash_selected,
+                        popup_lines,
+                        fs,
+                        popup_capacity,
+                    )?;
                 } else {
                     let matches = filter_matches(&buf);
                     if !matches.is_empty() {
@@ -522,7 +646,14 @@ fn input_loop(
                             None => 0,
                             Some(s) => (s + 1) % matches.len(),
                         });
-                        popup_lines = redraw(stdout, &buf, slash_selected, popup_lines, None, popup_capacity)?;
+                        popup_lines = redraw(
+                            stdout,
+                            &buf,
+                            slash_selected,
+                            popup_lines,
+                            None,
+                            popup_capacity,
+                        )?;
                     }
                 }
             }
@@ -530,11 +661,20 @@ fn input_loop(
             // ── arrow navigation ─────────────────────────────────────────
             (KeyCode::Down, _) => {
                 if file_all.is_some() && !file_filtered.is_empty() {
-                    let next = file_selected.map(|s| (s + 1) % file_filtered.len()).unwrap_or(0);
+                    let next = file_selected
+                        .map(|s| (s + 1) % file_filtered.len())
+                        .unwrap_or(0);
                     file_selected = Some(next);
                     adjust_scroll(next, &mut file_scroll, popup_capacity);
                     let fs = Some((file_filtered.as_slice(), file_selected, file_scroll));
-                    popup_lines = redraw(stdout, &buf, slash_selected, popup_lines, fs, popup_capacity)?;
+                    popup_lines = redraw(
+                        stdout,
+                        &buf,
+                        slash_selected,
+                        popup_lines,
+                        fs,
+                        popup_capacity,
+                    )?;
                 } else {
                     let matches = filter_matches(&buf);
                     if !matches.is_empty() {
@@ -542,7 +682,14 @@ fn input_loop(
                             None => 0,
                             Some(s) => (s + 1) % matches.len(),
                         });
-                        popup_lines = redraw(stdout, &buf, slash_selected, popup_lines, None, popup_capacity)?;
+                        popup_lines = redraw(
+                            stdout,
+                            &buf,
+                            slash_selected,
+                            popup_lines,
+                            None,
+                            popup_capacity,
+                        )?;
                     }
                 }
             }
@@ -555,7 +702,14 @@ fn input_loop(
                     file_selected = Some(prev);
                     adjust_scroll(prev, &mut file_scroll, popup_capacity);
                     let fs = Some((file_filtered.as_slice(), file_selected, file_scroll));
-                    popup_lines = redraw(stdout, &buf, slash_selected, popup_lines, fs, popup_capacity)?;
+                    popup_lines = redraw(
+                        stdout,
+                        &buf,
+                        slash_selected,
+                        popup_lines,
+                        fs,
+                        popup_capacity,
+                    )?;
                 } else {
                     let matches = filter_matches(&buf);
                     if !matches.is_empty() {
@@ -563,7 +717,14 @@ fn input_loop(
                             None | Some(0) => matches.len() - 1,
                             Some(s) => s - 1,
                         });
-                        popup_lines = redraw(stdout, &buf, slash_selected, popup_lines, None, popup_capacity)?;
+                        popup_lines = redraw(
+                            stdout,
+                            &buf,
+                            slash_selected,
+                            popup_lines,
+                            None,
+                            popup_capacity,
+                        )?;
                     }
                 }
             }
@@ -574,10 +735,21 @@ fn input_loop(
                 let all = list_files();
                 file_filtered = all.clone();
                 file_all = Some(all);
-                file_selected = if file_filtered.is_empty() { None } else { Some(0) };
+                file_selected = if file_filtered.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
                 file_scroll = 0;
                 let fs = Some((file_filtered.as_slice(), file_selected, file_scroll));
-                popup_lines = redraw(stdout, &buf, slash_selected, popup_lines, fs, popup_capacity)?;
+                popup_lines = redraw(
+                    stdout,
+                    &buf,
+                    slash_selected,
+                    popup_lines,
+                    fs,
+                    popup_capacity,
+                )?;
             }
 
             // ── space ends a file path ────────────────────────────────────
@@ -588,7 +760,14 @@ fn input_loop(
                 file_selected = None;
                 file_scroll = 0;
                 slash_selected = None;
-                popup_lines = redraw(stdout, &buf, slash_selected, popup_lines, None, popup_capacity)?;
+                popup_lines = redraw(
+                    stdout,
+                    &buf,
+                    slash_selected,
+                    popup_lines,
+                    None,
+                    popup_capacity,
+                )?;
             }
 
             // ── regular character ────────────────────────────────────────
@@ -600,13 +779,31 @@ fn input_loop(
                             file_filtered = filter_files(all, prefix);
                         }
                     }
-                    file_selected = if file_filtered.is_empty() { None } else { Some(0) };
+                    file_selected = if file_filtered.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    };
                     file_scroll = 0;
                     let fs = Some((file_filtered.as_slice(), file_selected, file_scroll));
-                    popup_lines = redraw(stdout, &buf, slash_selected, popup_lines, fs, popup_capacity)?;
+                    popup_lines = redraw(
+                        stdout,
+                        &buf,
+                        slash_selected,
+                        popup_lines,
+                        fs,
+                        popup_capacity,
+                    )?;
                 } else {
                     slash_selected = None;
-                    popup_lines = redraw(stdout, &buf, slash_selected, popup_lines, None, popup_capacity)?;
+                    popup_lines = redraw(
+                        stdout,
+                        &buf,
+                        slash_selected,
+                        popup_lines,
+                        None,
+                        popup_capacity,
+                    )?;
                 }
             }
 

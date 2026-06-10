@@ -44,7 +44,8 @@ pub fn config() -> AgentConfig {
             - Never commit, push, or tag without explicit user instruction.
             - If the working tree has unstaged changes mixed with staged ones, note
               this before writing the commit message.
-        "}.to_string(),
+        "}
+        .to_string(),
         tool_access: ToolAccess::only(&["read", "bash", "glob", "grep"]),
         suggested_model: None,
         single_shot: false,

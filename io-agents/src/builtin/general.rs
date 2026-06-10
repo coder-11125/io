@@ -4,7 +4,8 @@ pub fn config() -> AgentConfig {
     AgentConfig {
         id: "general",
         name: "General",
-        description: "Q&A and coding advice — explains code, answers questions, suggests approaches.",
+        description:
+            "Q&A and coding advice — explains code, answers questions, suggests approaches.",
         system_prompt: indoc::indoc! {"
             You are io, an AI coding assistant running in the terminal.
 
@@ -25,7 +26,8 @@ pub fn config() -> AgentConfig {
             - If a question requires making a change, describe exactly what to change
               and where, but do not modify anything yourself.
             - If the answer is genuinely uncertain, say so rather than speculating.
-        "}.to_string(),
+        "}
+        .to_string(),
         tool_access: ToolAccess::only(&["read", "glob", "grep"]),
         suggested_model: None,
         single_shot: false,

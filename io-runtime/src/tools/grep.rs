@@ -4,7 +4,9 @@ pub struct GrepTool;
 
 #[async_trait::async_trait]
 impl Tool for GrepTool {
-    fn name(&self) -> &str { "grep" }
+    fn name(&self) -> &str {
+        "grep"
+    }
 
     fn description(&self) -> &str {
         "Search file contents using regular expressions. Returns file paths and line numbers of matches."
@@ -28,8 +30,17 @@ impl Tool for GrepTool {
             None => return ToolOutput::err("missing required argument: pattern"),
         };
 
-        let include = input.args.get("include").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let root = input.args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let include = input
+            .args
+            .get("include")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let root = input
+            .args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
 
         let re = match regex::Regex::new(&pattern) {
             Ok(r) => r,
@@ -45,21 +56,33 @@ impl Tool for GrepTool {
             }
         };
 
-        let walker = ignore::WalkBuilder::new(root).standard_filters(true).build();
+        let walker = ignore::WalkBuilder::new(root)
+            .standard_filters(true)
+            .build();
         let mut results: Vec<String> = Vec::new();
         let mut file_count = 0u32;
         let mut match_count = 0u32;
 
         for entry in walker {
-            let entry = match entry { Ok(e) => e, Err(_) => continue };
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
             let path = entry.path();
-            if path.is_dir() { continue; }
-
-            if let Some(ref glob) = include_glob {
-                if !glob.is_match(path) { continue; }
+            if path.is_dir() {
+                continue;
             }
 
-            let contents = match std::fs::read_to_string(path) { Ok(c) => c, Err(_) => continue };
+            if let Some(ref glob) = include_glob {
+                if !glob.is_match(path) {
+                    continue;
+                }
+            }
+
+            let contents = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
             let path_str = path.to_string_lossy();
             let mut file_matches = 0;
 
@@ -80,7 +103,9 @@ impl Tool for GrepTool {
             ToolOutput::ok(format!("no matches for pattern: {pattern}"))
         } else {
             let mut output = results.join("\n");
-            output.push_str(&format!("\n--- {match_count} matches across {file_count} files ---"));
+            output.push_str(&format!(
+                "\n--- {match_count} matches across {file_count} files ---"
+            ));
             ToolOutput::ok(output)
         }
     }
@@ -93,7 +118,12 @@ mod tests {
     fn input(args: serde_json::Value) -> ToolInput {
         ToolInput {
             name: "grep".into(),
-            args: args.as_object().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            args: args
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
         }
     }
 
@@ -113,7 +143,9 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_regex_returns_error() {
-        let out = GrepTool.execute(input(serde_json::json!({ "pattern": "[invalid" }))).await;
+        let out = GrepTool
+            .execute(input(serde_json::json!({ "pattern": "[invalid" })))
+            .await;
         assert!(!out.success);
         assert!(out.data.contains("invalid regex"));
     }
@@ -121,10 +153,12 @@ mod tests {
     #[tokio::test]
     async fn finds_matches_with_line_numbers() {
         let dir = make_temp_dir_with_file("sample.txt", "alpha\nbeta\nalpha again\n");
-        let out = GrepTool.execute(input(serde_json::json!({
-            "pattern": "alpha",
-            "path": dir.to_str().unwrap()
-        }))).await;
+        let out = GrepTool
+            .execute(input(serde_json::json!({
+                "pattern": "alpha",
+                "path": dir.to_str().unwrap()
+            })))
+            .await;
         std::fs::remove_dir_all(&dir).ok();
         assert!(out.success, "{}", out.data);
         assert!(out.data.contains("alpha"));
@@ -135,10 +169,12 @@ mod tests {
     #[tokio::test]
     async fn no_matches_returns_message() {
         let dir = make_temp_dir_with_file("empty.txt", "nothing relevant\n");
-        let out = GrepTool.execute(input(serde_json::json!({
-            "pattern": "ZZZNOMATCH",
-            "path": dir.to_str().unwrap()
-        }))).await;
+        let out = GrepTool
+            .execute(input(serde_json::json!({
+                "pattern": "ZZZNOMATCH",
+                "path": dir.to_str().unwrap()
+            })))
+            .await;
         std::fs::remove_dir_all(&dir).ok();
         assert!(out.success);
         assert!(out.data.contains("no matches"));

@@ -24,7 +24,10 @@ pub enum ProviderPricingCategory {
 
 impl ModelPricing {
     pub fn new(input_cost_per_1k: f64, output_cost_per_1k: f64) -> Self {
-        Self { input_cost_per_1k, output_cost_per_1k }
+        Self {
+            input_cost_per_1k,
+            output_cost_per_1k,
+        }
     }
 
     pub fn calculate_cost(&self, input_tokens: u32, output_tokens: u32) -> f64 {
@@ -46,10 +49,9 @@ pub fn get_provider_pricing_category(provider: &str, model: &str) -> ProviderPri
         "github_copilot" => ProviderPricingCategory::SubscriptionBased,
 
         // Proxies and deployment platforms — cost depends on the backend or contract
-        "openrouter"
-        | "azure"
-        | "opencode_go"
-        | "opencode_zen" => ProviderPricingCategory::PassThrough,
+        "openrouter" | "azure" | "opencode_go" | "opencode_zen" => {
+            ProviderPricingCategory::PassThrough
+        }
 
         // Priced providers
         _ => match get_pricing_for_model(provider, model) {
@@ -189,9 +191,7 @@ fn groq_pricing(model: &str) -> Option<ModelPricing> {
             ModelPricing::new(0.00005, 0.00008)
         }
         // DeepSeek on Groq
-        m if m.contains("deepseek-r1-distill-llama-70b") => {
-            ModelPricing::new(0.00075, 0.00099)
-        }
+        m if m.contains("deepseek-r1-distill-llama-70b") => ModelPricing::new(0.00075, 0.00099),
         // Mixtral
         m if m.contains("mixtral-8x7b") => ModelPricing::new(0.00024, 0.00024),
         // Gemma
@@ -219,7 +219,6 @@ fn xai_pricing(model: &str) -> Option<ModelPricing> {
         _ => return None,
     })
 }
-
 
 fn mistral_pricing(model: &str) -> Option<ModelPricing> {
     // https://mistral.ai/technology/#pricing

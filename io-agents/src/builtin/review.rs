@@ -30,7 +30,8 @@ pub fn config() -> AgentConfig {
 
             Do not rewrite code in your response unless a short snippet (≤5 lines) is
             the clearest way to explain a suggestion.
-        "}.to_string(),
+        "}
+        .to_string(),
         tool_access: ToolAccess::only(&["read", "glob", "grep"]),
         suggested_model: None,
         single_shot: false,

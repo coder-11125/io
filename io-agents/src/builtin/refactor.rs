@@ -35,7 +35,8 @@ pub fn config() -> AgentConfig {
 
             If you discover a bug while refactoring, stop and report it rather than
             silently fixing it — the user needs to know.
-        "}.to_string(),
+        "}
+        .to_string(),
         tool_access: ToolAccess::All,
         suggested_model: None,
         single_shot: false,

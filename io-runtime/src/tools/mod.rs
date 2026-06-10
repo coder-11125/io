@@ -1,23 +1,23 @@
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
-pub mod read;
 pub mod bash;
+pub mod edit;
 pub mod glob;
 pub mod grep;
-pub mod write;
-pub mod edit;
+pub mod read;
 pub mod spawn;
+pub mod write;
 
-pub use read::ReadTool;
 pub use bash::BashTool;
+pub use edit::EditTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
-pub use write::WriteTool;
-pub use edit::EditTool;
+pub use read::ReadTool;
 pub use spawn::SpawnAgentTool;
+pub use write::WriteTool;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolInput {
@@ -35,12 +35,20 @@ pub struct ToolOutput {
 
 impl ToolOutput {
     pub fn ok(data: impl Into<String>) -> Self {
-        Self { success: true, data: data.into(), error: None }
+        Self {
+            success: true,
+            data: data.into(),
+            error: None,
+        }
     }
 
     pub fn err(error: impl Into<String>) -> Self {
         let msg = error.into();
-        Self { success: false, data: msg.clone(), error: Some(msg) }
+        Self {
+            success: false,
+            data: msg.clone(),
+            error: Some(msg),
+        }
     }
 }
 
@@ -68,7 +76,9 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: HashMap::new() }
+        Self {
+            tools: HashMap::new(),
+        }
     }
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
@@ -85,11 +95,14 @@ impl ToolRegistry {
     }
 
     pub fn specs(&self) -> Vec<ToolSpec> {
-        self.all_tools().iter().map(|t| ToolSpec {
-            name: t.name().to_string(),
-            description: t.description().to_string(),
-            input_schema: t.input_schema(),
-        }).collect()
+        self.all_tools()
+            .iter()
+            .map(|t| ToolSpec {
+                name: t.name().to_string(),
+                description: t.description().to_string(),
+                input_schema: t.input_schema(),
+            })
+            .collect()
     }
 
     /// Propagate a cancellation flag to all tools.
@@ -109,8 +122,8 @@ pub fn resolve_safe_path(path: &str) -> Result<std::path::PathBuf, String> {
     if p.is_absolute() {
         return Ok(normalize_path(p));
     }
-    let cwd = std::env::current_dir()
-        .map_err(|e| format!("cannot determine working directory: {e}"))?;
+    let cwd =
+        std::env::current_dir().map_err(|e| format!("cannot determine working directory: {e}"))?;
     let resolved = normalize_path(&cwd.join(p));
     if !resolved.starts_with(&cwd) {
         return Err(format!("path '{path}' escapes the working directory"));
@@ -122,7 +135,9 @@ fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
     let mut out = std::path::PathBuf::new();
     for component in path.components() {
         match component {
-            std::path::Component::ParentDir => { out.pop(); }
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
             std::path::Component::CurDir => {}
             c => out.push(c),
         }
@@ -147,13 +162,13 @@ pub fn filtered_registry(names: &[&str]) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     for &name in names {
         match name {
-            "read"  => reg.register(Box::new(ReadTool)),
+            "read" => reg.register(Box::new(ReadTool)),
             "write" => reg.register(Box::new(WriteTool)),
-            "edit"  => reg.register(Box::new(EditTool)),
-            "bash"  => reg.register(Box::new(BashTool)),
-            "glob"  => reg.register(Box::new(GlobTool)),
-            "grep"  => reg.register(Box::new(GrepTool)),
-            _       => {}
+            "edit" => reg.register(Box::new(EditTool)),
+            "bash" => reg.register(Box::new(BashTool)),
+            "glob" => reg.register(Box::new(GlobTool)),
+            "grep" => reg.register(Box::new(GrepTool)),
+            _ => {}
         }
     }
     reg

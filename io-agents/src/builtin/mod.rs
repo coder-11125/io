@@ -33,7 +33,10 @@ pub fn all() -> Vec<AgentConfig> {
 /// Returns only the full agents (those with unrestricted tool access).
 pub fn full_agents() -> Vec<AgentConfig> {
     use crate::agent_config::ToolAccess;
-    all().into_iter().filter(|a| a.tool_access == ToolAccess::All).collect()
+    all()
+        .into_iter()
+        .filter(|a| a.tool_access == ToolAccess::All)
+        .collect()
 }
 
 /// Looks up a built-in agent by its `id` field.

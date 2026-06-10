@@ -167,7 +167,7 @@ The `Agent` struct orchestrates the core conversation loop:
 
 ```rust
 pub struct Agent {
-    provider: Arc<ProviderKind>,
+    provider: Arc<dyn CompletionModel>,  // trait object — mockable in tests
     tools: Arc<ToolRegistry>,
     session: Arc<Mutex<Session>>,
     memory: Arc<SessionStore>,
@@ -184,6 +184,13 @@ pub struct Agent {
 - `run_turn_streaming()` - Execute with real-time token streaming
 - `session_id()` - Get the current session ID
 - `context_window()` - Get the provider's context window size (delegates to `CompletionModel`)
+- `set_prompt_fn()` / `set_cancel()` - Permission prompt callback and cancellation flag
+
+Both run methods share one implementation (`run_turn_inner`); the optional
+event channel selects streaming vs. blocking mode. Per-turn usage records
+sum input tokens across loop iterations (billing-accurate), while the
+`Usage` event and auto-compact threshold use the last reported input
+(context-accurate).
 
 **Agent Loop**:
 1. Build message history from session
@@ -294,11 +301,15 @@ pub enum PermissionLevel {
 }
 ```
 
-**Permission Checking**:
-- Tool-level permissions via allow/deny lists
-- Command pattern matching for bash tool
-- Configurable default mode
-- Integration with agent loop for tool execution control
+**Permission Checking** (`PermissionChecker::decide_tool`):
+- Tool-level permissions via allow/deny lists (deny wins)
+- In `prompt` mode, read-only tools (read, glob, grep) run without asking;
+  bash commands are matched against `allowed_commands`/`denied_commands`;
+  everything else asks the user: **[y]es once / [a]lways this session / [n]o**
+- Streaming turns ask via `AgentEvent::PermissionRequest` (answered by the REPL
+  key listener); non-streaming turns use the agent's `set_prompt_fn` callback
+  (single-shot mode reads from stdin). With no way to ask, the call is denied.
+- "Always" answers are recorded per-tool for the session via `allow_for_session`
 
 ### Configuration System (io-runtime/src/config.rs)
 
@@ -353,10 +364,15 @@ struct Cli {
 
 **Subcommands**:
 - `io session {list|show|delete}` - Session management
-- `io config {show|set}` - Configuration management
+- `io config {show|set}` - Configuration management. `config set` keys:
+  `provider.default`, `provider.<name>.model`, `provider.<name>.api_key_env`,
+  `provider.azure.deployment`, `session.auto_compact`, `session.memory_enabled`,
+  `session.max_turns`, `session.max_tokens`, `permissions.default`
 - `io init` - Initialize project-level config
 
-**REPL slash commands**: `/help`, `/connect`, `/model`, `/cost`, `/exit` (also `/quit`, `/q`)
+**REPL slash commands**: `/help`, `/agent`, `/connect`, `/model`, `/cost`, `/compact`, `/exit` (also `/quit`, `/q`).
+Switching agent, provider, or model mid-conversation keeps the current session
+(`SessionChoice::Existing` in `build_agent`) — history is preserved.
 
 ### REPL Loop (io/src/main.rs)
 
@@ -426,7 +442,10 @@ The `ContextManager` builds LLM message history:
 
 ## Testing
 
-The project has 43 unit tests across 7 modules. Run with `cargo test`.
+The project has 49 unit tests plus 7 integration tests
+(`io-runtime/tests/agent_loop.rs` — full agent-loop runs against a scripted
+mock provider, covering tool execution, permission prompting/denial,
+streaming events, usage tracking, and session resumption). Run with `cargo test`.
 
 | Module | Tests |
 |---|---|
@@ -436,7 +455,8 @@ The project has 43 unit tests across 7 modules. Run with `cargo test`.
 | `tools/bash.rs` | missing arg, stdout, nonzero exit, timeout |
 | `tools/glob.rs` | missing arg, finds files, no matches, invalid pattern |
 | `tools/grep.rs` | missing arg, invalid regex, matches with line numbers, no matches |
-| `sandbox.rs` | allow/deny/prompt modes, denylist, allowlist, command basename matching |
+| `sandbox.rs` | allow/deny/prompt modes, denylist, allowlist, command basename matching, decide_tool prompting, session approvals |
+| `provider/mod.rs` | retryable vs non-retryable error classification |
 | `config.rs` | default config, roundtrip serialization |
 | `pricing.rs` | cost calculation, known models, free/subscription/passthrough providers |
 
