@@ -43,7 +43,9 @@ impl CompletionModel for AnthropicProvider {
     }
 
     fn context_window(&self) -> u64 {
-        super::context_window_for_model(&self.config.model)
+        self.config
+            .context_window
+            .unwrap_or_else(|| super::context_window_for_model(&self.config.model))
     }
 
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse> {
@@ -79,9 +81,7 @@ impl CompletionModel for AnthropicProvider {
             .await?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Anthropic API error ({status}): {text}");
+            return Err(super::api_error("Anthropic", resp).await);
         }
 
         let data: AnthropicResponse = resp.json().await?;

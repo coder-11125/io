@@ -62,9 +62,7 @@ impl CompletionModel for OpenAIProvider {
             .await?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("OpenAI API error ({status}): {text}");
+            return Err(super::api_error("OpenAI", resp).await);
         }
 
         let data: ChatResponse = resp.json().await?;
@@ -87,9 +85,7 @@ impl CompletionModel for OpenAIProvider {
             .await?;
 
         if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("OpenAI API error ({status}): {text}");
+            return Err(super::api_error("OpenAI", resp).await);
         }
 
         let (tx, rx) = tokio::sync::mpsc::channel(64);

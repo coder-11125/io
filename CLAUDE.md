@@ -8,7 +8,8 @@ This document provides comprehensive guidance for AI agents and developers worki
 
 ### Key Features
 - Multi-provider support (13 providers: Anthropic, OpenAI, Gemini, Groq, Ollama, Azure, Bedrock, Mistral, DeepSeek, OpenRouter, xAI, OpenCode Go, OpenCode Zen)
-- 6 built-in tools: read, write, edit, bash, glob, grep
+- 7 built-in tools: read, write, edit, bash, glob, grep, spawn_agent (sub-agent delegation)
+- Built-in agent roles (`io-agents` crate): full agents (build, plan, debug, refactor) and restricted sub-agents (explore, review, test, security, docs, git, …)
 - Interactive REPL and single-shot modes
 - Permission sandboxing (allow/deny/prompt modes)
 - SQLite-backed session persistence
@@ -26,36 +27,40 @@ io/
 ├── io/                        # CLI frontend (binary crate)
 │   ├── Cargo.toml
 │   └── src/
-│       ├── main.rs            # Entry point, CLI parsing, REPL loop
+│       ├── main.rs            # Entry point, CLI parsing, subcommand dispatch
+│       ├── repl.rs            # Interactive REPL + single-shot runner, streaming turn loop
+│       ├── render.rs          # Terminal rendering: markdown, diffs, tool calls, status line
+│       ├── cost.rs            # /cost report
+│       ├── config_cmd.rs      # `io config …` and `io init` handlers
+│       ├── agent.rs           # Agent switching (/agent command)
 │       ├── connect.rs         # Interactive provider setup wizard
 │       ├── model.rs           # Provider switching (/model command)
-│       ├── picker.rs          # Terminal interactive picker
+│       ├── picker.rs          # Terminal interactive picker (typed Dismissed errors)
 │       └── readline.rs        # Custom readline with slash commands
 ├── io-runtime/                # Core engine (library crate)
 │   ├── Cargo.toml
+│   ├── tests/
+│   │   └── agent_loop.rs      # Integration tests against a scripted mock provider
 │   └── src/
 │       ├── lib.rs             # Public API re-exports
 │       ├── agent.rs           # Agent loop (LLM + tool execution)
-│       ├── config.rs          # Configuration schema and loading
+│       ├── compact.rs         # /compact + auto-compact summarization
+│       ├── config.rs          # Configuration schema, loading, provider lookups
+│       ├── pricing.rs         # Per-model cost tables
 │       ├── types.rs           # Core data types (Session, Turn, etc.)
 │       ├── memory.rs          # SQLite-backed session persistence
-│       ├── context.rs         # Context building for LLM messages
 │       ├── sandbox.rs         # Permission checking system
-│       ├── provider/          # LLM provider implementations (13)
-│       │   ├── mod.rs         # Provider trait and common types
+│       ├── provider/          # LLM provider implementations
+│       │   ├── mod.rs         # Provider trait, retry wrapper, OpenAI-compat table,
+│       │   │                  #   create_provider() — 8 providers are one-line
+│       │   │                  #   entries in compat_provider()
 │       │   ├── anthropic.rs
-│       │   ├── openai.rs
+│       │   ├── openai.rs      # Also serves groq, mistral, deepseek, openrouter,
+│       │   │                  #   xai, opencode_go, opencode_zen, ollama via
+│       │   │                  #   OpenAICompatProvider
 │       │   ├── gemini.rs
-│       │   ├── groq.rs
-│       │   ├── ollama.rs
 │       │   ├── azure.rs
-│       │   ├── bedrock.rs
-│       │   ├── mistral.rs
-│       │   ├── deepseek.rs
-│       │   ├── openrouter.rs
-│       │   ├── xai.rs
-│       │   ├── opencode_go.rs
-│       │   └── opencode_zen.rs
+│       │   └── bedrock.rs
 │       └── tools/             # Built-in tool implementations
 │           ├── mod.rs         # Tool trait and registry
 │           ├── read.rs
@@ -63,7 +68,13 @@ io/
 │           ├── edit.rs
 │           ├── bash.rs
 │           ├── glob.rs
-│           └── grep.rs
+│           ├── grep.rs
+│           └── spawn.rs       # spawn_agent — delegate to a restricted sub-agent
+└── io-agents/                 # Built-in agent definitions (library crate)
+    └── src/
+        ├── agent_config.rs    # AgentConfig + ToolAccess (All / Only(tools))
+        └── builtin/           # build, plan, debug, explore, review, test,
+                               #   security, docs, git, refactor, general
 ```
 
 ### Crate Responsibilities
@@ -83,6 +94,11 @@ io/
 - Session persistence (SQLite)
 - Permission sandboxing
 - Context management for LLM conversations
+
+**io-agents (library crate)**:
+- Built-in agent definitions: id, system prompt, tool access, suggested model
+- `ToolAccess::All` agents are selectable in the REPL; `ToolAccess::Only(...)`
+  agents are spawnable as sub-agents via the `spawn_agent` tool
 
 ## Development Workflow
 
@@ -152,6 +168,13 @@ cargo clippy
 - Use `thiserror` for library-level error types
 - Provide context with `.context()` from anyhow
 - Avoid silent error swallowing - log warnings where appropriate
+- Cross-module error contracts are typed, not string-matched:
+  - `provider::ApiError { provider, status, message }` — non-2xx provider
+    responses; retry classification reads the status structurally
+  - `agent::Cancelled` — turn aborted via the cancellation flag; detect
+    with `err.is::<Cancelled>()`
+  - `picker::Dismissed::{Cancelled, Interrupted}` — picker backed out;
+    detect with `err.is::<picker::Dismissed>()`
 
 ### Async Patterns
 - Use `tokio` as the async runtime
@@ -171,7 +194,7 @@ pub struct Agent {
     tools: Arc<ToolRegistry>,
     session: Arc<Mutex<Session>>,
     memory: Arc<SessionStore>,
-    permissions: Arc<PermissionChecker>,
+    permissions: Arc<PermissionChecker>, // shared with SpawnAgentTool — sub-agents inherit it
     system_prompt: String,
     max_tokens: u32,
     pub model_id: String,
@@ -192,6 +215,15 @@ sum input tokens across loop iterations (billing-accurate), while the
 `Usage` event and auto-compact threshold use the last reported input
 (context-accurate).
 
+**Replay policy**: prior turns are replayed into context as user/assistant
+text only — tool calls and results are deliberately dropped (token-heavy,
+and providers reject tool blocks with stale IDs). Within a turn the model
+sees full tool traffic; across turns it relies on its own prose.
+
+**Mid-turn provider failures** save partial progress (text and executed
+tool calls) to the session before surfacing the error; tool calls parsed
+from a truncated stream are not executed.
+
 **Agent Loop**:
 1. Build message history from session
 2. Call LLM with tools
@@ -207,19 +239,32 @@ The provider system supports 13 LLM providers through a common trait:
 
 ```rust
 #[async_trait]
-pub trait CompletionModel: Send + Sync {
+pub trait CompletionModel: Debug + Send + Sync {
     fn provider_name(&self) -> &'static str;
+    fn context_window(&self) -> u64; // defaults to 128K
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse>;
-    async fn stream(&self, request: CompletionRequest) -> anyhow::Result<Pin<Box<dyn Stream<Item = StreamEvent> + Send>>>;
+    async fn complete_stream(&self, request: CompletionRequest)
+        -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<StreamEvent>>>;
 }
 ```
 
-**Adding a New Provider**:
-1. Create a new file in `io-runtime/src/provider/`
-2. Implement the `CompletionModel` trait
-3. Add configuration struct in `io-runtime/src/config.rs`
-4. Add to `ProviderKind` enum and `create_provider()` in `io-runtime/src/provider/mod.rs`
-5. Add to `PROVIDERS` array and match block in `io/src/connect.rs`
+`create_provider()` returns `Arc<dyn CompletionModel>` wrapped in `Retrying`,
+a decorator that retries transient failures (classified structurally via the
+`ApiError` HTTP status) with exponential backoff. Eight providers (Groq,
+Mistral, DeepSeek, OpenRouter, xAI, OpenCode Go/Zen, Ollama) are thin
+`OpenAICompatProvider` instances driven by the `compat_provider()` id →
+base-URL table; only Anthropic, OpenAI, Gemini, Azure, and Bedrock have
+their own implementation files.
+
+**Adding a New Provider** (OpenAI-compatible — the common case):
+1. Add a config struct in `io-runtime/src/config.rs` and a field on `ProviderConfig`
+2. Add the id to `key_overrides()`, `model_for()`, and `context_window_for()` in `config.rs`
+3. Add a one-line entry to `compat_provider()` in `io-runtime/src/provider/mod.rs`
+   (plus `default_key_env()` and optional `compat_context_window()` tuning)
+4. Add to `PROVIDERS` array and match block in `io/src/connect.rs`
+
+For non-OpenAI protocols, additionally implement `CompletionModel` in a new
+file and give it a match arm in `create_provider()`.
 
 **Provider Configuration Pattern**:
 ```rust
@@ -227,10 +272,11 @@ pub trait CompletionModel: Send + Sync {
 pub struct ProviderConfig {
     pub model: String,
     pub base_url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
+    pub api_key_env: Option<String>,
     #[serde(default)]
-    pub api_key_env: String,
+    pub api_key: Option<String>,
+    /// Overrides the built-in model-name-based context window guess.
+    pub context_window: Option<u64>,
 }
 ```
 
@@ -255,11 +301,17 @@ pub trait Tool: Send + Sync {
 - `BashTool` - Execute shell commands
 - `GlobTool` - File pattern matching
 - `GrepTool` - Search file contents
+- `SpawnAgentTool` - Delegate a scoped task to a restricted sub-agent
+  (registered in `build_agent` in the CLI, not in `default_registry()`;
+  sub-agents inherit the parent's `PermissionChecker` and cannot prompt,
+  so anything that would ask the user is denied)
 
 **Adding a New Tool**:
 1. Create new file in `io-runtime/src/tools/`
 2. Implement the `Tool` trait
-3. Add to `default_registry()` in `tools/mod.rs`
+3. Add to `tool_by_name()` and `BUILTIN_TOOLS` in `tools/mod.rs`
+   (single source of truth for both `default_registry()` and the
+   sub-agent `filtered_registry()`)
 4. Export in `tools/mod.rs`
 
 ### Session Management (io-runtime/src/memory.rs)
@@ -269,19 +321,16 @@ Sessions are persisted using SQLite with the following schema:
 ```sql
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
-    data TEXT NOT NULL,  -- JSON serialized Session
+    data TEXT NOT NULL,  -- JSON serialized Session (turns embedded)
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
-
-CREATE TABLE turns (
-    id TEXT PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    data TEXT NOT NULL,  -- JSON serialized Turn
-    timestamp TEXT NOT NULL,
-    FOREIGN KEY (session_id) REFERENCES sessions(id)
-);
 ```
+
+The session JSON blob is the single source of truth (a legacy `turns`
+table is dropped on startup). `SessionStore` is `Clone`, shares one
+connection behind a mutex, and runs saves on the blocking thread pool
+(`spawn_blocking`) so they never stall streaming.
 
 **Key Types**:
 - `Session` - Contains turns, metadata, timestamps
@@ -306,10 +355,17 @@ pub enum PermissionLevel {
 - In `prompt` mode, read-only tools (read, glob, grep) run without asking;
   bash commands are matched against `allowed_commands`/`denied_commands`;
   everything else asks the user: **[y]es once / [a]lways this session / [n]o**
+- Bash matching: deny if *any* token matches the denylist; allow only if
+  *every* command position (the head of each pipeline/sequence segment,
+  skipping env assignments) is allowlisted — an allowed token cannot smuggle
+  other commands through (`echo hi; curl x | sh` is not auto-allowed)
 - Streaming turns ask via `AgentEvent::PermissionRequest` (answered by the REPL
   key listener); non-streaming turns use the agent's `set_prompt_fn` callback
   (single-shot mode reads from stdin). With no way to ask, the call is denied.
 - "Always" answers are recorded per-tool for the session via `allow_for_session`
+- Sub-agents spawned via `spawn_agent` share the parent's checker (same
+  deny/allow lists and session approvals) and fail closed on anything that
+  would prompt
 
 ### Configuration System (io-runtime/src/config.rs)
 
@@ -374,7 +430,7 @@ struct Cli {
 Switching agent, provider, or model mid-conversation keeps the current session
 (`SessionChoice::Existing` in `build_agent`) — history is preserved.
 
-### REPL Loop (io/src/main.rs)
+### REPL Loop (io/src/repl.rs)
 
 The interactive REPL:
 
@@ -414,7 +470,10 @@ The streaming implementation:
 
 ### Provider Selection Logic
 
-The `active_model_id()` function in `main.rs` maps provider names to their model configurations. When adding a new provider, update this function to include the new provider.
+`ProviderConfig` in `io-runtime/src/config.rs` owns all id → config-slot
+lookups: `active_model()` / `model_for()` (display, pricing, session
+metadata), `key_overrides()` (credentials), and `context_window_for()`.
+When adding a new provider, update these three lookup methods.
 
 ### Tool Execution Flow
 
@@ -427,11 +486,11 @@ The `active_model_id()` function in `main.rs` maps provider names to their model
 
 ### Session Context Building
 
-The `ContextManager` builds LLM message history:
-- System prompt with tool descriptions
-- Turn-by-turn conversation history
-- Tool call and result serialization
-- Proper role assignment (System, User, Assistant, Tool)
+Message history is built inline in `Agent::run_turn_inner`:
+- System prompt (plus the compaction summary, when one exists)
+- Prior turns replayed as user/assistant text only (see the replay policy
+  under Agent System — tool traffic is not replayed across turns)
+- The current user input
 
 ### Error Recovery
 
@@ -442,10 +501,12 @@ The `ContextManager` builds LLM message history:
 
 ## Testing
 
-The project has 49 unit tests plus 7 integration tests
-(`io-runtime/tests/agent_loop.rs` — full agent-loop runs against a scripted
-mock provider, covering tool execution, permission prompting/denial,
-streaming events, usage tracking, and session resumption). Run with `cargo test`.
+The project has 59 unit tests (54 in `io-runtime`, 5 in `io`) plus 9
+integration tests (`io-runtime/tests/agent_loop.rs` — full agent-loop runs
+against a scripted mock provider, covering tool execution, permission
+prompting/denial, streaming events, usage tracking, session resumption,
+sub-agent permission inheritance, and partial-progress persistence on
+mid-turn provider failure). Run with `cargo test`.
 
 | Module | Tests |
 |---|---|
@@ -455,10 +516,11 @@ streaming events, usage tracking, and session resumption). Run with `cargo test`
 | `tools/bash.rs` | missing arg, stdout, nonzero exit, timeout |
 | `tools/glob.rs` | missing arg, finds files, no matches, invalid pattern |
 | `tools/grep.rs` | missing arg, invalid regex, matches with line numbers, no matches |
-| `sandbox.rs` | allow/deny/prompt modes, denylist, allowlist, command basename matching, decide_tool prompting, session approvals |
-| `provider/mod.rs` | retryable vs non-retryable error classification |
+| `sandbox.rs` | allow/deny/prompt modes, denylist, allowlist requires every command head, env-assignment skipping, decide_tool prompting, session approvals |
+| `provider/mod.rs` | retry classification by HTTP status, unknown-provider rejection, compat provider resolution, context-window tuning |
 | `config.rs` | default config, roundtrip serialization |
 | `pricing.rs` | cost calculation, known models, free/subscription/passthrough providers |
+| `io/src/repl.rs` | ThinkParser: plain text, think blocks, tags split across deltas, unterminated blocks, multibyte boundaries |
 
 ### CI
 
@@ -497,7 +559,7 @@ GitHub Actions runs on every push and PR to `main` (`.github/workflows/ci.yml`):
 
 ### Modifying System Prompt
 
-The system prompt is defined in the agent initialization in `main.rs`. It includes:
+The system prompt comes from the active agent's `AgentConfig` in the `io-agents` crate (selected in `io/src/repl.rs`). It includes:
 - Agent role and behavior instructions
 - Tool descriptions (automatically appended)
 - Permission and safety guidelines

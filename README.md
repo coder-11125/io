@@ -20,7 +20,7 @@
 ## Features
 
 - **🤖 Multi-provider** — 13 LLM providers supported (Anthropic, OpenAI, Gemini, Groq, DeepSeek, Mistral, Ollama, Azure, Bedrock, OpenRouter, xAI, OpenCode Go, OpenCode Zen)
-- **🛠️ 6 built-in tools** — `read`, `write`, `edit`, `bash`, `glob`, `grep` for full codebase interaction
+- **🛠️ 7 built-in tools** — `read`, `write`, `edit`, `bash`, `glob`, `grep`, `spawn_agent` for full codebase interaction
 - **� Cost tracking** — Built-in API cost calculation with `/cost` command for supported providers
 - **�💬 Interactive & single-shot modes** — REPL for conversation, or `io "do this"` for one-off tasks
 - **🔐 Permission sandbox** — Allow/deny/prompt modes for command execution control
@@ -177,7 +177,7 @@ io/
 ├── io/                          # CLI frontend (binary crate)
 │   ├── Cargo.toml
 │   └── src/
-│       ├── main.rs              # Entry point, CLI parsing, REPL loop, streaming display
+│       ├── main.rs              # Entry point, CLI parsing, subcommand dispatch
 │       ├── connect.rs           # Interactive provider setup wizard (13 providers)
 │       ├── model.rs             # Provider switching (/model command)
 │       └── picker.rs            # Terminal interactive picker (arrow keys, viewport)
@@ -189,7 +189,6 @@ io/
 │       ├── agent.rs             # Agent loop: LLM completion + tool execution (sync & streaming)
 │       ├── config.rs            # Config/schema (TOML), KeyStore, provider config structs
 │       ├── types.rs             # Core data types — Session, Turn, ToolCallRecord, TurnUsage
-│       ├── context.rs           # ContextManager — builds message history from session + tools
 │       ├── memory.rs            # SQLite-backed session persistence (CRUD)
 │       ├── sandbox.rs           # Permission checker (allow/deny/prompt modes)
 │       ├── pricing.rs           # Per-token cost calculation for supported providers

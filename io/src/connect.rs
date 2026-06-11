@@ -136,6 +136,7 @@ pub async fn run() -> anyhow::Result<()> {
                 base_url: "https://api.anthropic.com/v1".to_string(),
                 api_key_env,
                 api_key: None,
+                context_window: None,
             });
         }
         "gemini" => {
@@ -158,6 +159,7 @@ pub async fn run() -> anyhow::Result<()> {
                 base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
                 api_key_env,
                 api_key: None,
+                context_window: None,
             });
         }
         "groq" => {
@@ -179,6 +181,7 @@ pub async fn run() -> anyhow::Result<()> {
                 model,
                 api_key_env,
                 api_key: None,
+                context_window: None,
             });
         }
         "ollama" => {
@@ -193,6 +196,7 @@ pub async fn run() -> anyhow::Result<()> {
             config.provider.ollama = Some(io_runtime::config::OllamaConfig {
                 model,
                 endpoint: Some(endpoint),
+                context_window: None,
             });
         }
         "azure" => {
@@ -220,6 +224,7 @@ pub async fn run() -> anyhow::Result<()> {
                 },
                 api_key_env,
                 api_key: None,
+                context_window: None,
             });
         }
         "bedrock" => {
@@ -233,6 +238,7 @@ pub async fn run() -> anyhow::Result<()> {
             config.provider.bedrock = Some(io_runtime::config::BedrockConfig {
                 model,
                 region: Some(region),
+                context_window: None,
             });
         }
         "mistral" => {
@@ -254,6 +260,7 @@ pub async fn run() -> anyhow::Result<()> {
                 model,
                 api_key_env,
                 api_key: None,
+                context_window: None,
             });
         }
         "deepseek" => {
@@ -275,6 +282,7 @@ pub async fn run() -> anyhow::Result<()> {
                 model,
                 api_key_env,
                 api_key: None,
+                context_window: None,
             });
         }
         "openrouter" => {
@@ -296,6 +304,7 @@ pub async fn run() -> anyhow::Result<()> {
                 model,
                 api_key_env,
                 api_key: None,
+                context_window: None,
             });
         }
         "xai" => {
@@ -317,6 +326,7 @@ pub async fn run() -> anyhow::Result<()> {
                 model,
                 api_key_env,
                 api_key: None,
+                context_window: None,
             });
         }
         "opencode_go" => {
@@ -338,6 +348,7 @@ pub async fn run() -> anyhow::Result<()> {
                 model,
                 api_key_env,
                 api_key: None,
+                context_window: None,
             });
         }
         "opencode_zen" => {
@@ -359,6 +370,7 @@ pub async fn run() -> anyhow::Result<()> {
                 model,
                 api_key_env,
                 api_key: None,
+                context_window: None,
             });
         }
         _ => {}

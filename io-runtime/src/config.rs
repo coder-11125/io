@@ -47,6 +47,86 @@ fn default_provider() -> String {
     "openai".to_string()
 }
 
+impl ProviderConfig {
+    /// Configured `(api_key, api_key_env)` overrides for a provider id.
+    /// This is the single place that maps provider ids to their config slots
+    /// for credential lookup — keep new providers in sync here.
+    pub fn key_overrides(&self, id: &str) -> (Option<String>, Option<String>) {
+        macro_rules! kf {
+            ($slot:expr) => {
+                $slot
+                    .as_ref()
+                    .map(|c| (c.api_key.clone(), c.api_key_env.clone()))
+                    .unwrap_or((None, None))
+            };
+        }
+        match id {
+            "openai" => kf!(self.openai),
+            "anthropic" => kf!(self.anthropic),
+            "gemini" => kf!(self.gemini),
+            "groq" => kf!(self.groq),
+            "azure" => kf!(self.azure),
+            "mistral" => kf!(self.mistral),
+            "deepseek" => kf!(self.deepseek),
+            "openrouter" => kf!(self.openrouter),
+            "xai" => kf!(self.xai),
+            "opencode_go" => kf!(self.opencode_go),
+            "opencode_zen" => kf!(self.opencode_zen),
+            // ollama, bedrock — local/ambient credentials
+            _ => (None, None),
+        }
+    }
+
+    /// The configured model (deployment for Azure) for a provider id,
+    /// falling back to that provider's default model when unconfigured.
+    pub fn model_for(&self, id: &str) -> Option<String> {
+        let model = match id {
+            "openai" => self.openai.clone().unwrap_or_default().model,
+            "anthropic" => self.anthropic.clone().unwrap_or_default().model,
+            "gemini" => self.gemini.clone().unwrap_or_default().model,
+            "groq" => self.groq.clone().unwrap_or_default().model,
+            "ollama" => self.ollama.clone().unwrap_or_default().model,
+            "azure" => self.azure.clone().unwrap_or_default().deployment,
+            "bedrock" => self.bedrock.clone().unwrap_or_default().model,
+            "mistral" => self.mistral.clone().unwrap_or_default().model,
+            "deepseek" => self.deepseek.clone().unwrap_or_default().model,
+            "openrouter" => self.openrouter.clone().unwrap_or_default().model,
+            "xai" => self.xai.clone().unwrap_or_default().model,
+            "opencode_go" => self.opencode_go.clone().unwrap_or_default().model,
+            "opencode_zen" => self.opencode_zen.clone().unwrap_or_default().model,
+            _ => return None,
+        };
+        Some(model)
+    }
+
+    /// Configured context-window override for a provider id, if any.
+    pub fn context_window_for(&self, id: &str) -> Option<u64> {
+        match id {
+            "openai" => self.openai.as_ref()?.context_window,
+            "anthropic" => self.anthropic.as_ref()?.context_window,
+            "gemini" => self.gemini.as_ref()?.context_window,
+            "groq" => self.groq.as_ref()?.context_window,
+            "ollama" => self.ollama.as_ref()?.context_window,
+            "azure" => self.azure.as_ref()?.context_window,
+            "bedrock" => self.bedrock.as_ref()?.context_window,
+            "mistral" => self.mistral.as_ref()?.context_window,
+            "deepseek" => self.deepseek.as_ref()?.context_window,
+            "openrouter" => self.openrouter.as_ref()?.context_window,
+            "xai" => self.xai.as_ref()?.context_window,
+            "opencode_go" => self.opencode_go.as_ref()?.context_window,
+            "opencode_zen" => self.opencode_zen.as_ref()?.context_window,
+            _ => None,
+        }
+    }
+
+    /// Model id of the active (default) provider — used for display,
+    /// pricing, and session metadata.
+    pub fn active_model(&self) -> String {
+        self.model_for(&self.default)
+            .unwrap_or_else(|| self.default.clone())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAIConfig {
     #[serde(default = "default_openai_model")]
@@ -89,6 +169,9 @@ pub struct AnthropicConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Actual context window for this model (tokens).
+    /// When set, overrides the built-in model-name-based guess.
+    pub context_window: Option<u64>,
 }
 
 impl Default for AnthropicConfig {
@@ -98,6 +181,7 @@ impl Default for AnthropicConfig {
             base_url: default_anthropic_base_url(),
             api_key_env: None,
             api_key: None,
+            context_window: None,
         }
     }
 }
@@ -118,6 +202,9 @@ pub struct GeminiConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Actual context window for this model (tokens).
+    /// When set, overrides the built-in model-name-based guess.
+    pub context_window: Option<u64>,
 }
 
 impl Default for GeminiConfig {
@@ -127,6 +214,7 @@ impl Default for GeminiConfig {
             base_url: default_gemini_base_url(),
             api_key_env: None,
             api_key: None,
+            context_window: None,
         }
     }
 }
@@ -145,6 +233,9 @@ pub struct GroqConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Actual context window for this model (tokens).
+    /// When set, overrides the built-in model-name-based guess.
+    pub context_window: Option<u64>,
 }
 
 impl Default for GroqConfig {
@@ -153,6 +244,7 @@ impl Default for GroqConfig {
             model: default_groq_model(),
             api_key_env: None,
             api_key: None,
+            context_window: None,
         }
     }
 }
@@ -166,6 +258,9 @@ pub struct OllamaConfig {
     #[serde(default = "default_ollama_model")]
     pub model: String,
     pub endpoint: Option<String>,
+    /// Actual context window for this model (tokens).
+    /// When set, overrides the built-in model-name-based guess.
+    pub context_window: Option<u64>,
 }
 
 impl Default for OllamaConfig {
@@ -173,6 +268,7 @@ impl Default for OllamaConfig {
         Self {
             model: default_ollama_model(),
             endpoint: None,
+            context_window: None,
         }
     }
 }
@@ -191,6 +287,9 @@ pub struct AzureConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Actual context window for this model (tokens).
+    /// When set, overrides the built-in model-name-based guess.
+    pub context_window: Option<u64>,
 }
 
 impl Default for AzureConfig {
@@ -201,6 +300,7 @@ impl Default for AzureConfig {
             endpoint: None,
             api_key_env: None,
             api_key: None,
+            context_window: None,
         }
     }
 }
@@ -217,6 +317,9 @@ pub struct BedrockConfig {
     #[serde(default = "default_bedrock_model")]
     pub model: String,
     pub region: Option<String>,
+    /// Actual context window for this model (tokens).
+    /// When set, overrides the built-in model-name-based guess.
+    pub context_window: Option<u64>,
 }
 
 impl Default for BedrockConfig {
@@ -224,6 +327,7 @@ impl Default for BedrockConfig {
         Self {
             model: default_bedrock_model(),
             region: None,
+            context_window: None,
         }
     }
 }
@@ -239,6 +343,9 @@ pub struct MistralConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Actual context window for this model (tokens).
+    /// When set, overrides the built-in model-name-based guess.
+    pub context_window: Option<u64>,
 }
 
 impl Default for MistralConfig {
@@ -247,6 +354,7 @@ impl Default for MistralConfig {
             model: default_mistral_model(),
             api_key_env: None,
             api_key: None,
+            context_window: None,
         }
     }
 }
@@ -262,6 +370,9 @@ pub struct DeepSeekConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Actual context window for this model (tokens).
+    /// When set, overrides the built-in model-name-based guess.
+    pub context_window: Option<u64>,
 }
 
 impl Default for DeepSeekConfig {
@@ -270,6 +381,7 @@ impl Default for DeepSeekConfig {
             model: default_deepseek_model(),
             api_key_env: None,
             api_key: None,
+            context_window: None,
         }
     }
 }
@@ -285,6 +397,9 @@ pub struct OpenRouterConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Actual context window for this model (tokens).
+    /// When set, overrides the built-in model-name-based guess.
+    pub context_window: Option<u64>,
 }
 
 impl Default for OpenRouterConfig {
@@ -293,6 +408,7 @@ impl Default for OpenRouterConfig {
             model: default_openrouter_model(),
             api_key_env: None,
             api_key: None,
+            context_window: None,
         }
     }
 }
@@ -308,6 +424,9 @@ pub struct XAIConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Actual context window for this model (tokens).
+    /// When set, overrides the built-in model-name-based guess.
+    pub context_window: Option<u64>,
 }
 
 impl Default for XAIConfig {
@@ -316,6 +435,7 @@ impl Default for XAIConfig {
             model: default_xai_model(),
             api_key_env: None,
             api_key: None,
+            context_window: None,
         }
     }
 }
@@ -331,6 +451,9 @@ pub struct OpenCodeGoConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Actual context window for this model (tokens).
+    /// When set, overrides the built-in model-name-based guess.
+    pub context_window: Option<u64>,
 }
 
 impl Default for OpenCodeGoConfig {
@@ -339,6 +462,7 @@ impl Default for OpenCodeGoConfig {
             model: default_opencode_go_model(),
             api_key_env: None,
             api_key: None,
+            context_window: None,
         }
     }
 }
@@ -354,6 +478,9 @@ pub struct OpenCodeZenConfig {
     pub api_key_env: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Actual context window for this model (tokens).
+    /// When set, overrides the built-in model-name-based guess.
+    pub context_window: Option<u64>,
 }
 
 impl Default for OpenCodeZenConfig {
@@ -362,6 +489,7 @@ impl Default for OpenCodeZenConfig {
             model: default_opencode_zen_model(),
             api_key_env: None,
             api_key: None,
+            context_window: None,
         }
     }
 }

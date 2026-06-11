@@ -17,18 +17,29 @@ use std::sync::{
 /// session, and no interactive permission prompts. They cannot spawn further
 /// agents, preventing infinite recursion.
 ///
+/// Sub-agents inherit the parent session's `PermissionChecker`, so the
+/// user's deny/allow lists and "always allow" approvals apply to them too.
+/// Because they have no way to prompt, any tool call that would require
+/// asking the user is denied (fails closed).
+///
 /// Holds a shared cancellation flag — when set (e.g. by Esc in the UI),
 /// the spawned agent aborts early and returns a cancellation message.
 pub struct SpawnAgentTool {
     provider: Arc<dyn CompletionModel>,
     model_id: String,
     max_tokens: u32,
+    permissions: Arc<PermissionChecker>,
     description: String,
     cancel: Mutex<Arc<AtomicBool>>,
 }
 
 impl SpawnAgentTool {
-    pub fn new(provider: Arc<dyn CompletionModel>, model_id: String, max_tokens: u32) -> Self {
+    pub fn new(
+        provider: Arc<dyn CompletionModel>,
+        model_id: String,
+        max_tokens: u32,
+        permissions: Arc<PermissionChecker>,
+    ) -> Self {
         let sub_agents: Vec<String> = io_agents::builtin::all()
             .into_iter()
             .filter(|a| a.tool_access != ToolAccess::All)
@@ -52,6 +63,7 @@ impl SpawnAgentTool {
             provider,
             model_id,
             max_tokens,
+            permissions,
             description,
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
         }
@@ -137,20 +149,21 @@ impl Tool for SpawnAgentTool {
             Ok(m) => m,
             Err(e) => return ToolOutput::err(format!("failed to init session store: {e}")),
         };
+        let store = memory.clone();
 
         let model_id = config
             .suggested_model
             .unwrap_or(self.model_id.as_str())
             .to_string();
 
-        let permissions = PermissionChecker::new("allow");
-
         let cancel = self.cancel.lock().unwrap().clone();
         let agent = Agent::new(
             self.provider.clone(),
             tools,
             memory,
-            permissions,
+            // Inherit the parent's permission policy. Sub-agents cannot
+            // prompt, so anything that would ask the user is denied.
+            self.permissions.clone(),
             config.system_prompt.clone(),
             None,
             model_id,
@@ -163,9 +176,7 @@ impl Tool for SpawnAgentTool {
         let result = agent.run_turn(&task).await;
 
         // Remove the ephemeral session — it's single-use and would accumulate in the DB.
-        if let Ok(store) = SessionStore::new() {
-            let _ = store.delete_session(session_id);
-        }
+        let _ = store.delete_session(session_id);
 
         match result {
             Ok(r) => ToolOutput::ok(r),

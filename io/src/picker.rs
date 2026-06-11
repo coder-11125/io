@@ -9,6 +9,18 @@ use std::io::{self, Write};
 
 const VIEWPORT: usize = 20;
 
+/// The user dismissed the picker without choosing. Callers detect this with
+/// `err.is::<Dismissed>()` instead of matching on message strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum Dismissed {
+    /// Esc or `q` — back out of the picker.
+    #[error("cancelled")]
+    Cancelled,
+    /// Ctrl+C — interrupt.
+    #[error("interrupted")]
+    Interrupted,
+}
+
 /// Show an interactive arrow-key list. Returns the selected index.
 /// `current` highlights the already-active item in green even when not focused.
 pub fn pick(items: &[&str], current: Option<usize>) -> anyhow::Result<usize> {
@@ -178,13 +190,13 @@ fn pick_hint_loop(
                     clear_picker(stdout, drawn_items)?;
                     execute!(stdout, cursor::Show)?;
                     stdout.flush()?;
-                    return Err(anyhow::anyhow!("Cancelled"));
+                    return Err(Dismissed::Cancelled.into());
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     let _ = terminal::disable_raw_mode();
                     execute!(stdout, cursor::Show)?;
                     stdout.flush()?;
-                    return Err(anyhow::anyhow!("Interrupted"));
+                    return Err(Dismissed::Interrupted.into());
                 }
                 _ => {}
             }
@@ -300,13 +312,13 @@ fn pick_loop(
                     clear_picker(stdout, drawn_items)?;
                     execute!(stdout, cursor::Show)?;
                     stdout.flush()?;
-                    return Err(anyhow::anyhow!("Cancelled"));
+                    return Err(Dismissed::Cancelled.into());
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     let _ = terminal::disable_raw_mode();
                     execute!(stdout, cursor::Show)?;
                     stdout.flush()?;
-                    return Err(anyhow::anyhow!("Interrupted"));
+                    return Err(Dismissed::Interrupted.into());
                 }
                 _ => {}
             }

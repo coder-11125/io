@@ -145,15 +145,25 @@ fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
     out
 }
 
+/// Every built-in tool name, in registration order.
+const BUILTIN_TOOLS: &[&str] = &["read", "bash", "glob", "grep", "write", "edit"];
+
+/// Construct a built-in tool by name — the single source of truth for the
+/// name → implementation mapping used by both registry builders.
+fn tool_by_name(name: &str) -> Option<Box<dyn Tool>> {
+    match name {
+        "read" => Some(Box::new(ReadTool)),
+        "write" => Some(Box::new(WriteTool)),
+        "edit" => Some(Box::new(EditTool)),
+        "bash" => Some(Box::new(BashTool)),
+        "glob" => Some(Box::new(GlobTool)),
+        "grep" => Some(Box::new(GrepTool)),
+        _ => None,
+    }
+}
+
 pub fn default_registry() -> ToolRegistry {
-    let mut reg = ToolRegistry::new();
-    reg.register(Box::new(ReadTool));
-    reg.register(Box::new(BashTool));
-    reg.register(Box::new(GlobTool));
-    reg.register(Box::new(GrepTool));
-    reg.register(Box::new(WriteTool));
-    reg.register(Box::new(EditTool));
-    reg
+    filtered_registry(BUILTIN_TOOLS)
 }
 
 /// Build a registry containing only the named tools.
@@ -161,14 +171,8 @@ pub fn default_registry() -> ToolRegistry {
 pub fn filtered_registry(names: &[&str]) -> ToolRegistry {
     let mut reg = ToolRegistry::new();
     for &name in names {
-        match name {
-            "read" => reg.register(Box::new(ReadTool)),
-            "write" => reg.register(Box::new(WriteTool)),
-            "edit" => reg.register(Box::new(EditTool)),
-            "bash" => reg.register(Box::new(BashTool)),
-            "glob" => reg.register(Box::new(GlobTool)),
-            "grep" => reg.register(Box::new(GrepTool)),
-            _ => {}
+        if let Some(tool) = tool_by_name(name) {
+            reg.register(tool);
         }
     }
     reg

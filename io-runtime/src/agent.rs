@@ -1,3 +1,9 @@
+/// A turn was aborted by the shared cancellation flag (e.g. the user
+/// pressed Esc). Callers detect it with `err.is::<Cancelled>()`.
+#[derive(Debug, thiserror::Error)]
+#[error("cancelled")]
+pub struct Cancelled;
+
 /// User's answer to a permission prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionReply {
@@ -81,7 +87,7 @@ impl Agent {
         provider: Arc<dyn CompletionModel>,
         tools: ToolRegistry,
         memory: SessionStore,
-        permissions: PermissionChecker,
+        permissions: Arc<PermissionChecker>,
         system_prompt: String,
         session_id: Option<SessionId>,
         model_id: String,
@@ -107,7 +113,7 @@ impl Agent {
             tools: Arc::new(tools),
             session: Arc::new(TokioMutex::new(session)),
             memory: Arc::new(memory),
-            permissions: Arc::new(permissions),
+            permissions,
             system_prompt,
             max_tokens,
             auto_compact,
@@ -185,6 +191,11 @@ impl Agent {
             content: vec![ContentBlock::Text { text: system_text }],
         }];
 
+        // Replay policy: prior turns are replayed as user/assistant text only.
+        // Tool calls and results are deliberately dropped from history — they
+        // are token-heavy, and providers reject tool blocks whose IDs don't
+        // match a real in-flight call. Within a single turn the model sees
+        // full tool traffic; across turns it relies on its own prose summary.
         for turn in &prior_turns {
             messages.push(Message {
                 role: Role::User,
@@ -217,6 +228,9 @@ impl Agent {
         let mut summed_input_tokens = 0u32;
         let mut summed_output_tokens = 0u32;
         let mut last_input_tokens = 0u32;
+        // A provider failure mid-turn. Set instead of returning immediately so
+        // partial progress (text, executed tools) is still saved to the session.
+        let mut turn_error: Option<anyhow::Error> = None;
         const MAX_ITERATIONS: usize = 20;
 
         // Propagate cancellation to tools (e.g. spawn_agent)
@@ -224,7 +238,7 @@ impl Agent {
 
         for _ in 0..MAX_ITERATIONS {
             if self.cancel.lock().unwrap().load(Ordering::Relaxed) {
-                return Err(anyhow::anyhow!("cancelled"));
+                return Err(Cancelled.into());
             }
 
             let request = CompletionRequest {
@@ -238,13 +252,25 @@ impl Agent {
 
             let (assistant_content, iter_text, iter_tool_uses) = match token_tx {
                 Some(tx) => {
-                    let mut rx = self.provider.complete_stream(request).await?;
+                    let mut rx = match self.provider.complete_stream(request).await {
+                        Ok(rx) => rx,
+                        Err(e) => {
+                            turn_error = Some(e);
+                            break;
+                        }
+                    };
 
                     let mut iter_text = String::new();
                     let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
 
                     while let Some(event) = rx.recv().await {
-                        let ev = event?;
+                        let ev = match event {
+                            Ok(ev) => ev,
+                            Err(e) => {
+                                turn_error = Some(e);
+                                break;
+                            }
+                        };
                         // Capture usage whenever present — may co-occur with
                         // stop_reason so extract it before the dispatch match.
                         if let Some(ref u) = ev.usage {
@@ -293,7 +319,13 @@ impl Agent {
                     (content, iter_text, tool_uses)
                 }
                 None => {
-                    let response = self.provider.complete(request).await?;
+                    let response = match self.provider.complete(request).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            turn_error = Some(e);
+                            break;
+                        }
+                    };
 
                     if let Some(ref u) = response.usage {
                         if u.input_tokens > 0 {
@@ -337,6 +369,12 @@ impl Agent {
                 role: Role::Assistant,
                 content: assistant_content,
             });
+
+            // A stream that died mid-response: keep the partial text but do
+            // not execute any tool calls parsed from a truncated stream.
+            if turn_error.is_some() {
+                break;
+            }
 
             if iter_tool_uses.is_empty() {
                 break;
@@ -392,6 +430,14 @@ impl Agent {
             });
         }
 
+        // A failure before anything was produced: fail the turn outright
+        // rather than persisting an empty record.
+        if all_text.is_empty() && all_tool_calls.is_empty() {
+            if let Some(e) = turn_error {
+                return Err(e);
+            }
+        }
+
         if let Some(tx) = token_tx {
             if last_input_tokens > 0 || summed_output_tokens > 0 {
                 let _ = tx
@@ -430,6 +476,11 @@ impl Agent {
 
         if let Err(e) = self.memory.save_session(&session_to_save).await {
             tracing::warn!("failed to save session: {e}");
+        }
+
+        // Surface the provider failure now that partial progress is saved.
+        if let Some(e) = turn_error {
+            return Err(e);
         }
 
         if self.auto_compact && last_input_tokens > 0 {

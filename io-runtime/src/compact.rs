@@ -109,7 +109,6 @@ pub async fn run(
         let mut s = session.lock().await;
         s.summary = Some(summary.clone());
         s.turns.clear();
-        s.metadata.turn_count = 0;
         s.updated_at = chrono::Utc::now();
         s.clone()
     };

@@ -146,7 +146,7 @@ fn make_agent_at(
         provider,
         default_registry(),
         memory,
-        permissions,
+        Arc::new(permissions),
         "You are a test agent.".to_string(),
         session_id,
         "mock-model".to_string(),
@@ -368,6 +368,95 @@ async fn streaming_emits_events_and_permission_is_answerable() {
     assert!(usage_seen, "Usage event expected");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "streamed");
     std::fs::remove_file(&target).ok();
+}
+
+#[tokio::test]
+async fn provider_failure_mid_turn_saves_partial_progress() {
+    let file = temp_path("io-test-read", ".txt");
+    std::fs::write(&file, "partial progress contents").unwrap();
+
+    // One successful tool iteration, then the provider dies (script empty).
+    let provider = MockProvider::new(vec![tool_response(
+        "read",
+        serde_json::json!({"file_path": file.to_str().unwrap()}),
+    )]);
+    let db = temp_path("io-test", ".db");
+    let agent = make_agent_at(provider, PermissionChecker::new("allow"), db.clone(), None);
+
+    let err = agent.run_turn("read it").await.expect_err("turn must fail");
+    assert!(err.to_string().contains("ran out of scripted responses"));
+
+    // The executed tool call must be persisted despite the failure.
+    let store = SessionStore::with_path(db).unwrap();
+    let session = store.load_session(agent.session_id().await).unwrap();
+    assert_eq!(session.turns.len(), 1);
+    assert_eq!(session.turns[0].tool_calls.len(), 1);
+    assert!(session.turns[0].tool_calls[0].success);
+}
+
+#[tokio::test]
+async fn sub_agent_inherits_permissions_and_fails_closed() {
+    let target = temp_path("io-test-spawn-touch", ".txt");
+    let touch_cmd = format!("touch {}", target.to_str().unwrap());
+
+    // Parent asks to spawn the git sub-agent (has bash access); the sub-agent
+    // tries to run a command that is neither allowlisted nor approvable
+    // (sub-agents cannot prompt), so it must be denied.
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "spawn_agent",
+            serde_json::json!({"agent_id": "git", "task": "touch a file"}),
+        ),
+        tool_response("bash", serde_json::json!({"command": touch_cmd})),
+        text_response("sub-agent done"),
+        text_response("parent done"),
+    ]);
+
+    let permissions = Arc::new(PermissionChecker::new("prompt"));
+    let mut tools = default_registry();
+    tools.register(Box::new(io_runtime::SpawnAgentTool::new(
+        provider.clone(),
+        "mock-model".to_string(),
+        1024,
+        permissions.clone(),
+    )));
+    let memory = SessionStore::with_path(temp_path("io-test", ".db")).expect("session store");
+    let agent = Agent::new(
+        provider.clone(),
+        tools,
+        memory,
+        permissions,
+        "You are a test agent.".to_string(),
+        None,
+        "mock-model".to_string(),
+        1024,
+        false,
+    );
+    // The user approves spawning the sub-agent — but nothing else.
+    agent.set_prompt_fn(Arc::new(|name, _| {
+        if name == "spawn_agent" {
+            PermissionReply::AllowOnce
+        } else {
+            PermissionReply::Deny
+        }
+    }));
+
+    let reply = agent.run_turn("delegate this").await.unwrap();
+    assert_eq!(reply, "parent done");
+    assert!(
+        !target.exists(),
+        "sub-agent bash must fail closed, not execute"
+    );
+
+    // The sub-agent's second request must carry the denial as an error result.
+    let requests = provider.recorded_requests();
+    let denied = requests.iter().flat_map(|r| r.messages.iter()).any(|m| {
+        m.content.iter().any(|b| {
+            matches!(b, ContentBlock::ToolResult { content, is_error, .. }
+                if content.contains("no prompt is available") && *is_error == Some(true))
+        })
+    });
+    assert!(denied, "sub-agent tool call should be denied, not allowed");
 }
 
 #[tokio::test]

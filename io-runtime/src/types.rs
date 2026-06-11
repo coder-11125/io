@@ -50,7 +50,6 @@ pub struct SessionMetadata {
     pub project_root: Option<String>,
     pub model: String,
     pub provider: String,
-    pub turn_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,7 +108,6 @@ impl Session {
                 project_root: None,
                 model,
                 provider,
-                turn_count: 0,
             },
             summary: None,
         }
@@ -117,7 +115,6 @@ impl Session {
 
     pub fn add_turn(&mut self, turn: Turn) {
         self.turns.push(turn);
-        self.metadata.turn_count = self.turns.len();
         self.updated_at = Utc::now();
     }
 
