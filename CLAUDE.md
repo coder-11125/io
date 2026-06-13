@@ -363,10 +363,39 @@ pub enum PermissionLevel {
 - Streaming turns ask via `AgentEvent::PermissionRequest` (answered by the REPL
   key listener); non-streaming turns use the agent's `set_prompt_fn` callback
   (single-shot mode reads from stdin). With no way to ask, the call is denied.
-- "Always" answers are recorded per-tool for the session via `allow_for_session`
+- "Always" answers are recorded per-session via `allow_for_session`: for bash
+  tools, approval is granular per-command (e.g., "always" for `ls -la` won't
+  approve `rm -rf`); for other tools, approval applies to all uses of that tool
 - Sub-agents spawned via `spawn_agent` share the parent's checker (same
   deny/allow lists and session approvals) and fail closed on anything that
   would prompt
+
+### Security Analysis
+
+The permission sandbox system has undergone comprehensive security testing to
+identify potential bypass vectors. Key security properties:
+
+**Defended Attack Vectors**:
+- Path obfuscation: `/bin/rm`, `./rm`, `../rm`, `r\m` → All normalized and denied
+- Command substitution: `$(rm)`, `` `rm` ``, `"$(rm)"` → All detected and denied
+- Command chaining: `;`, `&`, `|`, `&&`, `||` operators → All split and checked
+- Environment injection: `FOO=$(rm)` → Detected and denied
+- Subshells/braces: `(rm)`, `{ rm; }` → Detected and denied
+- HEREDOC: Multi-line commands → Newlines split and checked
+- Process substitution: `<(rm)` → Parentheses split and checked
+
+**Security Design Choices**:
+- Conservative denylist: Any token match denies the entire command
+- Strict allowlist: All pipeline segment heads must be explicitly allowed
+- Exact session approval: Bash "always" approvals require exact command string match
+- Read-only tools bypass: `read`, `glob`, `grep` auto-allowed in prompt mode
+
+**Known Limitations** (by design):
+- Command arguments are not validated (e.g., allowing `ls` permits `ls -rf /`)
+- Single-quoted strings don't trigger denial (correct shell behavior)
+- Session approvals are exact-match only (prevents command variation bypasses)
+
+See `SECURITY_ANALYSIS.md` for comprehensive test coverage and detailed findings.
 
 ### Configuration System (io-runtime/src/config.rs)
 

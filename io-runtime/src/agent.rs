@@ -549,7 +549,13 @@ impl Agent {
                 match reply {
                     PermissionReply::AllowOnce => Ok(()),
                     PermissionReply::AllowSession => {
-                        self.permissions.allow_for_session(name);
+                        // For bash tools, pass the command to approve only that specific command
+                        let command = if name == "bash" {
+                            input.get("command").and_then(|v| v.as_str())
+                        } else {
+                            None
+                        };
+                        self.permissions.allow_for_session(name, command);
                         Ok(())
                     }
                     PermissionReply::Deny => Err(format!("tool {name} denied by user")),

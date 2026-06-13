@@ -24,7 +24,7 @@
 - **Cost tracking** — Built-in API cost calculation with `/cost` command for supported providers
 - **Interactive & single-shot modes** — Full-screen REPL with splash screen, prompt bar, and scrollback
 - **Color themes** — 8 built-in themes (dark/light) with live `/theme` switcher
-- **Permission sandbox** — Allow/deny/prompt modes for command execution control
+- **Permission sandbox** — Allow/deny/prompt modes with granular bash command control and security-hardened command validation
 - **Session persistence** — SQLite-backed conversation history, resume anytime
 - **Streaming responses** — Real-time token-by-token streaming with live indicator
 - **Fast & lightweight** — Built in Rust, minimal dependencies, no Node.js or Python required
@@ -49,6 +49,27 @@ io "explain this codebase"
 
 On first run, `io` creates a default configuration at `~/.io/config.toml`.
 Use `/connect` inside the REPL to set up your preferred LLM provider.
+
+## Security
+
+The permission sandbox system provides defense-in-depth protection against command injection and unauthorized execution:
+
+**Permission Modes**:
+- `allow` — Auto-approve all tool executions
+- `deny` — Block all tool executions
+- `prompt` — Ask user for approval (default)
+
+**Security Features**:
+- **Granular bash approvals**: "Always" approvals are command-specific (approving `ls -la` won't approve `rm -rf`)
+- **Command normalization**: Handles path obfuscation (`/bin/rm` → `rm`, `r\m` → `rm`)
+- **Injection prevention**: Detects command substitution (`$(rm)`, `` `rm` ``), chaining (`;`, `&`, `|`), and subshells
+- **Conservative denylist**: Any dangerous token denies the entire command
+- **Strict allowlist**: Requires all pipeline heads to be explicitly allowed
+
+**Defended Attack Vectors**:
+- Path obfuscation, command substitution, environment injection
+- Command chaining with `;`, `&`, `|`, `&&`, `||`
+- Subshells, brace groups, HEREDOC, process substitution
 
 ## Modes
 
