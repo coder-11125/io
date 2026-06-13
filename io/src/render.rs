@@ -723,7 +723,7 @@ pub fn draw_splash(
     let logo_w = IO_LOGO.iter().map(|l| l.len()).max().unwrap_or(0) as u16;
     let logo_h = IO_LOGO.len() as u16;
 
-    let box_w = (w * 2 / 3).max(52).min(90);
+    let box_w = (w * 2 / 3).clamp(52, 90);
     let inner_w = box_w.saturating_sub(2) as usize;
 
     const DROP_CMDS: &[(&str, &str)] = &[
@@ -994,6 +994,7 @@ pub fn splash_update_status(
     out.flush()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_splash_status_at(
     out: &mut impl std::io::Write,
     box_x: u16,

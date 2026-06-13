@@ -66,8 +66,8 @@ fn theme_picker_loop(stdout: &mut impl Write, current_theme: &str) -> anyhow::Re
         drawn = draw_panel(stdout, selected, box_w)?;
         stdout.flush()?;
 
-        match event::read()? {
-            Event::Key(key) => match key.code {
+        if let Event::Key(key) = event::read()? {
+            match key.code {
                 KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
                     selected = if selected > 0 { selected - 1 } else { n - 1 };
                 }
@@ -102,8 +102,7 @@ fn theme_picker_loop(stdout: &mut impl Write, current_theme: &str) -> anyhow::Re
                     return Err(crate::picker::Dismissed::Interrupted.into());
                 }
                 _ => {}
-            },
-            _ => {}
+            }
         }
     }
 }

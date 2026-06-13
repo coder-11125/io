@@ -370,9 +370,8 @@ fn draw_slash_popup(matches: &[usize], selected: Option<usize>) -> std::io::Resu
         ResetColor,
     )?;
 
-    for i in 0..n {
+    for (i, &idx) in matches[..n].iter().enumerate() {
         let row = top_row + 1 + i as u16;
-        let idx = matches[i];
         let (name, desc) = SLASH_COMMANDS[idx];
         let is_sel = selected == Some(i);
         let indicator = if is_sel { "▶" } else { " " };
@@ -438,6 +437,7 @@ fn draw_slash_popup(matches: &[usize], selected: Option<usize>) -> std::io::Resu
 /// Read a line of input from the user in TUI mode. The prompt bar at the bottom
 /// of the terminal shows the current buffer. Supports /slash completions,
 /// @file mentions, and Tab agent cycling.
+#[allow(clippy::too_many_arguments)]
 fn tui_read_line(
     full_agents: &[io_agents::AgentConfig],
     tab_current: &mut usize,
@@ -505,12 +505,10 @@ fn tui_read_line(
                         scroll_offset = scroll_offset.saturating_add(SCROLL_STEP).min(n);
                         render_scroll_view(&line_buf.lock().unwrap(), scroll_offset, theme)?;
                     }
-                    MouseEventKind::ScrollDown => {
-                        if scroll_offset > 0 {
-                            scroll_offset = scroll_offset.saturating_sub(SCROLL_STEP);
-                            render_scroll_view(&line_buf.lock().unwrap(), scroll_offset, theme)?;
-                            bar(&buf, *tab_current)?;
-                        }
+                    MouseEventKind::ScrollDown if scroll_offset > 0 => {
+                        scroll_offset = scroll_offset.saturating_sub(SCROLL_STEP);
+                        render_scroll_view(&line_buf.lock().unwrap(), scroll_offset, theme)?;
+                        bar(&buf, *tab_current)?;
                     }
                     _ => {}
                 }
