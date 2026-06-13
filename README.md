@@ -60,11 +60,34 @@ The permission sandbox system provides defense-in-depth protection against comma
 - `prompt` — Ask user for approval (default)
 
 **Security Features**:
+- **Semantic command analyzer**: Classifies every bash command as `Safe`, `Caution`, or `Destructive` before execution — `ls`, `git status`, `cargo check` are auto-allowed; `rm -rf`, `dd`, `git reset --hard` always prompt
 - **Granular bash approvals**: "Always" approvals are command-specific (approving `ls -la` won't approve `rm -rf`)
 - **Command normalization**: Handles path obfuscation (`/bin/rm` → `rm`, `r\m` → `rm`)
 - **Injection prevention**: Detects command substitution (`$(rm)`, `` `rm` ``), chaining (`;`, `&`, `|`), and subshells
 - **Conservative denylist**: Any dangerous token denies the entire command
 - **Strict allowlist**: Requires all pipeline heads to be explicitly allowed
+- **Expansion guard**: Commands containing `$`, backtick, or `(` bypass auto-allow (static analysis can't classify them safely)
+
+**Command Safety Classifications**:
+| Level | Examples | Behavior |
+|---|---|---|
+| `Safe` | `ls`, `cat`, `grep`, `git status`, `cargo check`, `find` (no `-delete`) | Auto-allowed in prompt mode |
+| `Caution` | `mv`, `git commit`, `rm file.txt`, `sed -i`, `chmod` | Always prompts |
+| `Destructive` | `rm -rf`, `dd`, `git reset --hard`, `git push --force`, `mkfs.*` | Always prompts with implied risk |
+
+**Ecosystem-agnostic build tool classification** — subcommands are classified consistently across all package managers:
+
+| Subcommand | Ecosystems | Level |
+|---|---|---|
+| `test`, `build`, `check`, `lint`, `fmt`, `doc`, `bench`, `audit` | npm/yarn/pnpm/bun, cargo, go, pip, mvn/gradle, dotnet, … | `Safe` — auto-allowed |
+| `list`, `show`, `freeze`, `outdated`, `tree`, `info` | pip, npm, cargo, go mod | `Safe` — auto-allowed |
+| `install`, `add`, `update`, `upgrade`, `remove` | all | `Caution` — prompts |
+| `publish`, `deploy`, `release` | npm, cargo, mvn | `Caution` — prompts |
+| `run <script>` | npm/yarn/pnpm/bun | Safe or Caution based on script name |
+| `go mod download/verify/graph/why` | go | `Safe` — read-only module ops |
+| `go mod tidy/edit` | go | `Caution` — rewrites go.sum |
+
+`make`/`cmake`/`ninja` targets are always `Caution` — Makefile rules are opaque to static analysis.
 
 **Defended Attack Vectors**:
 - Path obfuscation, command substitution, environment injection
@@ -233,6 +256,7 @@ io/
 │       ├── types.rs             # Core data types — Session, Turn, ToolCallRecord, TurnUsage
 │       ├── memory.rs            # SQLite-backed session persistence (CRUD)
 │       ├── sandbox.rs           # Permission checker (allow/deny/prompt modes)
+│       ├── command_safety.rs    # Semantic command classifier (Safe/Caution/Destructive)
 │       ├── pricing.rs           # Per-token cost calculation for supported providers
 │       ├── tools/               # Built-in tools (7 tools, each with unit tests)
 │       │   ├── mod.rs           # Tool trait, ToolRegistry, default_registry()
@@ -320,7 +344,7 @@ cargo build
 cargo run -- "your prompt"
 cargo run --
 
-# Run tests (34 unit tests + 11 integration tests)
+# Run tests (129 unit tests + 9 integration tests)
 cargo test
 
 # Add a new provider

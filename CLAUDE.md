@@ -51,6 +51,7 @@ io/
 │       ├── types.rs           # Core data types (Session, Turn, etc.)
 │       ├── memory.rs          # SQLite-backed session persistence
 │       ├── sandbox.rs         # Permission checking system
+│       ├── command_safety.rs  # Semantic command classifier (Safe/Caution/Destructive)
 │       ├── provider/          # LLM provider implementations
 │       │   ├── mod.rs         # Provider trait, retry wrapper, OpenAI-compat table,
 │       │   │                  #   create_provider() — 8 providers are one-line
@@ -389,11 +390,19 @@ identify potential bypass vectors. Key security properties:
 - Strict allowlist: All pipeline segment heads must be explicitly allowed
 - Exact session approval: Bash "always" approvals require exact command string match
 - Read-only tools bypass: `read`, `glob`, `grep` auto-allowed in prompt mode
+- Semantic auto-allow: `command_safety.rs` classifies every bash command as `Safe / Caution / Destructive`; provably-safe simple commands (`ls`, `git status`, `npm test`, `go build`, `pip list`, …) are auto-allowed in prompt mode without needing an explicit allowlist entry
+- Expansion guard: semantic auto-allow is suppressed for any command containing `$`, backtick, or `(` — those require runtime evaluation that static analysis cannot classify safely
+
+**Semantic Safety Tiers** (`command_safety.rs`):
+- `Safe` → auto-allowed: read-only filesystem ops, system info, build-tool test/check/lint/doc subcommands across all ecosystems (cargo, npm/yarn/pnpm/bun, go, pip, mvn/gradle, dotnet, …), read-only git subcommands
+- `Caution` → always prompts: file mutations (mv/cp/rm), package installs, git write ops, ecosystem deploy/publish subcommands
+- `Destructive` → always prompts: `rm -rf`, `dd`, `git reset --hard`, `git push --force`, `mkfs.*`, `shred`
 
 **Known Limitations** (by design):
 - Command arguments are not validated (e.g., allowing `ls` permits `ls -rf /`)
 - Single-quoted strings don't trigger denial (correct shell behavior)
 - Session approvals are exact-match only (prevents command variation bypasses)
+- `make`/`cmake`/`ninja` targets are always Caution — Makefile rules are opaque to static analysis
 
 See `SECURITY_ANALYSIS.md` for comprehensive test coverage and detailed findings.
 
@@ -567,7 +576,7 @@ Message history is built inline in `Agent::run_turn_inner`:
 
 ## Testing
 
-The project has 34 unit tests (29 in `io-runtime`, 5 in `io`) plus 11
+The project has 149 unit tests (144 in `io-runtime`, 5 in `io`) plus 9
 integration tests (`io-runtime/tests/agent_loop.rs` — full agent-loop runs
 against a scripted mock provider, covering tool execution, permission
 prompting/denial, streaming events, usage tracking, session resumption,
@@ -576,13 +585,14 @@ mid-turn provider failure). Run with `cargo test`.
 
 | Module | Tests |
 |---|---|
+| `command_safety.rs` | Safe/Caution/Destructive classification for rm, find, git, cargo, sed, chmod, mkfs.*; ecosystem-agnostic build tools (npm, yarn, pnpm, bun, go, pip, mvn, gradle, dotnet, …); compound pipeline worst-case; expansion-free guard |
 | `tools/read.rs` | missing arg, nonexistent file, content, offset, limit |
 | `tools/write.rs` | missing args, create new file, overwrite + diff |
 | `tools/edit.rs` | missing args, nonexistent file, not found, replace first |
 | `tools/bash.rs` | missing arg, stdout, nonzero exit, timeout |
 | `tools/glob.rs` | missing arg, finds files, no matches, invalid pattern |
 | `tools/grep.rs` | missing arg, invalid regex, matches with line numbers, no matches |
-| `sandbox.rs` | allow/deny/prompt modes, denylist, allowlist requires every command head, env-assignment skipping, decide_tool prompting, session approvals |
+| `sandbox.rs` | allow/deny/prompt modes, denylist, allowlist requires every command head, env-assignment skipping, safe-command auto-allow, decide_tool prompting, session approvals |
 | `provider/mod.rs` | retry classification by HTTP status, unknown-provider rejection, compat provider resolution, context-window tuning |
 | `config.rs` | default config, roundtrip serialization |
 | `pricing.rs` | cost calculation, known models, free/subscription/passthrough providers |

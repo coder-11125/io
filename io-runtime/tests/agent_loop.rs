@@ -317,8 +317,8 @@ async fn allow_session_skips_subsequent_prompts() {
     assert!(t1.exists() && t2.exists());
     assert_eq!(
         prompt_count.load(Ordering::Relaxed),
-        1,
-        "AllowSession should suppress the second prompt"
+        2,
+        "AllowSession for write grants per-path approval: each distinct path prompts once"
     );
     std::fs::remove_file(&t1).ok();
     std::fs::remove_file(&t2).ok();

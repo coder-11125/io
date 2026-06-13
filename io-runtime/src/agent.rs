@@ -232,6 +232,8 @@ impl Agent {
         // partial progress (text, executed tools) is still saved to the session.
         let mut turn_error: Option<anyhow::Error> = None;
         const MAX_ITERATIONS: usize = 20;
+        // Track files written during this turn to detect write-then-execute sequences.
+        let mut written_this_turn: Vec<String> = Vec::new();
 
         // Propagate cancellation to tools (e.g. spawn_agent)
         self.tools.set_cancel(self.cancel.lock().unwrap().clone());
@@ -393,10 +395,25 @@ impl Agent {
                 }
 
                 let start = std::time::Instant::now();
-                let (output, success) = match self.resolve_permission(name, input, token_tx).await {
+                // Force a prompt if this bash command references a file written earlier this turn.
+                let force_prompt = name == "bash"
+                    && input
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .map(|cmd| written_this_turn.iter().any(|p| cmd.contains(p.as_str())))
+                        .unwrap_or(false);
+                let (output, success) = match self
+                    .resolve_permission(name, input, token_tx, force_prompt)
+                    .await
+                {
                     Err(denial) => (denial, false),
                     Ok(()) => self.execute_tool(name, input).await,
                 };
+                if success && (name == "write" || name == "edit") {
+                    if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+                        written_this_turn.push(path.to_string());
+                    }
+                }
 
                 if let Some(tx) = token_tx {
                     let _ = tx
@@ -409,13 +426,15 @@ impl Agent {
                 }
 
                 let duration = start.elapsed().as_millis() as u64;
-                all_tool_calls.push(ToolCallRecord {
+                let record = ToolCallRecord {
                     tool_name: name.clone(),
                     input: input.clone(),
                     output: output.clone(),
                     success,
                     duration_ms: duration,
-                });
+                };
+                append_audit_log(&record);
+                all_tool_calls.push(record);
                 tool_results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
                     content: output,
@@ -515,8 +534,15 @@ impl Agent {
         name: &str,
         input: &serde_json::Value,
         token_tx: Option<&tokio::sync::mpsc::Sender<AgentEvent>>,
+        force_prompt: bool,
     ) -> Result<(), String> {
-        match self.permissions.decide_tool(name, input) {
+        let decision = self.permissions.decide_tool(name, input);
+        let effective = if force_prompt && decision == PermissionLevel::Allow {
+            PermissionLevel::Prompt
+        } else {
+            decision
+        };
+        match effective {
             PermissionLevel::Allow => Ok(()),
             PermissionLevel::Deny => Err(format!("tool {name} not permitted")),
             PermissionLevel::Prompt => {
@@ -549,9 +575,14 @@ impl Agent {
                 match reply {
                     PermissionReply::AllowOnce => Ok(()),
                     PermissionReply::AllowSession => {
-                        // For bash tools, pass the command to approve only that specific command
                         let command = if name == "bash" {
                             input.get("command").and_then(|v| v.as_str())
+                        } else if name == "write" || name == "edit" {
+                            // Per-path approval: "always" for write/edit approves only this path
+                            input.get("path").and_then(|v| v.as_str())
+                        } else if name == "spawn_agent" {
+                            // Per-agent-id approval: "always" approves only this agent role
+                            input.get("agent_id").and_then(|v| v.as_str())
                         } else {
                             None
                         };
@@ -588,4 +619,28 @@ impl Agent {
     pub async fn compact(&self) -> anyhow::Result<crate::compact::CompactResult> {
         crate::compact::run(&self.session, &self.provider, &self.memory).await
     }
+}
+
+fn audit_log_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".io").join("audit.log"))
+}
+
+fn append_audit_log(record: &crate::types::ToolCallRecord) {
+    let Some(path) = audit_log_path() else { return };
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let entry = serde_json::json!({
+        "ts": chrono::Utc::now().to_rfc3339(),
+        "tool": record.tool_name,
+        "success": record.success,
+        "duration_ms": record.duration_ms,
+    });
+    let line = format!("{}\n", entry);
+    let _ = std::io::Write::write_all(&mut file, line.as_bytes());
 }

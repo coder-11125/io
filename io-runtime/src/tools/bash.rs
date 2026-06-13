@@ -1,5 +1,7 @@
 use super::{Tool, ToolInput, ToolOutput};
 
+const MAX_OUTPUT_BYTES: usize = 100_000;
+
 const ALLOWED_SHELLS: &[&str] = &[
     "/bin/sh",
     "/bin/bash",
@@ -57,9 +59,12 @@ impl Tool for BashTool {
             .filter(|s| ALLOWED_SHELLS.contains(&s.as_str()))
             .unwrap_or_else(|| "/bin/sh".to_string());
 
+        // Prepend resource limits: 512 MB virtual memory, 60 s CPU, 200 MB file size.
+        // Applied at execution time so the sandbox analysis sees the original command.
+        let guarded = format!("ulimit -v 524288 -t 60 -f 204800 2>/dev/null; {command}");
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(timeout_ms),
-            execute_command(&shell, "-lc", &command, &workdir),
+            execute_command(&shell, "-c", &guarded, &workdir),
         )
         .await;
 
@@ -74,6 +79,10 @@ impl Tool for BashTool {
                         text.push('\n');
                     }
                     text.push_str(&output.stderr);
+                }
+                if text.len() > MAX_OUTPUT_BYTES {
+                    text.truncate(MAX_OUTPUT_BYTES);
+                    text.push_str("\n[output truncated]");
                 }
                 if !output.status {
                     if !text.is_empty() {

@@ -19,6 +19,20 @@ enum SessionChoice {
     Existing(SessionId),
 }
 
+fn detect_project_root() -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let mut dir = cwd.clone();
+    loop {
+        if dir.join(".git").exists() || dir.join(".io").exists() {
+            return dir;
+        }
+        match dir.parent() {
+            Some(p) => dir = p.to_path_buf(),
+            None => return cwd,
+        }
+    }
+}
+
 async fn build_agent(
     session: SessionChoice,
     system_prompt: String,
@@ -28,9 +42,10 @@ async fn build_agent(
     let model_id = config.provider.active_model();
     let provider = io_runtime::provider::create_provider(&config, &keys)?;
     let memory = io_runtime::memory::SessionStore::new()?;
-    let permissions = std::sync::Arc::new(io_runtime::sandbox::PermissionChecker::from(
-        &config.permissions,
-    ));
+    let permissions = std::sync::Arc::new(
+        io_runtime::sandbox::PermissionChecker::from(&config.permissions)
+            .with_project_root(detect_project_root()),
+    );
 
     let session_id = match session {
         SessionChoice::New => None,
@@ -1502,9 +1517,18 @@ fn process_ev(
             let icon = if success { "✓" } else { "✗" };
             push_line(line_buf, format!("  ├ {}  {}", name, icon));
         }
-        AgentEvent::PermissionRequest { respond, .. } => {
+        AgentEvent::PermissionRequest { name, input, respond } => {
             use crossterm::style::Stylize;
-            print!("  {} ", "allow? [y]es / [a]lways / [n]o:".yellow());
+            let detail = tool_detail(&name, &input);
+            if detail.is_empty() {
+                print!("\r\n  allow \"{}\"? [y]es / [a]lways / [n]o: ", name.yellow());
+            } else {
+                print!(
+                    "\r\n  allow \"{}\" ({})? [y]es / [a]lways / [n]o: ",
+                    name.yellow(),
+                    detail
+                );
+            }
             let _ = std::io::stdout().flush();
             *pending_perm.lock().unwrap() = Some(respond);
         }
