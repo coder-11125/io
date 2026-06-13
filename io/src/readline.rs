@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
@@ -51,8 +53,8 @@ const COMMANDS: &[Cmd] = &[
     },
 ];
 
-// Column index where user input starts — must match the width of ">>> "
-const PROMPT_COL: u16 = 4;
+// Column index where user input starts — must match the width of "> "
+pub(crate) const PROMPT_COL: u16 = 2;
 
 /// Context passed into read_line for in-place Tab cycling.
 pub struct ReadLineCtx {
@@ -106,7 +108,7 @@ fn filter_matches(buf: &str) -> Vec<usize> {
 }
 
 /// Returns `(at_byte_pos, typed_prefix)` for the last active `@`-mention.
-fn at_prefix(buf: &str) -> Option<(usize, &str)> {
+pub(crate) fn at_prefix(buf: &str) -> Option<(usize, &str)> {
     let at_pos = buf.rfind('@')?;
     if at_pos > 0 && !buf[..at_pos].ends_with(char::is_whitespace) {
         return None;
@@ -115,7 +117,7 @@ fn at_prefix(buf: &str) -> Option<(usize, &str)> {
 }
 
 /// Tries `fd`, then `rg --files`, then `git ls-files`, then stdlib single-level walk.
-fn list_files() -> Vec<String> {
+pub(crate) fn list_files() -> Vec<String> {
     list_files_fd()
         .or_else(list_files_rg)
         .or_else(list_files_git)
@@ -228,7 +230,7 @@ fn list_files_stdlib() -> Vec<String> {
     files
 }
 
-fn filter_files(all: &[String], prefix: &str) -> Vec<String> {
+pub(crate) fn filter_files(all: &[String], prefix: &str) -> Vec<String> {
     if prefix.is_empty() {
         return all.to_vec();
     }
@@ -449,10 +451,10 @@ fn redraw_status(stdout: &mut impl Write, status: &str) -> io::Result<()> {
     queue!(
         stdout,
         cursor::MoveToColumn(0),
-        cursor::MoveUp(1),
+        cursor::MoveUp(2),
         terminal::Clear(ClearType::CurrentLine),
         crossterm::style::PrintStyledContent(status.dark_grey()),
-        cursor::MoveDown(1),
+        cursor::MoveDown(2),
         cursor::MoveToColumn(PROMPT_COL),
     )?;
     stdout.flush()?;

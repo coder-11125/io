@@ -54,13 +54,22 @@ fn set_config_key(
             }
             config.permissions.default = value.to_string();
         }
+        ["theme"] => {
+            if !crate::render::THEME_NAMES.contains(&value) {
+                anyhow::bail!(
+                    "unknown theme: {value}\nAvailable: {}",
+                    crate::render::THEME_NAMES.join(", ")
+                );
+            }
+            config.theme = value.to_string();
+        }
         ["provider", provider, field @ ("model" | "api_key_env" | "deployment")] => {
             set_provider_field(config, provider, field, value)?;
         }
         _ => anyhow::bail!(
             "unknown config key: {key}\nSupported: provider.default, provider.<name>.model, \
              provider.<name>.api_key_env, provider.azure.deployment, session.auto_compact, \
-             session.memory_enabled, session.max_turns, session.max_tokens, permissions.default"
+             session.memory_enabled, session.max_turns, session.max_tokens, permissions.default, theme"
         ),
     }
     Ok(())

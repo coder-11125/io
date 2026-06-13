@@ -9,6 +9,12 @@ pub struct Config {
     pub session: SessionConfig,
     #[serde(default)]
     pub permissions: PermissionConfig,
+    #[serde(default = "default_theme")]
+    pub theme: String,
+}
+
+fn default_theme() -> String {
+    "default".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -557,6 +563,7 @@ impl Default for Config {
             },
             session: SessionConfig::default(),
             permissions: PermissionConfig::default(),
+            theme: default_theme(),
         }
     }
 }

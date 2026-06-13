@@ -11,6 +11,7 @@ mod picker;
 mod readline;
 mod render;
 mod repl;
+mod theme;
 
 #[derive(Parser)]
 #[command(name = "io", version, about = "AI coding agent for the terminal")]

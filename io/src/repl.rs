@@ -2,26 +2,20 @@
 //! per-turn streaming/cancellation/permission dance, and `@path` mentions.
 
 use crate::cost::show_cost_summary;
+use crate::readline;
 use crate::render::{
-    print_prompt, render_markdown, render_thoughts, render_tool_done, render_tool_start,
-    tool_detail,
+    clear_prompt_input, draw_prompt_bar, enter_tui, exit_tui, prepare_streaming,
+    render_scroll_view, render_thoughts, render_tool_done, render_tool_start, tool_detail,
+    PROMPT_BAR_HEIGHT,
 };
-use crate::{agent, connect, model, picker, readline};
+use crate::{agent, connect, model, picker};
 use io_runtime::types::SessionId;
 use std::io::Write;
 
-fn print_banner() {
-    println!("IO");
-}
-
 /// Which session the agent should run in.
 enum SessionChoice {
-    /// Start a fresh session.
     New,
-    /// Resume the most recently updated session (--continue).
     Continue,
-    /// Keep a specific session — used when switching agent/provider/model
-    /// mid-conversation so history is preserved.
     Existing(SessionId),
 }
 
@@ -69,12 +63,8 @@ async fn build_agent(
     ))
 }
 
-/// Maximum file size included inline via `@path` mention.
 const MAX_AT_FILE_BYTES: usize = 100 * 1024;
 
-/// Scan `input` for `@path` tokens and append their resolved content as
-/// `<file>` blocks at the end of the message. The original text (including
-/// the `@` mentions) is preserved so the model sees them in context.
 fn resolve_at_mentions(input: &str) -> String {
     let mut blocks: Vec<String> = Vec::new();
     let chars: Vec<char> = input.chars().collect();
@@ -144,13 +134,16 @@ fn read_at_path(path: &str) -> Option<String> {
     }
 }
 
-/// Slot holding the responder for an in-flight permission prompt. Filled by
-/// the event printer when the agent asks, answered by the key listener.
 type PendingPermission = std::sync::Arc<
     std::sync::Mutex<Option<tokio::sync::oneshot::Sender<io_runtime::PermissionReply>>>,
 >;
 
-/// Blocking stdin permission prompt for single-shot mode (no raw-mode UI).
+/// Shared plain-text line buffer used for in-session scrollback.
+type LineBuf = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+
+const MAX_SCROLL_LINES: usize = 5000;
+const SCROLL_STEP: usize = 3;
+
 fn prompt_on_stdin(name: &str, input: &serde_json::Value) -> io_runtime::PermissionReply {
     let detail = tool_detail(name, input);
     if detail.is_empty() {
@@ -190,28 +183,719 @@ pub async fn run_single_shot(prompt: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── Slash commands (for TUI completion popup) ──────────────────────────────────
+
+const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/help", "Show available commands"),
+    ("/new", "Start a new session"),
+    ("/agent", "Switch agent mode"),
+    ("/connect", "Set up a provider"),
+    ("/model", "Switch model"),
+    ("/theme", "Switch UI theme"),
+    ("/cost", "Show API cost for current session"),
+    ("/compact", "Summarize and compress conversation history"),
+    ("/exit", "Exit"),
+    ("/quit", "Exit"),
+    ("/q", "Exit"),
+];
+
+fn filter_slash_commands(buf: &str) -> Vec<usize> {
+    if buf.is_empty() || !buf.starts_with('/') {
+        return vec![];
+    }
+    let lower = buf.to_ascii_lowercase();
+    SLASH_COMMANDS
+        .iter()
+        .enumerate()
+        .filter(|(_, (name, _))| name.starts_with(&lower))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+// ── TUI input helpers ──────────────────────────────────────────────────────────
+
+/// Maximum number of popup rows to show above the prompt bar.
+const MAX_POPUP_ROWS: u16 = 10;
+
+/// Clear `count` rows above the prompt bar, starting from the row just above it.
+fn clear_rows_above(count: u16) -> std::io::Result<()> {
+    use crossterm::{cursor, execute, terminal};
+    if count == 0 {
+        return Ok(());
+    }
+    let (_, h) = crossterm::terminal::size()?;
+    let top_row = h.saturating_sub(PROMPT_BAR_HEIGHT + 1); // first row above prompt bar
+    let start = top_row.saturating_sub(count.saturating_sub(1));
+    for row in start..=top_row {
+        execute!(
+            std::io::stdout(),
+            cursor::MoveTo(0, row),
+            terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+        )?;
+    }
+    Ok(())
+}
+
+/// Draw a file-completion popup above the prompt bar.
+/// Returns the number of rows drawn.
+fn draw_file_popup(
+    items: &[String],
+    selected: Option<usize>,
+    scroll: usize,
+) -> std::io::Result<u16> {
+    use crossterm::{
+        cursor, execute,
+        style::{Color, Print, ResetColor, SetForegroundColor},
+    };
+    if items.is_empty() {
+        clear_rows_above(0)?;
+        return Ok(0);
+    }
+
+    let total = items.len();
+    let has_above = scroll > 0;
+    let mut item_rows = (MAX_POPUP_ROWS as usize).saturating_sub(usize::from(has_above));
+    let has_below = scroll + item_rows < total;
+    if has_below {
+        item_rows = item_rows.saturating_sub(1);
+    }
+    let window = &items[scroll..(scroll + item_rows).min(total)];
+    let count = usize::from(has_above) + window.len() + usize::from(has_below);
+
+    let (_, h) = crossterm::terminal::size()?;
+    let top_row = h.saturating_sub(PROMPT_BAR_HEIGHT + 1);
+    let start_row = top_row.saturating_sub(count.saturating_sub(1) as u16);
+
+    clear_rows_above(count as u16)?;
+
+    let mut render_idx = 0usize;
+    for row in start_row..=top_row {
+        execute!(std::io::stdout(), cursor::MoveTo(0, row))?;
+
+        if render_idx == 0 && has_above {
+            execute!(
+                std::io::stdout(),
+                SetForegroundColor(Color::DarkGrey),
+                Print(format!("  \u{2191} {} above", scroll)),
+                ResetColor,
+            )?;
+            render_idx += 1;
+        } else {
+            let item_i = render_idx.saturating_sub(usize::from(has_above));
+            if item_i < window.len() {
+                let item = &window[item_i];
+                let abs_idx = scroll + item_i;
+                let is_dir = item.ends_with('/');
+                if selected == Some(abs_idx) {
+                    execute!(
+                        std::io::stdout(),
+                        SetForegroundColor(Color::Cyan),
+                        Print("\u{25b6} "),
+                        ResetColor,
+                        Print(item),
+                    )?;
+                } else if is_dir {
+                    execute!(
+                        std::io::stdout(),
+                        SetForegroundColor(Color::Cyan),
+                        Print(format!("  {item}")),
+                        ResetColor,
+                    )?;
+                } else {
+                    execute!(
+                        std::io::stdout(),
+                        SetForegroundColor(Color::DarkGrey),
+                        Print(format!("  {item}")),
+                        ResetColor,
+                    )?;
+                }
+                render_idx += 1;
+            } else if has_below && item_i == window.len() {
+                let remaining = total.saturating_sub(scroll + window.len());
+                execute!(
+                    std::io::stdout(),
+                    SetForegroundColor(Color::DarkGrey),
+                    Print(format!("  \u{2193} {} below", remaining)),
+                    ResetColor,
+                )?;
+                render_idx += 1;
+            }
+        }
+    }
+    std::io::stdout().flush()?;
+    Ok(count as u16)
+}
+
+/// Draw a bordered slash-command picker above the prompt bar.
+/// Returns the number of rows drawn (including border rows).
+fn draw_slash_popup(matches: &[usize], selected: Option<usize>) -> std::io::Result<u16> {
+    use crossterm::{
+        cursor, execute,
+        style::{Color, Print, ResetColor, SetBackgroundColor, SetForegroundColor},
+    };
+    if matches.is_empty() {
+        clear_rows_above(0)?;
+        return Ok(0);
+    }
+
+    let n = matches.len().min(MAX_POPUP_ROWS as usize);
+    let (w, h) = crossterm::terminal::size()?;
+
+    let name_w = matches
+        .iter()
+        .map(|&i| SLASH_COMMANDS[i].0.len())
+        .max()
+        .unwrap_or(0);
+    let desc_w = matches
+        .iter()
+        .map(|&i| SLASH_COMMANDS[i].1.len())
+        .max()
+        .unwrap_or(0);
+    // Item inner content: " ▶ /name   desc " — indicator(1) + space + name(padded) + 2 + desc
+    let inner_w = (1 + 1 + name_w + 2 + desc_w + 1).min(w as usize - 2);
+    let box_w = (inner_w + 2) as u16;
+
+    // total_rows = n items + top border + bottom border
+    let total_rows = n as u16 + 2;
+    let top_row = h.saturating_sub(PROMPT_BAR_HEIGHT + total_rows);
+
+    clear_rows_above(total_rows)?;
+
+    // Top border
+    execute!(
+        std::io::stdout(),
+        cursor::MoveTo(0, top_row),
+        SetForegroundColor(Color::DarkGrey),
+        Print(format!("╭{}╮", "─".repeat(inner_w))),
+        ResetColor,
+    )?;
+
+    for i in 0..n {
+        let row = top_row + 1 + i as u16;
+        let idx = matches[i];
+        let (name, desc) = SLASH_COMMANDS[idx];
+        let is_sel = selected == Some(i);
+        let indicator = if is_sel { "▶" } else { " " };
+        let pad = " ".repeat(name_w - name.len() + 2);
+        let content = format!("{indicator} {name}{pad}{desc}");
+        // Truncate at char boundary to inner_w
+        let mut end = content.len().min(inner_w);
+        while end > 0 && !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        let padded = format!("{:<width$}", &content[..end], width = inner_w);
+
+        execute!(
+            std::io::stdout(),
+            cursor::MoveTo(0, row),
+            SetForegroundColor(Color::DarkGrey),
+            Print("│"),
+            ResetColor,
+        )?;
+        if is_sel {
+            execute!(
+                std::io::stdout(),
+                SetBackgroundColor(Color::DarkGrey),
+                SetForegroundColor(Color::White),
+                Print(&padded),
+                ResetColor,
+            )?;
+        } else {
+            // Name in default color, desc in dark grey
+            let name_part = format!("{indicator} {name}{pad}");
+            execute!(
+                std::io::stdout(),
+                Print(&name_part),
+                SetForegroundColor(Color::DarkGrey),
+                Print(desc),
+                ResetColor,
+            )?;
+        }
+        execute!(
+            std::io::stdout(),
+            cursor::MoveTo(box_w - 1, row),
+            SetForegroundColor(Color::DarkGrey),
+            Print("│"),
+            ResetColor,
+        )?;
+    }
+
+    // Bottom border
+    execute!(
+        std::io::stdout(),
+        cursor::MoveTo(0, top_row + n as u16 + 1),
+        SetForegroundColor(Color::DarkGrey),
+        Print(format!("╰{}╯", "─".repeat(inner_w))),
+        ResetColor,
+    )?;
+
+    std::io::stdout().flush()?;
+    Ok(total_rows)
+}
+
+// ── TUI read line ──────────────────────────────────────────────────────────────
+
+/// Read a line of input from the user in TUI mode. The prompt bar at the bottom
+/// of the terminal shows the current buffer. Supports /slash completions,
+/// @file mentions, and Tab agent cycling.
+fn tui_read_line(
+    full_agents: &[io_agents::AgentConfig],
+    tab_current: &mut usize,
+    agent: &io_runtime::Agent,
+    last_input_tokens: u32,
+    context_window: u64,
+    current_agent_id: &str,
+    theme: &crate::render::Theme,
+    line_buf: &LineBuf,
+) -> anyhow::Result<Option<String>> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
+
+    let mut buf = String::new();
+
+    let mut file_all: Option<Vec<String>> = None;
+    let mut file_filtered: Vec<String> = vec![];
+    let mut file_selected: Option<usize> = None;
+    let mut file_scroll: usize = 0;
+
+    let mut slash_matches: Vec<usize> = Vec::new();
+    let mut slash_selected: Option<usize> = None;
+    let mut popup_rows: u16 = 0;
+    let mut scroll_offset: usize = 0;
+
+    // Draw the prompt bar with the currently-selected agent info.
+    let bar = |input: &str, tc: usize| -> std::io::Result<()> {
+        let name = full_agents
+            .get(tc)
+            .map(|a| a.name)
+            .unwrap_or(current_agent_id);
+        draw_prompt_bar(
+            input,
+            name,
+            agent.provider_id,
+            &agent.model_id,
+            last_input_tokens,
+            context_window,
+            theme,
+        )
+    };
+
+    bar("", *tab_current)?;
+    crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
+
+    loop {
+        let ev = event::read()?;
+        match ev {
+            Event::Resize(_, _) => {
+                crate::render::handle_resize()?;
+                if file_all.is_some() {
+                    popup_rows = draw_file_popup(&file_filtered, file_selected, file_scroll)?;
+                } else if !slash_matches.is_empty() {
+                    popup_rows = draw_slash_popup(&slash_matches, slash_selected)?;
+                } else {
+                    popup_rows = 0;
+                    // Reflow content area at the current scroll position.
+                    render_scroll_view(&line_buf.lock().unwrap(), scroll_offset, theme)?;
+                }
+                bar(&buf, *tab_current)?;
+            }
+            Event::Mouse(mouse) => {
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        let n = line_buf.lock().unwrap().len();
+                        scroll_offset = scroll_offset.saturating_add(SCROLL_STEP).min(n);
+                        render_scroll_view(&line_buf.lock().unwrap(), scroll_offset, theme)?;
+                    }
+                    MouseEventKind::ScrollDown => {
+                        if scroll_offset > 0 {
+                            scroll_offset = scroll_offset.saturating_sub(SCROLL_STEP);
+                            render_scroll_view(&line_buf.lock().unwrap(), scroll_offset, theme)?;
+                            bar(&buf, *tab_current)?;
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            Event::Key(key) => {
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+                // Any key press while in scroll mode returns to live view first.
+                if scroll_offset > 0 {
+                    scroll_offset = 0;
+                    render_scroll_view(&line_buf.lock().unwrap(), scroll_offset, theme)?;
+                    bar(&buf, *tab_current)?;
+                }
+                match (key.code, key.modifiers) {
+                    (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                        clear_rows_above(popup_rows)?;
+                        crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide)?;
+                        return Ok(None);
+                    }
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        clear_rows_above(popup_rows)?;
+                        bar("", *tab_current)?;
+                        return Ok(Some(String::new()));
+                    }
+
+                    (KeyCode::Enter, _) => {
+                        if file_all.is_some() {
+                            if let Some(s) = file_selected {
+                                if s < file_filtered.len() {
+                                    if let Some((at_pos, _)) = readline::at_prefix(&buf) {
+                                        buf.truncate(at_pos);
+                                        buf.push('@');
+                                        buf.push_str(&file_filtered[s]);
+                                        file_all = None;
+                                        file_filtered.clear();
+                                        file_selected = None;
+                                        file_scroll = 0;
+                                        popup_rows = 0;
+                                        bar(&buf, *tab_current)?;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(s) = slash_selected {
+                            if s < slash_matches.len() {
+                                buf = SLASH_COMMANDS[slash_matches[s]].0.to_string();
+                            }
+                        }
+                        clear_rows_above(popup_rows)?;
+                        bar(&buf, *tab_current)?;
+                        crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide)?;
+                        return Ok(Some(buf));
+                    }
+
+                    (KeyCode::Backspace, _) => {
+                        buf.pop();
+                        let mut new_rows: u16 = 0;
+                        if let Some(ref all) = file_all {
+                            let prefix = readline::at_prefix(&buf).map(|(_, p)| p).unwrap_or("");
+                            file_filtered = readline::filter_files(all, prefix);
+                            file_selected = if file_filtered.is_empty() {
+                                None
+                            } else {
+                                Some(0)
+                            };
+                            file_scroll = 0;
+                            new_rows = draw_file_popup(&file_filtered, file_selected, file_scroll)?;
+                            slash_matches.clear();
+                            slash_selected = None;
+                        } else {
+                            slash_matches = filter_slash_commands(&buf);
+                            slash_selected = None;
+                            if !slash_matches.is_empty() {
+                                new_rows = draw_slash_popup(&slash_matches, slash_selected)?;
+                            } else {
+                                clear_rows_above(popup_rows)?;
+                            }
+                        }
+                        popup_rows = new_rows;
+                        bar(&buf, *tab_current)?;
+                    }
+
+                    (KeyCode::Tab, _) => {
+                        if buf.is_empty() {
+                            if !full_agents.is_empty() {
+                                *tab_current = (*tab_current + 1) % full_agents.len();
+                                file_all = None;
+                                file_filtered.clear();
+                                file_selected = None;
+                                file_scroll = 0;
+                                slash_matches.clear();
+                                slash_selected = None;
+                                clear_rows_above(popup_rows)?;
+                                popup_rows = 0;
+                                bar("", *tab_current)?;
+                            }
+                        } else if file_all.is_some() && !file_filtered.is_empty() {
+                            let next = file_selected
+                                .map(|s| (s + 1) % file_filtered.len())
+                                .unwrap_or(0);
+                            file_selected = Some(next);
+                            if next >= file_scroll + (MAX_POPUP_ROWS as usize).saturating_sub(2) {
+                                file_scroll = next
+                                    .saturating_add(1)
+                                    .saturating_sub(MAX_POPUP_ROWS as usize)
+                                    .saturating_sub(2);
+                            } else if next < file_scroll {
+                                file_scroll = next;
+                            }
+                            popup_rows =
+                                draw_file_popup(&file_filtered, file_selected, file_scroll)?;
+                            bar(&buf, *tab_current)?;
+                        } else if !slash_matches.is_empty() {
+                            slash_selected = Some(match slash_selected {
+                                None => 0,
+                                Some(s) => (s + 1) % slash_matches.len(),
+                            });
+                            popup_rows = draw_slash_popup(&slash_matches, slash_selected)?;
+                            bar(&buf, *tab_current)?;
+                        }
+                    }
+
+                    (KeyCode::Esc, _) if file_all.is_some() || slash_selected.is_some() => {
+                        file_all = None;
+                        file_filtered.clear();
+                        file_selected = None;
+                        file_scroll = 0;
+                        slash_matches.clear();
+                        slash_selected = None;
+                        clear_rows_above(popup_rows)?;
+                        popup_rows = 0;
+                        bar(&buf, *tab_current)?;
+                    }
+
+                    (KeyCode::Down, _) => {
+                        if file_all.is_some() && !file_filtered.is_empty() {
+                            let next = file_selected
+                                .map(|s| (s + 1) % file_filtered.len())
+                                .unwrap_or(0);
+                            file_selected = Some(next);
+                            if next >= file_scroll + (MAX_POPUP_ROWS as usize).saturating_sub(2) {
+                                file_scroll = next
+                                    .saturating_add(1)
+                                    .saturating_sub(MAX_POPUP_ROWS as usize)
+                                    .saturating_sub(2);
+                            } else if next < file_scroll {
+                                file_scroll = next;
+                            }
+                            popup_rows =
+                                draw_file_popup(&file_filtered, file_selected, file_scroll)?;
+                            bar(&buf, *tab_current)?;
+                        } else if !slash_matches.is_empty() {
+                            slash_selected = Some(match slash_selected {
+                                None => 0,
+                                Some(s) => (s + 1) % slash_matches.len(),
+                            });
+                            popup_rows = draw_slash_popup(&slash_matches, slash_selected)?;
+                            bar(&buf, *tab_current)?;
+                        }
+                    }
+
+                    (KeyCode::Up, _) => {
+                        if file_all.is_some() && !file_filtered.is_empty() {
+                            let prev = match file_selected {
+                                None | Some(0) => file_filtered.len() - 1,
+                                Some(s) => s - 1,
+                            };
+                            file_selected = Some(prev);
+                            if prev < file_scroll {
+                                file_scroll = prev;
+                            } else if prev
+                                >= file_scroll + (MAX_POPUP_ROWS as usize).saturating_sub(2)
+                            {
+                                file_scroll = prev
+                                    .saturating_add(1)
+                                    .saturating_sub(MAX_POPUP_ROWS as usize)
+                                    .saturating_sub(2);
+                            }
+                            popup_rows =
+                                draw_file_popup(&file_filtered, file_selected, file_scroll)?;
+                            bar(&buf, *tab_current)?;
+                        } else if !slash_matches.is_empty() {
+                            let prev = match slash_selected {
+                                None | Some(0) => slash_matches.len() - 1,
+                                Some(s) => s - 1,
+                            };
+                            slash_selected = Some(prev);
+                            popup_rows = draw_slash_popup(&slash_matches, slash_selected)?;
+                            bar(&buf, *tab_current)?;
+                        }
+                    }
+
+                    (KeyCode::Char('@'), _) => {
+                        buf.push('@');
+                        let all = readline::list_files();
+                        file_filtered = all.clone();
+                        file_all = Some(all);
+                        file_selected = if file_filtered.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        };
+                        file_scroll = 0;
+                        slash_matches.clear();
+                        slash_selected = None;
+                        popup_rows = draw_file_popup(&file_filtered, file_selected, file_scroll)?;
+                        bar(&buf, *tab_current)?;
+                    }
+
+                    (KeyCode::Char(' '), _) if file_all.is_some() => {
+                        buf.push(' ');
+                        file_all = None;
+                        file_filtered.clear();
+                        file_selected = None;
+                        file_scroll = 0;
+                        slash_matches.clear();
+                        slash_selected = None;
+                        clear_rows_above(popup_rows)?;
+                        popup_rows = 0;
+                        bar(&buf, *tab_current)?;
+                    }
+
+                    (KeyCode::Char(c), _) => {
+                        buf.push(c);
+                        if file_all.is_some() {
+                            if let Some((_, prefix)) = readline::at_prefix(&buf) {
+                                if let Some(all) = &file_all {
+                                    file_filtered = readline::filter_files(all, prefix);
+                                }
+                            }
+                            file_selected = if file_filtered.is_empty() {
+                                None
+                            } else {
+                                Some(0)
+                            };
+                            file_scroll = 0;
+                            popup_rows =
+                                draw_file_popup(&file_filtered, file_selected, file_scroll)?;
+                            slash_matches.clear();
+                            slash_selected = None;
+                        } else {
+                            slash_matches = filter_slash_commands(&buf);
+                            if slash_matches.is_empty() {
+                                slash_selected = None;
+                                if popup_rows > 0 {
+                                    clear_rows_above(popup_rows)?;
+                                    popup_rows = 0;
+                                }
+                            } else {
+                                popup_rows = draw_slash_popup(&slash_matches, slash_selected)?;
+                            }
+                        }
+                        bar(&buf, *tab_current)?;
+                    }
+
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── Splash screen input ────────────────────────────────────────────────────────
+
+/// Read the first message from a centered splash screen.
+/// Returns `None` on Ctrl+D (exit), `Some(text)` on Enter with non-empty input.
+fn splash_read_line(
+    full_agents: &[io_agents::AgentConfig],
+    tab_current: &mut usize,
+    agent: &io_runtime::Agent,
+    theme: &crate::render::Theme,
+) -> anyhow::Result<Option<String>> {
+    use crossterm::{
+        cursor,
+        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+        execute,
+    };
+
+    let mut buf = String::new();
+
+    let agent_name = full_agents
+        .get(*tab_current)
+        .map(|a| a.name)
+        .unwrap_or("build");
+    let mut layout =
+        crate::render::draw_splash(&buf, agent_name, agent.provider_id, &agent.model_id, theme)?;
+    let (cx, cy) = crate::render::splash_cursor(&layout, &buf);
+    execute!(std::io::stdout(), cursor::MoveTo(cx, cy), cursor::Show)?;
+
+    loop {
+        match event::read()? {
+            Event::Resize(_, _) => {
+                let name = full_agents
+                    .get(*tab_current)
+                    .map(|a| a.name)
+                    .unwrap_or("build");
+                layout = crate::render::draw_splash(
+                    &buf,
+                    name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    theme,
+                )?;
+                let (cx, cy) = crate::render::splash_cursor(&layout, &buf);
+                execute!(std::io::stdout(), cursor::MoveTo(cx, cy), cursor::Show)?;
+            }
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                        execute!(std::io::stdout(), cursor::Hide)?;
+                        return Ok(None);
+                    }
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        buf.clear();
+                        crate::render::splash_update_input(&layout, &buf, theme)?;
+                        let (cx, cy) = crate::render::splash_cursor(&layout, &buf);
+                        execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
+                    }
+                    (KeyCode::Enter, _) if !buf.trim().is_empty() => {
+                        execute!(std::io::stdout(), cursor::Hide)?;
+                        return Ok(Some(buf));
+                    }
+                    (KeyCode::Enter, _) => {}
+                    (KeyCode::Backspace, _) => {
+                        buf.pop();
+                        crate::render::splash_update_input(&layout, &buf, theme)?;
+                        let (cx, cy) = crate::render::splash_cursor(&layout, &buf);
+                        execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
+                    }
+                    (KeyCode::Tab, _) if !full_agents.is_empty() => {
+                        *tab_current = (*tab_current + 1) % full_agents.len();
+                        let name = full_agents[*tab_current].name;
+                        crate::render::splash_update_status(
+                            &layout,
+                            name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            theme,
+                        )?;
+                        let (cx, cy) = crate::render::splash_cursor(&layout, &buf);
+                        execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
+                    }
+                    (KeyCode::Char(c), _) => {
+                        buf.push(c);
+                        crate::render::splash_update_input(&layout, &buf, theme)?;
+                        let (cx, cy) = crate::render::splash_cursor(&layout, &buf);
+                        execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── Interactive REPL ───────────────────────────────────────────────────────────
+
 pub async fn run_interactive(
     new_session: bool,
     continue_session: bool,
     _model: Option<&str>,
 ) -> anyhow::Result<()> {
-    print_banner();
-
-    {
-        let config = io_runtime::config::Config::load()?;
-        let keys = io_runtime::config::KeyStore::load();
-        if let Some(env) = io_runtime::provider::missing_api_key(&config, &keys) {
-            use crossterm::style::Stylize;
-            println!(
-                "{}",
-                format!(
-                    "warning: no API key found for provider \"{}\" — requests will fail.\n         run /connect to set one up, or export {env}.",
-                    config.provider.default
-                )
-                .yellow()
-            );
-            println!();
-        }
+    let config = io_runtime::config::Config::load()?;
+    let mut theme = crate::render::get_theme(&config.theme);
+    let line_buf: LineBuf = std::sync::Arc::new(std::sync::Mutex::new(
+        std::collections::VecDeque::with_capacity(512),
+    ));
+    let keys = io_runtime::config::KeyStore::load();
+    if let Some(env) = io_runtime::provider::missing_api_key(&config, &keys) {
+        use crossterm::style::Stylize;
+        // Print warning before entering TUI
+        println!(
+            "{}",
+            format!(
+                "warning: no API key found for provider \"{}\" — requests will fail.\n         run /connect to set one up, or export {env}.",
+                config.provider.default
+            )
+            .yellow()
+        );
+        println!();
     }
 
     let mut current_agent = io_agents::builtin::by_id("build").expect("build agent must exist");
@@ -222,38 +906,69 @@ pub async fn run_interactive(
     };
     let mut agent = build_agent(startup_session, current_agent.system_prompt.clone()).await?;
 
-    let sid = agent.session_id().await;
-    let short_id = &sid.to_string()[..8];
-    println!("session: {short_id}  |  /help  /agent  /connect  /exit");
-    println!();
+    enter_tui()?;
 
     let mut last_input_tokens: u32 = 0;
+    let mut is_splash = true;
 
     loop {
-        print_prompt(&agent, last_input_tokens, current_agent.id);
-
         let full_agents = io_agents::builtin::full_agents();
-        let tab_current = full_agents
+        let mut tab_current = full_agents
             .iter()
             .position(|a| a.id == current_agent.id)
             .unwrap_or(0);
-        let tab_statuses: Vec<String> = full_agents
-            .iter()
-            .map(|a| format!("  {} · {} · {}", a.id, agent.provider_id, agent.model_id))
-            .collect();
-        let ctx = readline::ReadLineCtx {
-            tab_statuses,
-            tab_current,
+
+        let input = if is_splash {
+            match splash_read_line(&full_agents, &mut tab_current, &agent, &theme) {
+                Ok(Some(s)) => {
+                    is_splash = false;
+                    crossterm::execute!(
+                        std::io::stdout(),
+                        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                    )?;
+                    s
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    break;
+                }
+            }
+        } else {
+            match tui_read_line(
+                &full_agents,
+                &mut tab_current,
+                &agent,
+                last_input_tokens,
+                agent.context_window(),
+                current_agent.id,
+                &theme,
+                &line_buf,
+            ) {
+                Ok(Some(s)) => s,
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = draw_prompt_bar(
+                        &format!("error: {e}"),
+                        current_agent.name,
+                        agent.provider_id,
+                        &agent.model_id,
+                        last_input_tokens,
+                        agent.context_window(),
+                        &theme,
+                    );
+                    continue;
+                }
+            }
         };
 
-        let output = match tokio::task::spawn_blocking(move || readline::read_line(ctx)).await?? {
-            Some(out) => out,
-            None => break,
-        };
-
-        // Sync agent if Tab cycling changed the selection — rebuild once on Enter, not per keypress.
-        if output.agent_idx != tab_current {
-            if let Some(picked) = full_agents.into_iter().nth(output.agent_idx) {
+        if tab_current
+            != full_agents
+                .iter()
+                .position(|a| a.id == current_agent.id)
+                .unwrap_or(0)
+        {
+            if let Some(picked) = full_agents.into_iter().nth(tab_current) {
                 current_agent = picked;
                 let sid = agent.session_id().await;
                 match build_agent(
@@ -263,12 +978,23 @@ pub async fn run_interactive(
                 .await
                 {
                     Ok(new_agent) => agent = new_agent,
-                    Err(e) => eprintln!("error switching agent: {e}"),
+                    Err(e) => {
+                        let _ = draw_prompt_bar(
+                            &format!("error switching agent: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                        continue;
+                    }
                 }
             }
         }
 
-        let input = output.text.trim().to_string();
+        let input = input.trim().to_string();
 
         if input.is_empty() {
             continue;
@@ -277,47 +1003,93 @@ pub async fn run_interactive(
         match input.as_str() {
             "/exit" | "/quit" | "/q" => break,
             "/help" => {
-                println!("Commands:");
-                println!("  /exit, /quit   Exit");
-                println!("  /help          Show this help");
-                println!("  /agent         Switch agent mode");
-                println!("  /connect       Set up a provider interactively");
-                println!("  /model         Switch between configured providers");
-                println!("  /cost          Show API cost summary for current session");
-                println!("  /compact       Summarize and compress conversation history");
-                println!("  !<cmd>         Run a shell command");
-                println!();
+                clear_rows_above(0)?;
+                let help_lines = [
+                    "Commands:",
+                    "  /exit, /quit   Exit",
+                    "  /help          Show this help",
+                    "  /new           Start a new session",
+                    "  /agent         Switch agent mode",
+                    "  /connect       Set up a provider interactively",
+                    "  /model         Switch between configured providers",
+                    "  /theme         Switch UI theme",
+                    "  /cost          Show API cost summary for current session",
+                    "  /compact       Summarize and compress conversation history",
+                    "  !<cmd>         Run a shell command",
+                ];
+                let (_, h) = crossterm::terminal::size()?;
+                let start_row = h.saturating_sub(PROMPT_BAR_HEIGHT + 1 + help_lines.len() as u16);
+                for (i, line) in help_lines.iter().enumerate() {
+                    use crossterm::{cursor, execute, style::Print, terminal};
+                    execute!(
+                        std::io::stdout(),
+                        cursor::MoveTo(0, start_row + i as u16),
+                        terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+                        Print(line),
+                    )?;
+                }
+                std::io::stdout().flush()?;
                 continue;
             }
             "/cost" => {
                 if let Err(e) = show_cost_summary(&agent).await {
-                    eprintln!("error showing cost summary: {e}");
+                    let _ = draw_prompt_bar(
+                        &format!("error: {e}"),
+                        current_agent.name,
+                        agent.provider_id,
+                        &agent.model_id,
+                        last_input_tokens,
+                        agent.context_window(),
+                        &theme,
+                    );
                 }
                 continue;
             }
             "/compact" => {
-                print!("  Compacting conversation history...");
-                std::io::stdout().flush().ok();
                 match agent.compact().await {
                     Ok(result) if result.turns_compacted == 0 => {
-                        println!("\r  Nothing to compact — session has no turns.          ");
-                    }
-                    Ok(result) => {
-                        println!(
-                            "\r  Compacted {} turn{} into a summary.                    ",
-                            result.turns_compacted,
-                            if result.turns_compacted == 1 { "" } else { "s" }
+                        let _ = draw_prompt_bar(
+                            "Nothing to compact — session has no turns.",
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
                         );
                     }
-                    Err(e) => eprintln!("\r  error: {e}"),
+                    Ok(result) => {
+                        let _ = draw_prompt_bar(
+                            &format!(
+                                "Compacted {} turn{} into a summary.",
+                                result.turns_compacted,
+                                if result.turns_compacted == 1 { "" } else { "s" }
+                            ),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
+                    Err(e) => {
+                        let _ = draw_prompt_bar(
+                            &format!("error: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
                 }
                 continue;
             }
             "/agent" => {
                 match agent::run(current_agent.id) {
                     Ok(new_config) => {
-                        println!("  Agent: {}", new_config.name);
-                        println!();
                         current_agent = new_config;
                         let sid = agent.session_id().await;
                         match build_agent(
@@ -327,11 +1099,29 @@ pub async fn run_interactive(
                         .await
                         {
                             Ok(new_agent) => agent = new_agent,
-                            Err(e) => eprintln!("error reloading agent: {e}"),
+                            Err(e) => {
+                                let _ = draw_prompt_bar(
+                                    &format!("error reloading agent: {e}"),
+                                    current_agent.name,
+                                    agent.provider_id,
+                                    &agent.model_id,
+                                    last_input_tokens,
+                                    agent.context_window(),
+                                    &theme,
+                                );
+                            }
                         }
                     }
                     Err(e) if !e.is::<picker::Dismissed>() => {
-                        eprintln!("error: {e}");
+                        let _ = draw_prompt_bar(
+                            &format!("error: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
                     }
                     _ => {}
                 }
@@ -348,10 +1138,30 @@ pub async fn run_interactive(
                         .await
                         {
                             Ok(new_agent) => agent = new_agent,
-                            Err(e) => eprintln!("error reloading provider: {e}"),
+                            Err(e) => {
+                                let _ = draw_prompt_bar(
+                                    &format!("error reloading provider: {e}"),
+                                    current_agent.name,
+                                    agent.provider_id,
+                                    &agent.model_id,
+                                    last_input_tokens,
+                                    agent.context_window(),
+                                    &theme,
+                                );
+                            }
                         }
                     }
-                    Err(e) => eprintln!("error: {e}"),
+                    Err(e) => {
+                        let _ = draw_prompt_bar(
+                            &format!("error: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
                 }
                 continue;
             }
@@ -366,20 +1176,104 @@ pub async fn run_interactive(
                         .await
                         {
                             Ok(new_agent) => agent = new_agent,
-                            Err(e) => eprintln!("error reloading provider: {e}"),
+                            Err(e) => {
+                                let _ = draw_prompt_bar(
+                                    &format!("error reloading provider: {e}"),
+                                    current_agent.name,
+                                    agent.provider_id,
+                                    &agent.model_id,
+                                    last_input_tokens,
+                                    agent.context_window(),
+                                    &theme,
+                                );
+                            }
                         }
                     }
                     Err(e) if !e.is::<picker::Dismissed>() => {
-                        eprintln!("error: {e}");
+                        let _ = draw_prompt_bar(
+                            &format!("error: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
                     }
                     _ => {}
+                }
+                continue;
+            }
+            "/new" => {
+                match build_agent(SessionChoice::New, current_agent.system_prompt.clone()).await {
+                    Ok(new_agent) => {
+                        agent = new_agent;
+                        last_input_tokens = 0;
+                        // Reset scroll buffer for the new session.
+                        line_buf.lock().unwrap().clear();
+                        is_splash = true;
+                    }
+                    Err(e) => {
+                        let _ = draw_prompt_bar(
+                            &format!("error: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
+                }
+                continue;
+            }
+            "/theme" => {
+                match crate::theme::run(theme.name) {
+                    Ok(name) => {
+                        theme = crate::render::get_theme(name);
+                        is_splash = true;
+                    }
+                    Err(e) if !e.is::<picker::Dismissed>() => {
+                        let _ = draw_prompt_bar(
+                            &format!("error: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
+                    _ => {
+                        let _ = draw_prompt_bar(
+                            "",
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
                 }
                 continue;
             }
             _ if input.starts_with('!') => {
                 let cmd = input[1..].trim();
                 let output = run_bash(cmd).await;
-                println!("{output}");
+                // Show bash output at bottom of scroll region
+                {
+                    let (_, h) = crossterm::terminal::size()?;
+                    let row = h.saturating_sub(PROMPT_BAR_HEIGHT + 1);
+                    use crossterm::{cursor, execute, style::Print, terminal};
+                    execute!(
+                        std::io::stdout(),
+                        cursor::MoveTo(0, row),
+                        terminal::Clear(crossterm::terminal::ClearType::UntilNewLine),
+                        Print(output),
+                    )?;
+                    std::io::stdout().flush()?;
+                }
                 continue;
             }
             _ => {}
@@ -391,74 +1285,102 @@ pub async fn run_interactive(
 
         let (token_tx, token_rx) = tokio::sync::mpsc::channel::<io_runtime::AgentEvent>(64);
         let pending_perm: PendingPermission = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let print_task = tokio::spawn(blink_and_print(token_rx, pending_perm.clone()));
 
-        // Background thread: poll keys — answer permission prompts (y/a/n),
-        // otherwise Esc signals cancellation.
+        clear_prompt_input()?;
+        prepare_streaming()?;
+
+        // Echo the user's message into the content area before the response streams in.
+        {
+            use crossterm::{
+                execute,
+                style::{Print, ResetColor, SetForegroundColor},
+            };
+            execute!(
+                std::io::stdout(),
+                SetForegroundColor(theme.muted),
+                Print(format!("  {}\r\n\r\n", input)),
+                ResetColor,
+            )?;
+        }
+        // Capture user message in scroll buffer.
+        push_line(&line_buf, format!("  > {}", input));
+        push_line(&line_buf, String::new());
+
+        let print_task = tokio::spawn(blink_and_print(
+            token_rx,
+            pending_perm.clone(),
+            theme,
+            line_buf.clone(),
+        ));
+
         let cancel_for_listener = cancel_flag.clone();
         let pending_for_listener = pending_perm.clone();
         let streaming_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let streaming_done2 = streaming_done.clone();
         let (esc_tx, esc_rx) = tokio::sync::oneshot::channel::<()>();
         let key_listener = tokio::task::spawn_blocking(move || {
-            use crossterm::{event, terminal};
+            use crossterm::event;
             use io_runtime::PermissionReply;
-            let _ = terminal::enable_raw_mode();
             loop {
                 if streaming_done2.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
                 if event::poll(std::time::Duration::from_millis(50)).unwrap_or(false) {
-                    if let Ok(event::Event::Key(k)) = event::read() {
-                        let mut slot = pending_for_listener.lock().unwrap();
-                        if slot.is_some() {
-                            // A permission prompt is on screen — interpret the
-                            // key as an answer; ignore anything unrecognized.
-                            let reply = match k.code {
-                                event::KeyCode::Char('y')
-                                | event::KeyCode::Char('Y')
-                                | event::KeyCode::Enter => Some(PermissionReply::AllowOnce),
-                                event::KeyCode::Char('a') | event::KeyCode::Char('A') => {
-                                    Some(PermissionReply::AllowSession)
-                                }
-                                event::KeyCode::Char('n')
-                                | event::KeyCode::Char('N')
-                                | event::KeyCode::Esc => Some(PermissionReply::Deny),
-                                _ => None,
-                            };
-                            if let Some(reply) = reply {
-                                let label = match reply {
-                                    PermissionReply::AllowOnce => "yes",
-                                    PermissionReply::AllowSession => "always",
-                                    PermissionReply::Deny => "no",
+                    match event::read() {
+                        Ok(crossterm::event::Event::Key(k)) => {
+                            let mut slot = pending_for_listener.lock().unwrap();
+                            if slot.is_some() {
+                                let reply = match k.code {
+                                    crossterm::event::KeyCode::Char('y')
+                                    | crossterm::event::KeyCode::Char('Y')
+                                    | crossterm::event::KeyCode::Enter => {
+                                        Some(PermissionReply::AllowOnce)
+                                    }
+                                    crossterm::event::KeyCode::Char('a')
+                                    | crossterm::event::KeyCode::Char('A') => {
+                                        Some(PermissionReply::AllowSession)
+                                    }
+                                    crossterm::event::KeyCode::Char('n')
+                                    | crossterm::event::KeyCode::Char('N')
+                                    | crossterm::event::KeyCode::Esc => Some(PermissionReply::Deny),
+                                    _ => None,
                                 };
-                                print!("{label}\r\n");
-                                let _ = std::io::stdout().flush();
-                                if let Some(tx) = slot.take() {
-                                    let _ = tx.send(reply);
+                                if let Some(reply) = reply {
+                                    let label = match reply {
+                                        PermissionReply::AllowOnce => "yes",
+                                        PermissionReply::AllowSession => "always",
+                                        PermissionReply::Deny => "no",
+                                    };
+                                    print!("{label}\r\n");
+                                    let _ = std::io::stdout().flush();
+                                    if let Some(tx) = slot.take() {
+                                        let _ = tx.send(reply);
+                                    }
                                 }
+                                continue;
                             }
-                            continue;
+                            drop(slot);
+                            if k.code == crossterm::event::KeyCode::Esc {
+                                cancel_for_listener
+                                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                                let _ = esc_tx.send(());
+                                break;
+                            }
                         }
-                        drop(slot);
-                        if k.code == event::KeyCode::Esc {
-                            cancel_for_listener.store(true, std::sync::atomic::Ordering::Relaxed);
-                            let _ = esc_tx.send(());
-                            break;
+                        Ok(crossterm::event::Event::Resize(_, _)) => {
+                            let _ = crate::render::handle_resize();
                         }
+                        _ => {}
                     }
                 }
             }
-            let _ = terminal::disable_raw_mode();
         });
 
-        // Dropping the streaming future drops token_tx, closing the channel so
-        // print_task drains and exits naturally in both the normal and Esc cases.
         tokio::select! {
             result = agent.run_turn_streaming(&prompt, token_tx) => {
                 if let Err(e) = result {
                     if !e.is::<io_runtime::Cancelled>() {
-                        eprintln!("error: {e}");
+                        let _ = draw_prompt_bar(&format!("error: {e}"), current_agent.name, agent.provider_id, &agent.model_id, last_input_tokens, agent.context_window(), &theme);
                     }
                 }
             }
@@ -467,20 +1389,28 @@ pub async fn run_interactive(
         streaming_done.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = key_listener.await;
 
-        let (agent_thoughts, turn_input_tokens) = print_task.await.ok().unwrap_or((None, 0));
-        if turn_input_tokens > 0 {
+        let (agent_thoughts, turn_input_tokens) = print_task.await.unwrap_or((None, 0));
+        if turn_input_tokens > last_input_tokens {
             last_input_tokens = turn_input_tokens;
         }
-        println!();
         if let Some(ref t) = agent_thoughts {
             render_thoughts(t);
         }
+        draw_prompt_bar(
+            "",
+            current_agent.name,
+            agent.provider_id,
+            &agent.model_id,
+            last_input_tokens,
+            agent.context_window(),
+            &theme,
+        )?;
     }
 
+    exit_tui()?;
     Ok(())
 }
 
-/// Walk a byte offset back to the nearest valid UTF-8 char boundary.
 fn char_floor(s: &str, mut idx: usize) -> usize {
     while idx > 0 && !s.is_char_boundary(idx) {
         idx -= 1;
@@ -488,8 +1418,6 @@ fn char_floor(s: &str, mut idx: usize) -> usize {
     idx
 }
 
-/// Streaming parser that splits `<think>...</think>` blocks out of text deltas.
-/// Handles tags split across multiple deltas by buffering a small lookahead.
 struct ThinkParser {
     pending: String,
     in_think: bool,
@@ -503,7 +1431,6 @@ impl ThinkParser {
         }
     }
 
-    /// Feed a streaming delta. Returns `(display_text, thinking_text)`.
     fn feed(&mut self, delta: &str) -> (String, String) {
         self.pending.push_str(delta);
         let mut display = String::new();
@@ -516,7 +1443,6 @@ impl ThinkParser {
                     self.pending = self.pending[end + "</think>".len()..].to_string();
                     self.in_think = false;
                 } else {
-                    // Keep enough bytes to detect a tag split across chunks.
                     let raw = self.pending.len().saturating_sub("</think>".len());
                     let safe = char_floor(&self.pending, raw);
                     thoughts.push_str(&self.pending[..safe]);
@@ -539,7 +1465,6 @@ impl ThinkParser {
         (display, thoughts)
     }
 
-    /// Flush any remaining buffered bytes at end-of-stream.
     fn flush(&mut self) -> (String, String) {
         let text = std::mem::take(&mut self.pending);
         if self.in_think {
@@ -556,6 +1481,8 @@ fn process_ev(
     think: &mut String,
     parser: &mut ThinkParser,
     pending_perm: &PendingPermission,
+    theme: crate::render::Theme,
+    line_buf: &LineBuf,
 ) {
     use io_runtime::AgentEvent;
     match ev {
@@ -572,16 +1499,18 @@ fn process_ev(
             name,
             output,
             success,
-        } => render_tool_done(&name, &output, success),
+        } => {
+            render_tool_done(&name, &output, success, &theme);
+            let icon = if success { "✓" } else { "✗" };
+            push_line(line_buf, format!("  ├ {}  {}", name, icon));
+        }
         AgentEvent::PermissionRequest { respond, .. } => {
-            // The ToolStart line above already shows what will run; the key
-            // listener picks the answer up from the shared slot.
             use crossterm::style::Stylize;
             print!("  {} ", "allow? [y]es / [a]lways / [n]o:".yellow());
             let _ = std::io::stdout().flush();
             *pending_perm.lock().unwrap() = Some(respond);
         }
-        AgentEvent::Usage { .. } => {} // captured at call site
+        AgentEvent::Usage { .. } => {}
         AgentEvent::AutoCompact { turns_compacted } => {
             print!(
                 "\r\n  [auto-compact] Compacted {turns_compacted} turn{} into a summary.\r\n",
@@ -592,26 +1521,35 @@ fn process_ev(
     }
 }
 
+fn push_line(buf: &LineBuf, line: String) {
+    let mut g = buf.lock().unwrap();
+    g.push_back(line);
+    while g.len() > MAX_SCROLL_LINES {
+        g.pop_front();
+    }
+}
+
 async fn blink_and_print(
     mut rx: tokio::sync::mpsc::Receiver<io_runtime::AgentEvent>,
     pending_perm: PendingPermission,
+    theme: crate::render::Theme,
+    line_buf: LineBuf,
 ) -> (Option<String>, u32) {
-    let on = "  +  +  +  +  +";
-    let mut phase = false;
+    const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let mut spinner_idx = 0;
 
     let first = loop {
         tokio::select! {
             ev = rx.recv() => break ev,
-            _ = tokio::time::sleep(std::time::Duration::from_millis(350)) => {
-                let s = if phase { on } else { "                " };
-                print!("\r{s}");
+            _ = tokio::time::sleep(std::time::Duration::from_millis(80)) => {
+                print!("\r{}", SPINNER[spinner_idx]);
                 let _ = std::io::stdout().flush();
-                phase = !phase;
+                spinner_idx = (spinner_idx + 1) % SPINNER.len();
             }
         }
     };
 
-    print!("\r{}\r", " ".repeat(on.len()));
+    print!("\r \r");
     let _ = std::io::stdout().flush();
 
     let mut text_buf = String::new();
@@ -632,6 +1570,8 @@ async fn blink_and_print(
             &mut think_buf,
             &mut parser,
             &pending_perm,
+            theme,
+            &line_buf,
         );
         while let Some(ev) = rx.recv().await {
             if let io_runtime::AgentEvent::Usage {
@@ -646,6 +1586,8 @@ async fn blink_and_print(
                 &mut think_buf,
                 &mut parser,
                 &pending_perm,
+                theme,
+                &line_buf,
             );
         }
     }
@@ -655,9 +1597,25 @@ async fn blink_and_print(
     think_buf.push_str(&rem_think);
 
     if !text_buf.is_empty() {
-        print!("\r\n");
+        print!("\r\n\r\n");
         let _ = std::io::stdout().flush();
-        render_markdown(&text_buf);
+        let ansi_lines = crate::render::render_markdown_lines(&text_buf, &theme);
+        // Print rendered output to terminal.
+        {
+            use crossterm::QueueableCommand;
+            let mut out = std::io::stdout();
+            for line in &ansi_lines {
+                let _ = out.queue(crossterm::style::Print(line));
+                let _ = out.queue(crossterm::style::Print("\r\n"));
+            }
+            let _ = out.flush();
+        }
+        // Store ANSI lines in scroll buffer (prefixed \x01 = pre-rendered).
+        push_line(&line_buf, String::new());
+        for line in ansi_lines {
+            push_line(&line_buf, format!("\x01{}", line));
+        }
+        push_line(&line_buf, String::new());
     }
 
     let thoughts = if think_buf.trim().is_empty() {
