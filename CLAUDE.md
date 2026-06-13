@@ -36,7 +36,8 @@ io/
 │       ├── connect.rs         # Interactive provider setup wizard
 │       ├── model.rs           # Provider switching (/model command)
 │       ├── picker.rs          # Terminal interactive picker (typed Dismissed errors)
-│       └── readline.rs        # Custom readline with slash commands
+│       ├── readline.rs        # Custom readline with slash commands
+│       └── theme.rs           # Interactive theme picker
 ├── io-runtime/                # Core engine (library crate)
 │   ├── Cargo.toml
 │   ├── tests/
@@ -54,13 +55,13 @@ io/
 │       │   ├── mod.rs         # Provider trait, retry wrapper, OpenAI-compat table,
 │       │   │                  #   create_provider() — 8 providers are one-line
 │       │   │                  #   entries in compat_provider()
-│       │   ├── anthropic.rs
-│       │   ├── openai.rs      # Also serves groq, mistral, deepseek, openrouter,
-│       │   │                  #   xai, opencode_go, opencode_zen, ollama via
-│       │   │                  #   OpenAICompatProvider
-│       │   ├── gemini.rs
-│       │   ├── azure.rs
-│       │   └── bedrock.rs
+│       │   ├── anthropic.rs   # Anthropic
+│       │   ├── openai.rs      # OpenAI + 8 compat providers (groq, mistral,
+│       │   │                  #   deepseek, openrouter, xai, opencode_go,
+│       │   │                  #   opencode_zen, ollama) via OpenAICompatProvider
+│       │   ├── gemini.rs      # Google Gemini
+│       │   ├── azure.rs       # Azure OpenAI
+│       │   └── bedrock.rs     # AWS Bedrock
 │       └── tools/             # Built-in tool implementations
 │           ├── mod.rs         # Tool trait and registry
 │           ├── read.rs
@@ -82,7 +83,7 @@ io/
 **io (CLI crate)**:
 - Command-line argument parsing with `clap`
 - Interactive REPL loop with streaming display
-- Terminal UI components (picker, readline)
+- Terminal UI components (picker, readline, theme picker)
 - Provider/model switching commands
 - Session management commands
 - Configuration management commands
@@ -396,6 +397,30 @@ allowed_commands = []
 denied_commands = ["rm", "sudo"]
 ```
 
+### Theme System (io/src/render.rs + io/src/theme.rs)
+
+The terminal has 8 built-in themes with configurable accent colors and dark/light
+modes. Each theme defines:
+- `accent` — primary color (logo, status bar, highlights)
+- `muted` — secondary color (borders, dots, hints)
+- `diff_add_fg`/`diff_add_bg` — diff addition styling
+- `diff_del_fg`/`diff_del_bg` — diff deletion styling
+- `diff_add_prefix`/`diff_del_prefix` — single-char diff markers (▶, +, ◆, etc.)
+
+| Theme | Type | Accent |
+|---|---|---|
+| `default` | dark | Cyan |
+| `ocean` | dark | Blue |
+| `rose` | dark | Magenta |
+| `forest` | dark | Green |
+| `sunset` | dark | Yellow |
+| `mono` | dark | White |
+| `breeze` | light | DarkCyan |
+| `ink` | light | DarkBlue |
+
+The active theme is persisted in `~/.io/config.toml` via the `theme` key.
+Switch with `/theme` in the REPL or `io config set theme <name>`.
+
 ## CLI Implementation Details
 
 ### Command Structure (io/src/main.rs)
@@ -423,12 +448,15 @@ struct Cli {
 - `io config {show|set}` - Configuration management. `config set` keys:
   `provider.default`, `provider.<name>.model`, `provider.<name>.api_key_env`,
   `provider.azure.deployment`, `session.auto_compact`, `session.memory_enabled`,
-  `session.max_turns`, `session.max_tokens`, `permissions.default`
+  `session.max_turns`, `session.max_tokens`, `permissions.default`, `theme`
 - `io init` - Initialize project-level config
 
-**REPL slash commands**: `/help`, `/agent`, `/connect`, `/model`, `/cost`, `/compact`, `/exit` (also `/quit`, `/q`).
+**REPL slash commands**: `/help`, `/new`, `/agent`, `/connect`, `/model`, `/theme`, `/cost`, `/compact`, `/exit` (also `/quit`, `/q`).
 Switching agent, provider, or model mid-conversation keeps the current session
 (`SessionChoice::Existing` in `build_agent`) — history is preserved.
+
+**@file mentions**: Typing `@path/to/file` expands the file or directory contents inline
+before sending to the LLM. Supports text files (up to 100KB) and directories (lists entries).
 
 ### REPL Loop (io/src/repl.rs)
 
@@ -443,14 +471,23 @@ The interactive REPL:
    - Display tool calls and results inline
    - Save session after each turn
 
-### Streaming Display
+Tab key at the empty prompt cycles through available full agents (build, plan,
+debug, refactor) without needing the `/agent` command.
 
-The streaming implementation:
-- Uses `tokio::sync::mpsc::Sender<AgentEvent>` for events
-- Events: `Text`, `Thinking`, `ToolStart`, `ToolDone`, `Usage` (token counts after each turn)
-- Real-time token-by-token display with cursor indicator
-- Syntax-colored diff output for write/edit tools
-- Inline tool call visualization
+### Full-Screen TUI
+
+The interactive REPL uses an alternate-screen TUI with:
+
+- **Splash screen**: Centered logo, input box with placeholder, agent/model/provider
+  status line, commands reference, cwd/version footer. Agent cycling with Tab.
+- **Fixed prompt bar** (bottom 3 rows): Thin separator, `▌`-accented input line,
+  status row with `agent · model · provider` and context usage info (`X% used · Y rem · Z ctx`).
+- **Scrollback**: Mouse scroll-wheel navigates session history; any key returns to live.
+- **File completion popup**: `@` triggers filesystem completion with keyboard navigation.
+- **Slash command popup**: `/` triggers filtered command completion in a bordered box.
+- **Streaming**: Events (`Text`, `Thinking`, `ToolStart`, `ToolDone`, `Usage`) stream
+  token-by-token with a cursor indicator. Syntax-colored diffs for write/edit tools.
+- **Resize handling**: Prompt bar and scroll region re-flow on terminal resize.
 
 ### Terminal UI Components
 
@@ -501,7 +538,7 @@ Message history is built inline in `Agent::run_turn_inner`:
 
 ## Testing
 
-The project has 59 unit tests (54 in `io-runtime`, 5 in `io`) plus 9
+The project has 34 unit tests (29 in `io-runtime`, 5 in `io`) plus 11
 integration tests (`io-runtime/tests/agent_loop.rs` — full agent-loop runs
 against a scripted mock provider, covering tool execution, permission
 prompting/denial, streaming events, usage tracking, session resumption,

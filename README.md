@@ -19,18 +19,20 @@
 
 ## Features
 
-- **🤖 Multi-provider** — 13 LLM providers supported (Anthropic, OpenAI, Gemini, Groq, DeepSeek, Mistral, Ollama, Azure, Bedrock, OpenRouter, xAI, OpenCode Go, OpenCode Zen)
-- **🛠️ 7 built-in tools** — `read`, `write`, `edit`, `bash`, `glob`, `grep`, `spawn_agent` for full codebase interaction
-- **� Cost tracking** — Built-in API cost calculation with `/cost` command for supported providers
-- **�💬 Interactive & single-shot modes** — REPL for conversation, or `io "do this"` for one-off tasks
-- **🔐 Permission sandbox** — Allow/deny/prompt modes for command execution control
-- **💾 Session persistence** — SQLite-backed conversation history, resume anytime
-- **📡 Streaming responses** — Real-time token-by-token streaming with live indicator
-- **⚡ Fast & lightweight** — Built in Rust, minimal dependencies, no Node.js or Python required
-- **🔄 Provider switching** — Change providers on the fly with `/connect` and `/model`
-- **📁 Project-level config** — Per-project `.io/config.toml` initialization with `io init`
-- **🎨 Interactive picker** — Arrow-key provider/model selector with viewport scrolling
-- **📋 Context-aware** — Full conversation history management with turn-level tool call tracking
+- **Multi-provider** — 13 LLM providers supported (Anthropic, OpenAI, Gemini, Groq, DeepSeek, Mistral, Ollama, Azure, Bedrock, OpenRouter, xAI, OpenCode Go, OpenCode Zen)
+- **7 built-in tools** — `read`, `write`, `edit`, `bash`, `glob`, `grep`, `spawn_agent` for full codebase interaction
+- **Cost tracking** — Built-in API cost calculation with `/cost` command for supported providers
+- **Interactive & single-shot modes** — Full-screen REPL with splash screen, prompt bar, and scrollback
+- **Color themes** — 8 built-in themes (dark/light) with live `/theme` switcher
+- **Permission sandbox** — Allow/deny/prompt modes for command execution control
+- **Session persistence** — SQLite-backed conversation history, resume anytime
+- **Streaming responses** — Real-time token-by-token streaming with live indicator
+- **Fast & lightweight** — Built in Rust, minimal dependencies, no Node.js or Python required
+- **Provider switching** — Change providers on the fly with `/connect` and `/model`
+- **Project-level config** — Per-project `.io/config.toml` initialization with `io init`
+- **Interactive picker** — Arrow-key menus for agents, providers, models, and themes
+- **Agent cycling** — Tab key at empty prompt to swap agents mid-session
+- **@file mentions** — Type `@path/to/file` to inline file or directory contents
 
 ## Quick Start
 
@@ -59,18 +61,25 @@ io
 Launches an interactive session with a streaming agent loop. Commands:
 
 | Command | Description |
-|---|---|
+|---|---|---|
 | `/help` | Show available commands |
+| `/new` | Start a new session |
+| `/agent` | Switch agent mode (build, plan, debug, refactor) |
 | `/connect` | Set up a provider interactively (with live model fetching) |
 | `/model` | Switch between configured providers |
+| `/theme` | Switch UI color theme (8 themes) |
 | `/cost` | Show API cost summary for the current session |
+| `/compact` | Summarize and compress conversation history |
 | `/exit`, `/quit`, `/q` | Exit the session |
 | `!<cmd>` | Run a shell command directly |
 
-In interactive mode, tool calls are visualized inline:
-- Tool start events show the tool name and arguments
-- Tool completion shows diffs for `write`/`edit` with syntax-colored diff output
-- Text streams token-by-token with a blinking cursor indicator
+Tab key at the empty prompt cycles through available full agents.
+Type `@path/to/file` to expand file or directory contents inline.
+
+The TUI features a splash screen with centered logo and command reference,
+a fixed prompt bar at the bottom showing agent/model/provider and context usage,
+mouse scrollback through session history, and streaming tool call visualization
+with syntax-colored diffs.
 
 ### Single-shot
 
@@ -128,6 +137,8 @@ max_turns = 100
 default = "prompt"       # "allow" | "deny" | "prompt"
 allowed_commands = []
 denied_commands = ["rm", "sudo"]
+
+# Optional: theme = "ocean"  (default, ocean, rose, forest, sunset, mono, breeze, ink)
 ```
 
 ### API Keys
@@ -178,44 +189,53 @@ io/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs              # Entry point, CLI parsing, subcommand dispatch
+│       ├── repl.rs              # Interactive REPL + single-shot runner, streaming turn loop
+│       ├── render.rs            # Terminal rendering: markdown, diffs, splash, prompt bar, scrollback
+│       ├── cost.rs              # /cost report
+│       ├── config_cmd.rs        # `io config …` and `io init` handlers
+│       ├── agent.rs             # Agent switching (/agent command)
 │       ├── connect.rs           # Interactive provider setup wizard (13 providers)
 │       ├── model.rs             # Provider switching (/model command)
-│       └── picker.rs            # Terminal interactive picker (arrow keys, viewport)
+│       ├── picker.rs            # Terminal interactive picker (arrow keys, viewport)
+│       ├── readline.rs          # Custom readline with slash commands
+│       └── theme.rs             # Interactive theme picker
 │
 ├── io-runtime/                  # Core engine (library crate)
 │   ├── Cargo.toml
+│   ├── tests/
+│   │   └── agent_loop.rs        # 11 integration tests against a scripted mock provider
 │   └── src/
 │       ├── lib.rs               # Crate root — re-exports public API
 │       ├── agent.rs             # Agent loop: LLM completion + tool execution (sync & streaming)
+│       ├── compact.rs           # /compact + auto-compact summarization
 │       ├── config.rs            # Config/schema (TOML), KeyStore, provider config structs
 │       ├── types.rs             # Core data types — Session, Turn, ToolCallRecord, TurnUsage
 │       ├── memory.rs            # SQLite-backed session persistence (CRUD)
 │       ├── sandbox.rs           # Permission checker (allow/deny/prompt modes)
 │       ├── pricing.rs           # Per-token cost calculation for supported providers
-│       ├── tools/               # Built-in tools (6 tools, each with unit tests)
+│       ├── tools/               # Built-in tools (7 tools, each with unit tests)
 │       │   ├── mod.rs           # Tool trait, ToolRegistry, default_registry()
 │       │   ├── read.rs          # Read files with offset/limit
 │       │   ├── write.rs         # Write/create files, returns unified diff
 │       │   ├── edit.rs          # Replace first occurrence of text, returns unified diff
 │       │   ├── bash.rs          # Execute shell commands with timeout & workdir
 │       │   ├── glob.rs          # Find files by glob pattern (sorted by mtime)
-│       │   └── grep.rs          # Search file contents with regex
+│       │   ├── grep.rs          # Search file contents with regex
+│       │   └── spawn.rs         # spawn_agent — delegate to a restricted sub-agent
 │       │
-│       └── provider/            # 13 LLM provider implementations
+│       └── provider/            # LLM provider implementations
 │           ├── mod.rs           # ProviderKind enum, CompletionModel trait, create_provider()
 │           ├── anthropic.rs     # Anthropic Claude
-│           ├── openai.rs        # OpenAI & compatible APIs (core implementation)
+│           ├── openai.rs        # OpenAI + 8 compat providers via OpenAICompatProvider
 │           ├── gemini.rs        # Google Gemini
-│           ├── groq.rs          # Groq
-│           ├── ollama.rs        # Ollama (local)
 │           ├── azure.rs         # Azure OpenAI
-│           ├── bedrock.rs       # AWS Bedrock
-│           ├── mistral.rs       # Mistral AI
-│           ├── deepseek.rs      # DeepSeek
-│           ├── openrouter.rs    # OpenRouter
-│           ├── xai.rs           # xAI (Grok)
-│           ├── opencode_go.rs   # OpenCode Go
-│           └── opencode_zen.rs  # OpenCode Zen
+│           └── bedrock.rs       # AWS Bedrock
+│
+├── io-agents/                   # Built-in agent definitions (library crate)
+│   └── src/
+│       ├── agent_config.rs      # AgentConfig + ToolAccess (All / Only(tools))
+│       └── builtin/             # build, plan, debug, explore, review, test,
+│                                #   security, docs, git, refactor, general
 │
 ├── .github/
 │   └── workflows/
@@ -279,7 +299,7 @@ cargo build
 cargo run -- "your prompt"
 cargo run --
 
-# Run tests (43 unit tests across tools, sandbox, config, pricing)
+# Run tests (34 unit tests + 11 integration tests)
 cargo test
 
 # Add a new provider
