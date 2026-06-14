@@ -47,5 +47,6 @@ pub fn config() -> AgentConfig {
         tool_access: ToolAccess::All,
         suggested_model: None,
         single_shot: false,
+        auto_allow_writes: false,
     }
 }

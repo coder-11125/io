@@ -46,5 +46,6 @@ pub fn config() -> AgentConfig {
         tool_access: ToolAccess::only(&["read", "write", "edit", "glob", "grep"]),
         suggested_model: None,
         single_shot: false,
+        auto_allow_writes: true,
     }
 }

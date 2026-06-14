@@ -40,6 +40,11 @@ pub struct AgentConfig {
 
     /// Whether the agent should stop after a single LLM call (no tool loop).
     pub single_shot: bool,
+
+    /// When true, write and edit tool calls are auto-allowed without prompting
+    /// the user. Should be false for plan (which confirms before acting) and
+    /// read-only agents (which have no write access anyway).
+    pub auto_allow_writes: bool,
 }
 
 impl AgentConfig {

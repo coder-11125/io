@@ -260,6 +260,15 @@ impl PermissionChecker {
         self
     }
 
+    /// Add extra tool names to the static allowlist. Sensitive-path and
+    /// project-root guards still apply; only the prompt step is skipped.
+    pub fn with_allowed_tools(mut self, tools: &[&str]) -> Self {
+        for t in tools {
+            self.allowlist.insert((*t).to_string());
+        }
+        self
+    }
+
     fn is_in_project(&self, path: &str) -> bool {
         let Some(ref root) = self.project_root else {
             return true;

@@ -35,7 +35,7 @@ fn detect_project_root() -> std::path::PathBuf {
 
 async fn build_agent(
     session: SessionChoice,
-    system_prompt: String,
+    agent_config: &io_agents::AgentConfig,
 ) -> anyhow::Result<io_runtime::Agent> {
     let config = io_runtime::config::Config::load()?;
     let keys = io_runtime::config::KeyStore::load();
@@ -44,10 +44,12 @@ async fn build_agent(
     let memory = io_runtime::memory::SessionStore::new()?;
     let project_root = detect_project_root();
     let project_context = io_runtime::load_project_context(&project_root);
-    let permissions = std::sync::Arc::new(
-        io_runtime::sandbox::PermissionChecker::from(&config.permissions)
-            .with_project_root(project_root),
-    );
+    let mut checker = io_runtime::sandbox::PermissionChecker::from(&config.permissions)
+        .with_project_root(project_root);
+    if agent_config.auto_allow_writes {
+        checker = checker.with_allowed_tools(&["write", "edit"]);
+    }
+    let permissions = std::sync::Arc::new(checker);
 
     let session_id = match session {
         SessionChoice::New => None,
@@ -73,7 +75,7 @@ async fn build_agent(
         tools,
         memory,
         permissions,
-        system_prompt,
+        agent_config.system_prompt.clone(),
         project_context,
         session_id,
         model_id,
@@ -192,10 +194,8 @@ pub async fn run_single_shot(prompt: &str) -> anyhow::Result<()> {
         );
     }
 
-    let system_prompt = io_agents::builtin::by_id("build")
-        .expect("build agent must exist")
-        .system_prompt;
-    let agent = build_agent(SessionChoice::New, system_prompt).await?;
+    let build_config = io_agents::builtin::by_id("build").expect("build agent must exist");
+    let agent = build_agent(SessionChoice::New, &build_config).await?;
     agent.set_prompt_fn(std::sync::Arc::new(prompt_on_stdin));
     let response = agent.run_turn(&resolve_at_mentions(prompt)).await?;
     println!("{response}");
@@ -921,7 +921,7 @@ pub async fn run_interactive(
     } else {
         SessionChoice::New
     };
-    let mut agent = build_agent(startup_session, current_agent.system_prompt.clone()).await?;
+    let mut agent = build_agent(startup_session, &current_agent).await?;
 
     enter_tui()?;
 
@@ -988,12 +988,7 @@ pub async fn run_interactive(
             if let Some(picked) = full_agents.into_iter().nth(tab_current) {
                 current_agent = picked;
                 let sid = agent.session_id().await;
-                match build_agent(
-                    SessionChoice::Existing(sid),
-                    current_agent.system_prompt.clone(),
-                )
-                .await
-                {
+                match build_agent(SessionChoice::Existing(sid), &current_agent).await {
                     Ok(new_agent) => agent = new_agent,
                     Err(e) => {
                         let _ = draw_prompt_bar(
@@ -1109,12 +1104,7 @@ pub async fn run_interactive(
                     Ok(new_config) => {
                         current_agent = new_config;
                         let sid = agent.session_id().await;
-                        match build_agent(
-                            SessionChoice::Existing(sid),
-                            current_agent.system_prompt.clone(),
-                        )
-                        .await
-                        {
+                        match build_agent(SessionChoice::Existing(sid), &current_agent).await {
                             Ok(new_agent) => agent = new_agent,
                             Err(e) => {
                                 let _ = draw_prompt_bar(
@@ -1148,12 +1138,7 @@ pub async fn run_interactive(
                 match connect::run().await {
                     Ok(()) => {
                         let sid = agent.session_id().await;
-                        match build_agent(
-                            SessionChoice::Existing(sid),
-                            current_agent.system_prompt.clone(),
-                        )
-                        .await
-                        {
+                        match build_agent(SessionChoice::Existing(sid), &current_agent).await {
                             Ok(new_agent) => agent = new_agent,
                             Err(e) => {
                                 let _ = draw_prompt_bar(
@@ -1186,12 +1171,7 @@ pub async fn run_interactive(
                 match model::run().await {
                     Ok(()) => {
                         let sid = agent.session_id().await;
-                        match build_agent(
-                            SessionChoice::Existing(sid),
-                            current_agent.system_prompt.clone(),
-                        )
-                        .await
-                        {
+                        match build_agent(SessionChoice::Existing(sid), &current_agent).await {
                             Ok(new_agent) => agent = new_agent,
                             Err(e) => {
                                 let _ = draw_prompt_bar(
@@ -1222,7 +1202,7 @@ pub async fn run_interactive(
                 continue;
             }
             "/new" => {
-                match build_agent(SessionChoice::New, current_agent.system_prompt.clone()).await {
+                match build_agent(SessionChoice::New, &current_agent).await {
                     Ok(new_agent) => {
                         agent = new_agent;
                         last_input_tokens = 0;
