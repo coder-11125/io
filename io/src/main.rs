@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Init) => config_cmd::handle_init()?,
         None => {
             if let Some(prompt) = cli.prompt {
-                tui::run_single_shot(&prompt).await?;
+                tui::run_single_shot(&prompt, cli.model.as_deref()).await?;
             } else {
                 tui::run_interactive(cli.new, cli.r#continue, cli.model.as_deref()).await?;
             }

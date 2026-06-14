@@ -33,11 +33,43 @@ fn detect_project_root() -> std::path::PathBuf {
     }
 }
 
+/// Apply a `provider` or `provider/model` spec to an in-memory config without saving.
+fn apply_model_spec(config: &mut io_runtime::config::Config, spec: &str) {
+    let (provider, model) = match spec.split_once('/') {
+        Some((p, m)) => (p, Some(m)),
+        None => (spec, None),
+    };
+    config.provider.default = provider.to_string();
+    let Some(m) = model else { return };
+    let m = m.to_string();
+    let p = &mut config.provider;
+    match provider {
+        "openai" => p.openai.get_or_insert_with(Default::default).model = m,
+        "anthropic" => p.anthropic.get_or_insert_with(Default::default).model = m,
+        "gemini" => p.gemini.get_or_insert_with(Default::default).model = m,
+        "groq" => p.groq.get_or_insert_with(Default::default).model = m,
+        "ollama" => p.ollama.get_or_insert_with(Default::default).model = m,
+        "azure" => p.azure.get_or_insert_with(Default::default).deployment = m,
+        "bedrock" => p.bedrock.get_or_insert_with(Default::default).model = m,
+        "mistral" => p.mistral.get_or_insert_with(Default::default).model = m,
+        "deepseek" => p.deepseek.get_or_insert_with(Default::default).model = m,
+        "openrouter" => p.openrouter.get_or_insert_with(Default::default).model = m,
+        "xai" => p.xai.get_or_insert_with(Default::default).model = m,
+        "opencode_go" => p.opencode_go.get_or_insert_with(Default::default).model = m,
+        "opencode_zen" => p.opencode_zen.get_or_insert_with(Default::default).model = m,
+        _ => {}
+    }
+}
+
 async fn build_agent(
     session: SessionChoice,
     agent_config: &io_agents::AgentConfig,
+    model_override: Option<&str>,
 ) -> anyhow::Result<io_runtime::Agent> {
-    let config = io_runtime::config::Config::load()?;
+    let mut config = io_runtime::config::Config::load()?;
+    if let Some(spec) = model_override {
+        apply_model_spec(&mut config, spec);
+    }
     let keys = io_runtime::config::KeyStore::load();
     let model_id = config.provider.active_model();
     let provider = io_runtime::provider::create_provider(&config, &keys)?;
@@ -184,8 +216,11 @@ fn prompt_on_stdin(name: &str, input: &serde_json::Value) -> io_runtime::Permiss
     }
 }
 
-pub async fn run_single_shot(prompt: &str) -> anyhow::Result<()> {
-    let config = io_runtime::config::Config::load()?;
+pub async fn run_single_shot(prompt: &str, model_override: Option<&str>) -> anyhow::Result<()> {
+    let mut config = io_runtime::config::Config::load()?;
+    if let Some(spec) = model_override {
+        apply_model_spec(&mut config, spec);
+    }
     let keys = io_runtime::config::KeyStore::load();
     if let Some(env) = io_runtime::provider::missing_api_key(&config, &keys) {
         anyhow::bail!(
@@ -195,7 +230,7 @@ pub async fn run_single_shot(prompt: &str) -> anyhow::Result<()> {
     }
 
     let build_config = io_agents::builtin::by_id("build").expect("build agent must exist");
-    let agent = build_agent(SessionChoice::New, &build_config).await?;
+    let agent = build_agent(SessionChoice::New, &build_config, model_override).await?;
     agent.set_prompt_fn(std::sync::Arc::new(prompt_on_stdin));
     let response = agent.run_turn(&resolve_at_mentions(prompt)).await?;
     println!("{response}");
@@ -950,9 +985,12 @@ fn splash_read_line(
 pub async fn run_interactive(
     new_session: bool,
     continue_session: bool,
-    _model: Option<&str>,
+    model: Option<&str>,
 ) -> anyhow::Result<()> {
-    let config = io_runtime::config::Config::load()?;
+    let mut config = io_runtime::config::Config::load()?;
+    if let Some(spec) = model {
+        apply_model_spec(&mut config, spec);
+    }
     let mut theme = io_tui::render::get_theme(&config.theme);
     let line_buf: LineBuf = std::sync::Arc::new(std::sync::Mutex::new(
         std::collections::VecDeque::with_capacity(512),
@@ -978,7 +1016,7 @@ pub async fn run_interactive(
     } else {
         SessionChoice::New
     };
-    let mut agent = build_agent(startup_session, &current_agent).await?;
+    let mut agent = build_agent(startup_session, &current_agent, model).await?;
 
     enter_tui()?;
 
@@ -1045,7 +1083,7 @@ pub async fn run_interactive(
             if let Some(picked) = full_agents.into_iter().nth(tab_current) {
                 current_agent = picked;
                 let sid = agent.session_id().await;
-                match build_agent(SessionChoice::Existing(sid), &current_agent).await {
+                match build_agent(SessionChoice::Existing(sid), &current_agent, None).await {
                     Ok(new_agent) => agent = new_agent,
                     Err(e) => {
                         let _ = draw_prompt_bar(
@@ -1161,7 +1199,8 @@ pub async fn run_interactive(
                     Ok(new_config) => {
                         current_agent = new_config;
                         let sid = agent.session_id().await;
-                        match build_agent(SessionChoice::Existing(sid), &current_agent).await {
+                        match build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                        {
                             Ok(new_agent) => agent = new_agent,
                             Err(e) => {
                                 let _ = draw_prompt_bar(
@@ -1195,7 +1234,8 @@ pub async fn run_interactive(
                 match connect::run().await {
                     Ok(()) => {
                         let sid = agent.session_id().await;
-                        match build_agent(SessionChoice::Existing(sid), &current_agent).await {
+                        match build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                        {
                             Ok(new_agent) => agent = new_agent,
                             Err(e) => {
                                 let _ = draw_prompt_bar(
@@ -1228,7 +1268,8 @@ pub async fn run_interactive(
                 match model::run().await {
                     Ok(()) => {
                         let sid = agent.session_id().await;
-                        match build_agent(SessionChoice::Existing(sid), &current_agent).await {
+                        match build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                        {
                             Ok(new_agent) => agent = new_agent,
                             Err(e) => {
                                 let _ = draw_prompt_bar(
@@ -1259,7 +1300,7 @@ pub async fn run_interactive(
                 continue;
             }
             "/new" => {
-                match build_agent(SessionChoice::New, &current_agent).await {
+                match build_agent(SessionChoice::New, &current_agent, None).await {
                     Ok(new_agent) => {
                         agent = new_agent;
                         last_input_tokens = 0;

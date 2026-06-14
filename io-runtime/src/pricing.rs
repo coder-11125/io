@@ -275,6 +275,14 @@ fn bedrock_pricing(model: &str) -> Option<ModelPricing> {
             _ => ModelPricing::new(0.0002, 0.0006),
         });
     }
+    if model.contains("amazon.nova") || model.contains("nova-") {
+        return Some(match model {
+            m if m.contains("nova-pro") => ModelPricing::new(0.0008, 0.0032),
+            m if m.contains("nova-lite") => ModelPricing::new(0.00006, 0.00024),
+            m if m.contains("nova-micro") => ModelPricing::new(0.000035, 0.00014),
+            _ => ModelPricing::new(0.0008, 0.0032),
+        });
+    }
     None
 }
 

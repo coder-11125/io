@@ -71,9 +71,14 @@ impl AnthropicStreamState {
             "content_block_start" => {
                 let idx = event["index"].as_u64().unwrap_or(0) as u32;
                 if event["content_block"]["type"].as_str() == Some("tool_use") {
-                    let id = event["content_block"]["id"].as_str().unwrap_or("").to_string();
-                    let name =
-                        event["content_block"]["name"].as_str().unwrap_or("").to_string();
+                    let id = event["content_block"]["id"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    let name = event["content_block"]["name"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
                     self.tool_blocks.insert(idx, (id, name, String::new()));
                 }
             }
@@ -117,8 +122,7 @@ impl AnthropicStreamState {
             }
             "message_delta" => {
                 let stop_reason = event["delta"]["stop_reason"].as_str().map(str::to_string);
-                let output_tokens =
-                    event["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32;
+                let output_tokens = event["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32;
                 events.push(StreamEvent {
                     delta: None,
                     content_block: None,
@@ -242,8 +246,7 @@ impl CompletionModel for AnthropicProvider {
                 match chunk_result {
                     Ok(bytes) => {
                         buffer.push_str(&String::from_utf8_lossy(&bytes));
-                        loop {
-                            let Some(line_end) = buffer.find('\n') else { break };
+                        while let Some(line_end) = buffer.find('\n') {
                             let line = buffer[..line_end].trim().to_string();
                             buffer = buffer[line_end + 1..].to_string();
                             if line.is_empty() || line.starts_with("event:") {
@@ -270,9 +273,7 @@ impl CompletionModel for AnthropicProvider {
                                     }
                                 },
                                 Err(e) => {
-                                    let _ = tx
-                                        .send(Err(anyhow::anyhow!("parse error: {e}")))
-                                        .await;
+                                    let _ = tx.send(Err(anyhow::anyhow!("parse error: {e}"))).await;
                                     break 'outer;
                                 }
                             }

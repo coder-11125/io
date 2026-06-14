@@ -228,84 +228,64 @@ impl CompletionModel for BedrockProvider {
                 match chunk_result {
                     Ok(bytes) => {
                         buffer.extend_from_slice(&bytes);
-                        loop {
-                            match parse_event_frame(&buffer) {
-                                Some((headers, payload, frame_len)) => {
-                                    buffer = buffer[frame_len..].to_vec();
+                        while let Some((headers, payload, frame_len)) = parse_event_frame(&buffer) {
+                            buffer = buffer[frame_len..].to_vec();
 
-                                    let msg_type =
-                                        headers.get(":message-type").map(|s| s.as_str());
-                                    if msg_type == Some("exception") {
-                                        let msg = String::from_utf8_lossy(&payload).to_string();
+                            let msg_type = headers.get(":message-type").map(|s| s.as_str());
+                            if msg_type == Some("exception") {
+                                let msg = String::from_utf8_lossy(&payload).to_string();
+                                let _ = tx.send(Err(anyhow::anyhow!("Bedrock error: {msg}"))).await;
+                                break 'outer;
+                            }
+
+                            let event_type = headers.get(":event-type").map(|s| s.as_str());
+                            if event_type != Some("chunk") {
+                                continue;
+                            }
+
+                            // Payload is {"bytes": "<base64 Anthropic event JSON>"}
+                            let chunk_json =
+                                match serde_json::from_slice::<serde_json::Value>(&payload) {
+                                    Ok(v) => v,
+                                    Err(e) => {
                                         let _ = tx
-                                            .send(Err(anyhow::anyhow!("Bedrock error: {msg}")))
+                                            .send(Err(anyhow::anyhow!("chunk JSON error: {e}")))
                                             .await;
                                         break 'outer;
                                     }
-
-                                    let event_type =
-                                        headers.get(":event-type").map(|s| s.as_str());
-                                    if event_type != Some("chunk") {
-                                        continue;
+                                };
+                            let bytes_str = chunk_json["bytes"].as_str().unwrap_or_default();
+                            let decoded = match BASE64.decode(bytes_str) {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    let _ =
+                                        tx.send(Err(anyhow::anyhow!("base64 decode: {e}"))).await;
+                                    break 'outer;
+                                }
+                            };
+                            let event = match serde_json::from_slice::<serde_json::Value>(&decoded)
+                            {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _ = tx.send(Err(anyhow::anyhow!("event parse: {e}"))).await;
+                                    break 'outer;
+                                }
+                            };
+                            match state.process_event(&event) {
+                                Ok((events, done)) => {
+                                    for ev in events {
+                                        if tx.send(Ok(ev)).await.is_err() {
+                                            break 'outer;
+                                        }
                                     }
-
-                                    // Payload is {"bytes": "<base64 Anthropic event JSON>"}
-                                    let chunk_json = match serde_json::from_slice::<
-                                        serde_json::Value,
-                                    >(&payload)
-                                    {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            let _ = tx
-                                                .send(Err(anyhow::anyhow!(
-                                                    "chunk JSON error: {e}"
-                                                )))
-                                                .await;
-                                            break 'outer;
-                                        }
-                                    };
-                                    let bytes_str =
-                                        chunk_json["bytes"].as_str().unwrap_or_default();
-                                    let decoded = match BASE64.decode(bytes_str) {
-                                        Ok(d) => d,
-                                        Err(e) => {
-                                            let _ = tx
-                                                .send(Err(anyhow::anyhow!(
-                                                    "base64 decode: {e}"
-                                                )))
-                                                .await;
-                                            break 'outer;
-                                        }
-                                    };
-                                    let event = match serde_json::from_slice::<serde_json::Value>(
-                                        &decoded,
-                                    ) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            let _ = tx
-                                                .send(Err(anyhow::anyhow!("event parse: {e}")))
-                                                .await;
-                                            break 'outer;
-                                        }
-                                    };
-                                    match state.process_event(&event) {
-                                        Ok((events, done)) => {
-                                            for ev in events {
-                                                if tx.send(Ok(ev)).await.is_err() {
-                                                    break 'outer;
-                                                }
-                                            }
-                                            if done {
-                                                break 'outer;
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(Err(e)).await;
-                                            break 'outer;
-                                        }
+                                    if done {
+                                        break 'outer;
                                     }
                                 }
-                                None => break, // need more data
+                                Err(e) => {
+                                    let _ = tx.send(Err(e)).await;
+                                    break 'outer;
+                                }
                             }
                         }
                     }
@@ -375,11 +355,11 @@ fn parse_headers(data: &[u8]) -> std::collections::HashMap<String, String> {
         pos += 1;
         // Skip bytes consumed by each header type; only store String (7) / Bytes (6) values.
         let skip = match header_type {
-            0 | 1 => 0,      // BoolTrue / BoolFalse — no payload bytes
-            2 => 1,           // Byte
-            3 => 2,           // Short
-            4 => 4,           // Int
-            5 | 8 => 8,       // Long / Timestamp
+            0 | 1 => 0, // BoolTrue / BoolFalse — no payload bytes
+            2 => 1,     // Byte
+            3 => 2,     // Short
+            4 => 4,     // Int
+            5 | 8 => 8, // Long / Timestamp
             6 | 7 => {
                 // Bytes / String: 2-byte length prefix + value
                 if pos + 2 > data.len() {
@@ -389,8 +369,7 @@ fn parse_headers(data: &[u8]) -> std::collections::HashMap<String, String> {
                 if pos + 2 + vlen > data.len() {
                     break;
                 }
-                let value =
-                    String::from_utf8_lossy(&data[pos + 2..pos + 2 + vlen]).to_string();
+                let value = String::from_utf8_lossy(&data[pos + 2..pos + 2 + vlen]).to_string();
                 out.insert(name, value);
                 pos += 2 + vlen;
                 continue;
