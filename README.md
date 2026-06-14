@@ -33,6 +33,8 @@
 - **Interactive picker** — Arrow-key menus for agents, providers, models, and themes
 - **Agent cycling** — Tab key at empty prompt to swap agents mid-session
 - **@file mentions** — Type `@path/to/file` to inline file or directory contents
+- **Project context** — Reads `AGENTS.md` / `CLAUDE.md` from the project root and injects them as context so agents understand your conventions automatically
+- **Smart write permissions** — Most agents (build, debug, docs, refactor, …) auto-approve `write`/`edit` calls; plan, git, review, security, and test always prompt
 
 ## Quick Start
 
@@ -233,13 +235,18 @@ io/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs              # Entry point, CLI parsing, subcommand dispatch
-│       ├── repl.rs              # Interactive REPL + single-shot runner, streaming turn loop
-│       ├── render.rs            # Terminal rendering: markdown, diffs, splash, prompt bar, scrollback
+│       ├── tui.rs               # Interactive TUI + single-shot runner, streaming turn loop
 │       ├── cost.rs              # /cost report
 │       ├── config_cmd.rs        # `io config …` and `io init` handlers
 │       ├── agent.rs             # Agent switching (/agent command)
 │       ├── connect.rs           # Interactive provider setup wizard (13 providers)
-│       ├── model.rs             # Provider switching (/model command)
+│       └── model.rs             # Provider switching (/model command)
+│
+├── io-tui/                      # Terminal UI components (library crate)
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs               # Re-exports: picker, readline, render, theme
+│       ├── render.rs            # Terminal rendering: markdown, diffs, splash, prompt bar, scrollback
 │       ├── picker.rs            # Terminal interactive picker (arrow keys, viewport)
 │       ├── readline.rs          # Custom readline with slash commands
 │       └── theme.rs             # Interactive theme picker
@@ -249,7 +256,7 @@ io/
 │   ├── tests/
 │   │   └── agent_loop.rs        # 11 integration tests against a scripted mock provider
 │   └── src/
-│       ├── lib.rs               # Crate root — re-exports public API
+│       ├── lib.rs               # Crate root — re-exports public API + load_project_context()
 │       ├── agent.rs             # Agent loop: LLM completion + tool execution (sync & streaming)
 │       ├── compact.rs           # /compact + auto-compact summarization
 │       ├── config.rs            # Config/schema (TOML), KeyStore, provider config structs
@@ -278,7 +285,7 @@ io/
 │
 ├── io-agents/                   # Built-in agent definitions (library crate)
 │   └── src/
-│       ├── agent_config.rs      # AgentConfig + ToolAccess (All / Only(tools))
+│       ├── agent_config.rs      # AgentConfig + ToolAccess + auto_allow_writes
 │       └── builtin/             # build, plan, debug, explore, review, test,
 │                                #   security, docs, git, refactor, general
 │
@@ -294,10 +301,11 @@ io/
 ### How It Works
 
 1. **Input** — User types a prompt (interactive or single-shot)
-2. **Agent loop** — The agent iterates up to 20 turns: sends conversation history + system prompt + tool specs to the LLM
-3. **Tool execution** — If the LLM requests a tool call, the agent executes it via `ToolRegistry`, checks permissions via `PermissionChecker`, and feeds results back to the model
-4. **Streaming** — In interactive mode, text deltas stream to the terminal as they arrive; tool starts and completions are rendered inline (with syntax-colored diffs for `write`/`edit`)
-5. **Persistence** — Each turn (with tool call records and token usage) is saved to SQLite for session resumption
+2. **Project context** — On startup, `load_project_context()` reads `AGENTS.md` / `CLAUDE.md` from the project root and passes the content to the agent; it is injected as a synthetic user/assistant message pair so the model always has project conventions in context
+3. **Agent loop** — The agent iterates up to 20 turns: sends conversation history + system prompt + project context + tool specs to the LLM
+4. **Tool execution** — If the LLM requests a tool call, the agent executes it via `ToolRegistry`, checks permissions via `PermissionChecker`, and feeds results back to the model
+5. **Streaming** — In interactive mode, text deltas stream to the terminal as they arrive; tool starts and completions are rendered inline (with syntax-colored diffs for `write`/`edit`)
+6. **Persistence** — Each turn (with tool call records and token usage) is saved to SQLite for session resumption
 
 ### Message Flow
 

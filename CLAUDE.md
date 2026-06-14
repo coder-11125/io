@@ -10,12 +10,13 @@ This document provides comprehensive guidance for AI agents and developers worki
 - Multi-provider support (13 providers: Anthropic, OpenAI, Gemini, Groq, Ollama, Azure, Bedrock, Mistral, DeepSeek, OpenRouter, xAI, OpenCode Go, OpenCode Zen)
 - 7 built-in tools: read, write, edit, bash, glob, grep, spawn_agent (sub-agent delegation)
 - Built-in agent roles (`io-agents` crate): full agents (build, plan, debug, refactor) and restricted sub-agents (explore, review, test, security, docs, git, …)
-- Interactive REPL and single-shot modes
+- Full-screen TUI and single-shot modes
 - Permission sandboxing (allow/deny/prompt modes)
 - SQLite-backed session persistence
 - Real-time streaming responses
-- Terminal UI components (interactive picker, readline with completions)
+- Terminal UI components in dedicated `io-tui` crate (interactive picker, readline with completions)
 - Project-level configuration
+- Project context loading: reads `AGENTS.md` / `CLAUDE.md` from the project root and injects them as context at the start of each conversation
 
 ## Architecture
 
@@ -28,13 +29,17 @@ io/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs            # Entry point, CLI parsing, subcommand dispatch
-│       ├── repl.rs            # Interactive REPL + single-shot runner, streaming turn loop
-│       ├── render.rs          # Terminal rendering: markdown, diffs, tool calls, status line
+│       ├── tui.rs             # Interactive TUI + single-shot runner, streaming turn loop
 │       ├── cost.rs            # /cost report
 │       ├── config_cmd.rs      # `io config …` and `io init` handlers
 │       ├── agent.rs           # Agent switching (/agent command)
 │       ├── connect.rs         # Interactive provider setup wizard
-│       ├── model.rs           # Provider switching (/model command)
+│       └── model.rs           # Provider switching (/model command)
+├── io-tui/                    # Terminal UI components (library crate)
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs             # Re-exports: picker, readline, render, theme
+│       ├── render.rs          # Terminal rendering: markdown, diffs, tool calls, status line
 │       ├── picker.rs          # Terminal interactive picker (typed Dismissed errors)
 │       ├── readline.rs        # Custom readline with slash commands
 │       └── theme.rs           # Interactive theme picker
@@ -43,7 +48,7 @@ io/
 │   ├── tests/
 │   │   └── agent_loop.rs      # Integration tests against a scripted mock provider
 │   └── src/
-│       ├── lib.rs             # Public API re-exports
+│       ├── lib.rs             # Public API re-exports + load_project_context()
 │       ├── agent.rs           # Agent loop (LLM + tool execution)
 │       ├── compact.rs         # /compact + auto-compact summarization
 │       ├── config.rs          # Configuration schema, loading, provider lookups
@@ -74,7 +79,7 @@ io/
 │           └── spawn.rs       # spawn_agent — delegate to a restricted sub-agent
 └── io-agents/                 # Built-in agent definitions (library crate)
     └── src/
-        ├── agent_config.rs    # AgentConfig + ToolAccess (All / Only(tools))
+        ├── agent_config.rs    # AgentConfig + ToolAccess (All / Only(tools)) + auto_allow_writes
         └── builtin/           # build, plan, debug, explore, review, test,
                                #   security, docs, git, refactor, general
 ```
@@ -83,11 +88,15 @@ io/
 
 **io (CLI crate)**:
 - Command-line argument parsing with `clap`
-- Interactive REPL loop with streaming display
-- Terminal UI components (picker, readline, theme picker)
+- Interactive TUI loop with streaming display (`tui.rs`)
 - Provider/model switching commands
 - Session management commands
 - Configuration management commands
+
+**io-tui (TUI crate)**:
+- Terminal UI components: interactive picker, custom readline, theme picker
+- Terminal rendering: markdown, diffs, splash screen, prompt bar, scrollback
+- Used by `io` (CLI) and available to any future binary that needs TUI
 
 **io-runtime (library crate)**:
 - Core agent execution logic
@@ -96,11 +105,14 @@ io/
 - Session persistence (SQLite)
 - Permission sandboxing
 - Context management for LLM conversations
+- Project context loading (`load_project_context()` — reads `AGENTS.md`/`CLAUDE.md`)
 
 **io-agents (library crate)**:
-- Built-in agent definitions: id, system prompt, tool access, suggested model
-- `ToolAccess::All` agents are selectable in the REPL; `ToolAccess::Only(...)`
+- Built-in agent definitions: id, system prompt, tool access, suggested model, auto_allow_writes flag
+- `ToolAccess::All` agents are selectable in the TUI; `ToolAccess::Only(...)`
   agents are spawnable as sub-agents via the `spawn_agent` tool
+- `auto_allow_writes: true` on build, debug, docs, explore, general, refactor — write/edit tool calls skip the permission prompt for those agents
+- `auto_allow_writes: false` on plan, git, review, security, test — those agents always prompt before writing
 
 ## Development Workflow
 
@@ -198,6 +210,7 @@ pub struct Agent {
     memory: Arc<SessionStore>,
     permissions: Arc<PermissionChecker>, // shared with SpawnAgentTool — sub-agents inherit it
     system_prompt: String,
+    project_context: Option<String>,     // contents of AGENTS.md / CLAUDE.md at project root
     max_tokens: u32,
     pub model_id: String,
     pub provider_id: &'static str,
@@ -227,7 +240,7 @@ tool calls) to the session before surfacing the error; tool calls parsed
 from a truncated stream are not executed.
 
 **Agent Loop**:
-1. Build message history from session
+1. Build message history from session (system prompt, then optional project-context synthetic message pair, then prior turns, then current user input)
 2. Call LLM with tools
 3. Parse response for text and tool calls
 4. Execute permitted tools
@@ -306,7 +319,8 @@ pub trait Tool: Send + Sync {
 - `SpawnAgentTool` - Delegate a scoped task to a restricted sub-agent
   (registered in `build_agent` in the CLI, not in `default_registry()`;
   sub-agents inherit the parent's `PermissionChecker` and cannot prompt,
-  so anything that would ask the user is denied)
+  so anything that would ask the user is denied; `project_context` is
+  forwarded so sub-agents have the same project guidance as the parent)
 
 **Adding a New Tool**:
 1. Create new file in `io-runtime/src/tools/`
@@ -354,6 +368,9 @@ pub enum PermissionLevel {
 
 **Permission Checking** (`PermissionChecker::decide_tool`):
 - Tool-level permissions via allow/deny lists (deny wins)
+- `with_allowed_tools(&[&str]) -> Self` builder: adds tool names to the static
+  allowlist so they are auto-approved without prompting (used by `build_agent`
+  to pre-approve `write` and `edit` for agents with `auto_allow_writes: true`)
 - In `prompt` mode, read-only tools (read, glob, grep) run without asking;
   bash commands are matched against `allowed_commands`/`denied_commands`;
   everything else asks the user: **[y]es once / [a]lways this session / [n]o**
@@ -489,16 +506,20 @@ struct Cli {
   `session.max_turns`, `session.max_tokens`, `permissions.default`, `theme`
 - `io init` - Initialize project-level config
 
-**REPL slash commands**: `/help`, `/new`, `/agent`, `/connect`, `/model`, `/theme`, `/cost`, `/compact`, `/exit` (also `/quit`, `/q`).
+**TUI slash commands**: `/help`, `/new`, `/agent`, `/connect`, `/model`, `/theme`, `/cost`, `/compact`, `/exit` (also `/quit`, `/q`).
 Switching agent, provider, or model mid-conversation keeps the current session
 (`SessionChoice::Existing` in `build_agent`) — history is preserved.
+
+`build_agent` in `io/src/tui.rs` takes `&io_agents::AgentConfig` (not a string), calls
+`load_project_context()` from the project root, and applies `with_allowed_tools(&["write", "edit"])`
+to the `PermissionChecker` when `agent_config.auto_allow_writes` is `true`.
 
 **@file mentions**: Typing `@path/to/file` expands the file or directory contents inline
 before sending to the LLM. Supports text files (up to 100KB) and directories (lists entries).
 
-### REPL Loop (io/src/repl.rs)
+### TUI Loop (io/src/tui.rs)
 
-The interactive REPL:
+The interactive TUI:
 
 1. Load/create session
 2. Initialize agent with provider, tools, permissions
@@ -563,9 +584,25 @@ When adding a new provider, update these three lookup methods.
 
 Message history is built inline in `Agent::run_turn_inner`:
 - System prompt (plus the compaction summary, when one exists)
+- If `project_context` is set: a synthetic user message containing the
+  `<project-context>` block followed by a synthetic assistant acknowledgement —
+  these are injected once per turn so the model always has project guidance
+  available without it consuming the system prompt
 - Prior turns replayed as user/assistant text only (see the replay policy
   under Agent System — tool traffic is not replayed across turns)
 - The current user input
+
+### Project Context Loading
+
+`load_project_context(root: &Path) -> Option<String>` (public, in `io-runtime/src/lib.rs`):
+- Reads `AGENTS.md` and `CLAUDE.md` from the project root (current working directory)
+- Combines non-empty files into a single `<project-context>` block
+- Returns `None` if neither file exists or both are empty
+- Called by `build_agent` in `io/src/tui.rs` and forwarded to `SpawnAgentTool`
+  so sub-agents see the same context as the parent
+- All 12 built-in agent system prompts include the instruction: _"If you are
+  unsure about project conventions or what exactly to do, read AGENTS.md or
+  CLAUDE.md at the project root for guidance."_
 
 ### Error Recovery
 
@@ -596,7 +633,7 @@ mid-turn provider failure). Run with `cargo test`.
 | `provider/mod.rs` | retry classification by HTTP status, unknown-provider rejection, compat provider resolution, context-window tuning |
 | `config.rs` | default config, roundtrip serialization |
 | `pricing.rs` | cost calculation, known models, free/subscription/passthrough providers |
-| `io/src/repl.rs` | ThinkParser: plain text, think blocks, tags split across deltas, unterminated blocks, multibyte boundaries |
+| `io/src/tui.rs` | ThinkParser: plain text, think blocks, tags split across deltas, unterminated blocks, multibyte boundaries |
 
 ### CI
 
@@ -635,7 +672,7 @@ GitHub Actions runs on every push and PR to `main` (`.github/workflows/ci.yml`):
 
 ### Modifying System Prompt
 
-The system prompt comes from the active agent's `AgentConfig` in the `io-agents` crate (selected in `io/src/repl.rs`). It includes:
+The system prompt comes from the active agent's `AgentConfig` in the `io-agents` crate (selected in `io/src/tui.rs`). It includes:
 - Agent role and behavior instructions
 - Tool descriptions (automatically appended)
 - Permission and safety guidelines

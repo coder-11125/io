@@ -1,15 +1,16 @@
-//! The interactive REPL and single-shot runner: agent construction, the
+//! The interactive TUI and single-shot runner: agent construction, the
 //! per-turn streaming/cancellation/permission dance, and `@path` mentions.
 
 use crate::cost::show_cost_summary;
-use crate::readline;
-use crate::render::{
+use crate::{agent, connect, model};
+use io_runtime::types::SessionId;
+use io_tui::picker;
+use io_tui::readline;
+use io_tui::render::{
     clear_prompt_input, draw_prompt_bar, enter_tui, exit_tui, prepare_streaming,
     render_scroll_view, render_thoughts, render_tool_done, render_tool_start, tool_detail,
     PROMPT_BAR_HEIGHT,
 };
-use crate::{agent, connect, model, picker};
-use io_runtime::types::SessionId;
 use std::io::Write;
 
 /// Which session the agent should run in.
@@ -464,7 +465,7 @@ fn tui_read_line(
     last_input_tokens: u32,
     context_window: u64,
     current_agent_id: &str,
-    theme: &crate::render::Theme,
+    theme: &io_tui::render::Theme,
     line_buf: &LineBuf,
 ) -> anyhow::Result<Option<String>> {
     use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
@@ -505,7 +506,7 @@ fn tui_read_line(
         let ev = event::read()?;
         match ev {
             Event::Resize(_, _) => {
-                crate::render::handle_resize()?;
+                io_tui::render::handle_resize()?;
                 if file_all.is_some() {
                     popup_rows = draw_file_popup(&file_filtered, file_selected, file_scroll)?;
                 } else if !slash_matches.is_empty() {
@@ -802,7 +803,7 @@ fn splash_read_line(
     full_agents: &[io_agents::AgentConfig],
     tab_current: &mut usize,
     agent: &io_runtime::Agent,
-    theme: &crate::render::Theme,
+    theme: &io_tui::render::Theme,
 ) -> anyhow::Result<Option<String>> {
     use crossterm::{
         cursor,
@@ -817,8 +818,8 @@ fn splash_read_line(
         .map(|a| a.name)
         .unwrap_or("build");
     let mut layout =
-        crate::render::draw_splash(&buf, agent_name, agent.provider_id, &agent.model_id, theme)?;
-    let (cx, cy) = crate::render::splash_cursor(&layout, &buf);
+        io_tui::render::draw_splash(&buf, agent_name, agent.provider_id, &agent.model_id, theme)?;
+    let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf);
     execute!(std::io::stdout(), cursor::MoveTo(cx, cy), cursor::Show)?;
 
     loop {
@@ -828,14 +829,14 @@ fn splash_read_line(
                     .get(*tab_current)
                     .map(|a| a.name)
                     .unwrap_or("build");
-                layout = crate::render::draw_splash(
+                layout = io_tui::render::draw_splash(
                     &buf,
                     name,
                     agent.provider_id,
                     &agent.model_id,
                     theme,
                 )?;
-                let (cx, cy) = crate::render::splash_cursor(&layout, &buf);
+                let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf);
                 execute!(std::io::stdout(), cursor::MoveTo(cx, cy), cursor::Show)?;
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -846,8 +847,8 @@ fn splash_read_line(
                     }
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                         buf.clear();
-                        crate::render::splash_update_input(&layout, &buf, theme)?;
-                        let (cx, cy) = crate::render::splash_cursor(&layout, &buf);
+                        io_tui::render::splash_update_input(&layout, &buf, theme)?;
+                        let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
                     }
                     (KeyCode::Enter, _) if !buf.trim().is_empty() => {
@@ -857,27 +858,27 @@ fn splash_read_line(
                     (KeyCode::Enter, _) => {}
                     (KeyCode::Backspace, _) => {
                         buf.pop();
-                        crate::render::splash_update_input(&layout, &buf, theme)?;
-                        let (cx, cy) = crate::render::splash_cursor(&layout, &buf);
+                        io_tui::render::splash_update_input(&layout, &buf, theme)?;
+                        let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
                     }
                     (KeyCode::Tab, _) if !full_agents.is_empty() => {
                         *tab_current = (*tab_current + 1) % full_agents.len();
                         let name = full_agents[*tab_current].name;
-                        crate::render::splash_update_status(
+                        io_tui::render::splash_update_status(
                             &layout,
                             name,
                             agent.provider_id,
                             &agent.model_id,
                             theme,
                         )?;
-                        let (cx, cy) = crate::render::splash_cursor(&layout, &buf);
+                        let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
                     }
                     (KeyCode::Char(c), _) => {
                         buf.push(c);
-                        crate::render::splash_update_input(&layout, &buf, theme)?;
-                        let (cx, cy) = crate::render::splash_cursor(&layout, &buf);
+                        io_tui::render::splash_update_input(&layout, &buf, theme)?;
+                        let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
                     }
                     _ => {}
@@ -896,7 +897,7 @@ pub async fn run_interactive(
     _model: Option<&str>,
 ) -> anyhow::Result<()> {
     let config = io_runtime::config::Config::load()?;
-    let mut theme = crate::render::get_theme(&config.theme);
+    let mut theme = io_tui::render::get_theme(&config.theme);
     let line_buf: LineBuf = std::sync::Arc::new(std::sync::Mutex::new(
         std::collections::VecDeque::with_capacity(512),
     ));
@@ -1225,9 +1226,9 @@ pub async fn run_interactive(
                 continue;
             }
             "/theme" => {
-                match crate::theme::run(theme.name) {
+                match io_tui::theme::run(theme.name) {
                     Ok(name) => {
-                        theme = crate::render::get_theme(name);
+                        theme = io_tui::render::get_theme(name);
                         is_splash = true;
                     }
                     Err(e) if !e.is::<picker::Dismissed>() => {
@@ -1365,7 +1366,7 @@ pub async fn run_interactive(
                             }
                         }
                         Ok(crossterm::event::Event::Resize(_, _)) => {
-                            let _ = crate::render::handle_resize();
+                            let _ = io_tui::render::handle_resize();
                         }
                         _ => {}
                     }
@@ -1478,7 +1479,7 @@ fn process_ev(
     think: &mut String,
     parser: &mut ThinkParser,
     pending_perm: &PendingPermission,
-    theme: crate::render::Theme,
+    theme: io_tui::render::Theme,
     line_buf: &LineBuf,
 ) {
     use io_runtime::AgentEvent;
@@ -1545,7 +1546,7 @@ fn push_line(buf: &LineBuf, line: String) {
 async fn blink_and_print(
     mut rx: tokio::sync::mpsc::Receiver<io_runtime::AgentEvent>,
     pending_perm: PendingPermission,
-    theme: crate::render::Theme,
+    theme: io_tui::render::Theme,
     line_buf: LineBuf,
 ) -> (Option<String>, u32) {
     const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1612,7 +1613,7 @@ async fn blink_and_print(
     if !text_buf.is_empty() {
         print!("\r\n\r\n");
         let _ = std::io::stdout().flush();
-        let ansi_lines = crate::render::render_markdown_lines(&text_buf, &theme);
+        let ansi_lines = io_tui::render::render_markdown_lines(&text_buf, &theme);
         // Print rendered output to terminal.
         {
             use crossterm::QueueableCommand;

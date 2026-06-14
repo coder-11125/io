@@ -7,11 +7,7 @@ mod config_cmd;
 mod connect;
 mod cost;
 mod model;
-mod picker;
-mod readline;
-mod render;
-mod repl;
-mod theme;
+mod tui;
 
 #[derive(Parser)]
 #[command(name = "io", version, about = "AI coding agent for the terminal")]
@@ -82,9 +78,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Init) => config_cmd::handle_init()?,
         None => {
             if let Some(prompt) = cli.prompt {
-                repl::run_single_shot(&prompt).await?;
+                tui::run_single_shot(&prompt).await?;
             } else {
-                repl::run_interactive(cli.new, cli.r#continue, cli.model.as_deref()).await?;
+                tui::run_interactive(cli.new, cli.r#continue, cli.model.as_deref()).await?;
             }
         }
     }

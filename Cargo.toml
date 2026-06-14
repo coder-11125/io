@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "io",
+    "io-tui",
     "io-runtime",
     "io-agents",
 ]
