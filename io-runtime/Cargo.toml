@@ -28,4 +28,5 @@ mime_guess.workspace = true
 sha2 = "0.10"
 hmac = "0.12"
 hex = "0.4"
+base64 = "0.22"
 similar = "2"

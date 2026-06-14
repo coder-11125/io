@@ -352,7 +352,7 @@ cargo build
 cargo run -- "your prompt"
 cargo run --
 
-# Run tests (129 unit tests + 9 integration tests)
+# Run tests (149 unit tests + 9 integration tests)
 cargo test
 
 # Add a new provider

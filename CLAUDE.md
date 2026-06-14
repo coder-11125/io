@@ -61,13 +61,13 @@ io/
 │       │   ├── mod.rs         # Provider trait, retry wrapper, OpenAI-compat table,
 │       │   │                  #   create_provider() — 8 providers are one-line
 │       │   │                  #   entries in compat_provider()
-│       │   ├── anthropic.rs   # Anthropic
+│       │   ├── anthropic.rs   # Anthropic — SSE streaming via AnthropicStreamState
 │       │   ├── openai.rs      # OpenAI + 8 compat providers (groq, mistral,
 │       │   │                  #   deepseek, openrouter, xai, opencode_go,
 │       │   │                  #   opencode_zen, ollama) via OpenAICompatProvider
 │       │   ├── gemini.rs      # Google Gemini
 │       │   ├── azure.rs       # Azure OpenAI
-│       │   └── bedrock.rs     # AWS Bedrock
+│       │   └── bedrock.rs     # AWS Bedrock — binary event-stream + shared AnthropicStreamState
 │       └── tools/             # Built-in tool implementations
 │           ├── mod.rs         # Tool trait and registry
 │           ├── read.rs
@@ -270,6 +270,18 @@ Mistral, DeepSeek, OpenRouter, xAI, OpenCode Go/Zen, Ollama) are thin
 `OpenAICompatProvider` instances driven by the `compat_provider()` id →
 base-URL table; only Anthropic, OpenAI, Gemini, Azure, and Bedrock have
 their own implementation files.
+
+All 13 providers support both `complete` and `complete_stream`. Streaming
+implementation notes:
+- **Anthropic** — SSE (`text/event-stream`): request body includes `"stream": true`;
+  events are parsed by `AnthropicStreamState` (in `anthropic.rs`), which tracks
+  tool-use blocks by index and accumulates `input_json_delta` fragments until
+  `content_block_stop`.
+- **Bedrock** — AWS binary event-stream (`invoke-with-response-stream` endpoint):
+  binary frames are decoded by `parse_event_frame` / `parse_headers` in
+  `bedrock.rs`; each `chunk` event base64-decodes to the same Anthropic SSE
+  event JSON, which is then processed by the shared `AnthropicStreamState`.
+- **OpenAI / compat providers** — OpenAI SSE protocol with `stream_options.include_usage`.
 
 **Adding a New Provider** (OpenAI-compatible — the common case):
 1. Add a config struct in `io-runtime/src/config.rs` and a field on `ProviderConfig`
