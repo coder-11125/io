@@ -170,7 +170,7 @@ pub async fn run() -> anyhow::Result<()> {
     let items: Vec<(&str, &str)> = entries.iter().map(|(m, _, pl)| (m.as_str(), *pl)).collect();
 
     println!();
-    let picked = crate::picker::pick_with_hint(&items, current_pos)?;
+    let picked = io_tui::picker::pick_with_hint(&items, current_pos)?;
 
     let (model_id, provider_id, _) = &entries[picked];
     let mut config = Config::load()?;

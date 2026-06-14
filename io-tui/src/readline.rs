@@ -108,7 +108,7 @@ fn filter_matches(buf: &str) -> Vec<usize> {
 }
 
 /// Returns `(at_byte_pos, typed_prefix)` for the last active `@`-mention.
-pub(crate) fn at_prefix(buf: &str) -> Option<(usize, &str)> {
+pub fn at_prefix(buf: &str) -> Option<(usize, &str)> {
     let at_pos = buf.rfind('@')?;
     if at_pos > 0 && !buf[..at_pos].ends_with(char::is_whitespace) {
         return None;
@@ -117,7 +117,7 @@ pub(crate) fn at_prefix(buf: &str) -> Option<(usize, &str)> {
 }
 
 /// Tries `fd`, then `rg --files`, then `git ls-files`, then stdlib single-level walk.
-pub(crate) fn list_files() -> Vec<String> {
+pub fn list_files() -> Vec<String> {
     list_files_fd()
         .or_else(list_files_rg)
         .or_else(list_files_git)
@@ -230,7 +230,7 @@ fn list_files_stdlib() -> Vec<String> {
     files
 }
 
-pub(crate) fn filter_files(all: &[String], prefix: &str) -> Vec<String> {
+pub fn filter_files(all: &[String], prefix: &str) -> Vec<String> {
     if prefix.is_empty() {
         return all.to_vec();
     }

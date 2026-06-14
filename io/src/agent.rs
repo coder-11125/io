@@ -7,7 +7,7 @@ pub fn run(current_id: &str) -> anyhow::Result<AgentConfig> {
     let current = agents.iter().position(|a| a.id == current_id);
 
     println!();
-    let picked = crate::picker::pick_with_hint(&items, current)?;
+    let picked = io_tui::picker::pick_with_hint(&items, current)?;
     println!();
 
     agents

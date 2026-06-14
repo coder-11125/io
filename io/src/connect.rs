@@ -394,7 +394,7 @@ fn select_provider() -> anyhow::Result<usize> {
     println!("  Select a provider:");
     println!();
     let labels: Vec<&str> = PROVIDERS.iter().map(|p| p.label).collect();
-    crate::picker::pick(&labels, None)
+    io_tui::picker::pick(&labels, None)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

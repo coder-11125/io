@@ -55,10 +55,10 @@ fn set_config_key(
             config.permissions.default = value.to_string();
         }
         ["theme"] => {
-            if !crate::render::THEME_NAMES.contains(&value) {
+            if !io_tui::render::THEME_NAMES.contains(&value) {
                 anyhow::bail!(
                     "unknown theme: {value}\nAvailable: {}",
-                    crate::render::THEME_NAMES.join(", ")
+                    io_tui::render::THEME_NAMES.join(", ")
                 );
             }
             config.theme = value.to_string();
