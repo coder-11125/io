@@ -35,56 +35,133 @@ impl SafetyVerdict {
     }
 
     fn safe(reason: &'static str) -> Self {
-        Self { level: SafetyLevel::Safe, reason }
+        Self {
+            level: SafetyLevel::Safe,
+            reason,
+        }
     }
     fn caution(reason: &'static str) -> Self {
-        Self { level: SafetyLevel::Caution, reason }
+        Self {
+            level: SafetyLevel::Caution,
+            reason,
+        }
     }
     fn destructive(reason: &'static str) -> Self {
-        Self { level: SafetyLevel::Destructive, reason }
+        Self {
+            level: SafetyLevel::Destructive,
+            reason,
+        }
     }
 }
 
 /// Commands whose heads are definitively read-only with no persistent side effects.
 const ALWAYS_SAFE: &[&str] = &[
     // directory listing
-    "ls", "dir", "vdir",
+    "ls",
+    "dir",
+    "vdir",
     // file reading
-    "cat", "tac", "less", "more", "head", "tail", "bat", "strings",
-    "hexdump", "xxd", "od",
+    "cat",
+    "tac",
+    "less",
+    "more",
+    "head",
+    "tail",
+    "bat",
+    "strings",
+    "hexdump",
+    "xxd",
+    "od",
     // text processing (all read stdin/files, write only to stdout)
-    "grep", "egrep", "fgrep", "rg", "ag", "ack",
-    "sort", "uniq", "wc", "cut", "tr", "nl", "fold", "fmt",
-    "awk", "column", "paste", "join", "comm", "diff", "cmp",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "ag",
+    "ack",
+    "sort",
+    "uniq",
+    "wc",
+    "cut",
+    "tr",
+    "nl",
+    "fold",
+    "fmt",
+    "awk",
+    "column",
+    "paste",
+    "join",
+    "comm",
+    "diff",
+    "cmp",
     // system info
-    "pwd", "whoami", "id", "hostname", "uname", "arch",
-    "date", "cal", "uptime",
-    "ps", "pgrep", "pidof",
-    "df", "du", "free", "nproc",
+    "pwd",
+    "whoami",
+    "id",
+    "hostname",
+    "uname",
+    "arch",
+    "date",
+    "cal",
+    "uptime",
+    "ps",
+    "pgrep",
+    "pidof",
+    "df",
+    "du",
+    "free",
+    "nproc",
     // environment inspection
-    "env", "printenv",
+    "env",
+    "printenv",
     // file metadata
-    "file", "stat", "readlink", "realpath",
+    "file",
+    "stat",
+    "readlink",
+    "realpath",
     // hashing / verification
-    "md5sum", "sha1sum", "sha256sum", "sha512sum", "md5", "shasum", "cksum",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "md5",
+    "shasum",
+    "cksum",
     // path / command lookup
-    "which", "type",
+    "which",
+    "type",
     // output primitives
-    "echo", "printf", "true", "false",
+    "echo",
+    "printf",
+    "true",
+    "false",
     // data format tools
-    "jq", "yq", "base64",
+    "jq",
+    "yq",
+    "base64",
     // help / documentation
-    "man", "info",
+    "man",
+    "info",
     // process inspection (list-only modes)
     "lsof",
     // test builtins
-    "test", "[",
+    "test",
+    "[",
 ];
 
 /// Commands that always risk irreversible data loss or system integrity damage.
 const ALWAYS_DESTRUCTIVE: &[&str] = &[
-    "dd", "mkfs", "fdisk", "parted", "gdisk", "sgdisk",
-    "wipefs", "blkdiscard", "shred", "wipe", "srm",
+    "dd",
+    "mkfs",
+    "fdisk",
+    "parted",
+    "gdisk",
+    "sgdisk",
+    "wipefs",
+    "blkdiscard",
+    "shred",
+    "wipe",
+    "srm",
 ];
 
 /// Commands that modify state but are typically reversible or project-scoped.
@@ -92,24 +169,57 @@ const ALWAYS_DESTRUCTIVE: &[&str] = &[
 /// by `analyze_build_tool` / `analyze_go` so individual subcommands like
 /// `npm test` or `go build` can be auto-allowed.
 const ALWAYS_CAUTION: &[&str] = &[
-    "mv", "cp", "mkdir", "touch", "ln", "install",
-    "chmod", "chown", "chgrp",
-    "kill", "killall", "pkill",
+    "mv",
+    "cp",
+    "mkdir",
+    "touch",
+    "ln",
+    "install",
+    "chmod",
+    "chown",
+    "chgrp",
+    "kill",
+    "killall",
+    "pkill",
     // make/cmake/ninja: Makefile rules are opaque — cannot classify statically.
-    "make", "cmake", "ninja",
-    "apt", "apt-get", "brew", "yum", "dnf", "pacman", "snap",
-    "systemctl", "service", "launchctl",
-    "crontab", "at",
+    "make",
+    "cmake",
+    "ninja",
+    "apt",
+    "apt-get",
+    "brew",
+    "yum",
+    "dnf",
+    "pacman",
+    "snap",
+    "systemctl",
+    "service",
+    "launchctl",
+    "crontab",
+    "at",
     "ssh-keygen",
     "openssl",
-    "tar", "zip", "unzip", "gzip", "gunzip", "bzip2", "xz",
+    "tar",
+    "zip",
+    "unzip",
+    "gzip",
+    "gunzip",
+    "bzip2",
+    "xz",
     "patch",
     "rsync",
-    "docker", "podman", "kubectl",
-    "terraform", "ansible",
+    "docker",
+    "podman",
+    "kubectl",
+    "terraform",
+    "ansible",
     "truncate",
     "tee",
-    "python", "python3", "ruby", "node", "perl",
+    "python",
+    "python3",
+    "ruby",
+    "node",
+    "perl",
 ];
 
 // ── Ecosystem-agnostic build-tool classification ──────────────────────────────
@@ -122,36 +232,63 @@ const ALWAYS_CAUTION: &[&str] = &[
 /// Subcommands that are safe across build/package managers — they compile,
 /// run tests, lint, or report without mutating the broader environment.
 const BUILD_SAFE: &[&str] = &[
-    "test", "tests",
+    "test",
+    "tests",
     "build",
     "check",
-    "lint", "fmt", "format",
-    "doc", "docs",
-    "bench", "benchmark",
+    "lint",
+    "fmt",
+    "format",
+    "doc",
+    "docs",
+    "bench",
+    "benchmark",
     "audit",
-    "verify", "validate",
+    "verify",
+    "validate",
     "compile",
-    "typecheck", "type-check",
+    "typecheck",
+    "type-check",
     "watch",
     // read-only introspection
-    "list", "ls", "show", "info", "outdated", "tree",
-    "freeze", "why", "explain", "search",
-    "query", "inspect",
-    "vet",   // go vet
-    "env",   // go env, cargo env
+    "list",
+    "ls",
+    "show",
+    "info",
+    "outdated",
+    "tree",
+    "freeze",
+    "why",
+    "explain",
+    "search",
+    "query",
+    "inspect",
+    "vet", // go vet
+    "env", // go env, cargo env
     "version",
 ];
 
 /// Subcommands that install, remove, or publish packages — always caution.
 const BUILD_CAUTION: &[&str] = &[
-    "install", "add", "i",
-    "uninstall", "remove", "rm", "r", "delete",
-    "update", "upgrade", "up",
-    "publish", "pack", "release",
+    "install",
+    "add",
+    "i",
+    "uninstall",
+    "remove",
+    "rm",
+    "r",
+    "delete",
+    "update",
+    "upgrade",
+    "up",
+    "publish",
+    "pack",
+    "release",
     "deploy",
-    "get",   // go get
-    "tidy",  // go mod tidy (rewrites go.sum)
-    "link", "unlink",
+    "get",  // go get
+    "tidy", // go mod tidy (rewrites go.sum)
+    "link",
+    "unlink",
 ];
 
 /// Classify a generic build-tool invocation (npm, yarn, pnpm, bun, pip, pip3,
@@ -200,16 +337,42 @@ fn analyze_pip(args: &[String]) -> SafetyVerdict {
 
 /// `git` read-only subcommands — safe to auto-allow.
 const GIT_SAFE: &[&str] = &[
-    "status", "log", "diff", "show", "branch", "tag", "remote",
-    "describe", "rev-parse", "rev-list", "ls-files", "ls-tree",
-    "shortlog", "blame", "annotate", "config", "fetch", "stash",
-    "bisect", "notes",
+    "status",
+    "log",
+    "diff",
+    "show",
+    "branch",
+    "tag",
+    "remote",
+    "describe",
+    "rev-parse",
+    "rev-list",
+    "ls-files",
+    "ls-tree",
+    "shortlog",
+    "blame",
+    "annotate",
+    "config",
+    "fetch",
+    "stash",
+    "bisect",
+    "notes",
 ];
 
 /// `cargo` subcommands that are safe in a development context.
 const CARGO_SAFE: &[&str] = &[
-    "check", "build", "test", "clippy", "fmt", "doc", "bench",
-    "tree", "metadata", "pkgid", "locate-project", "verify-project",
+    "check",
+    "build",
+    "test",
+    "clippy",
+    "fmt",
+    "doc",
+    "bench",
+    "tree",
+    "metadata",
+    "pkgid",
+    "locate-project",
+    "verify-project",
     "run",
 ];
 
@@ -232,9 +395,7 @@ fn parse_segments(command: &str) -> Vec<(String, Vec<String>)> {
                 raw_head = it.next()?;
             }
             // Strip subshell markers that survived splitting.
-            let raw_head = raw_head
-                .trim_start_matches("$(")
-                .trim_start_matches('(');
+            let raw_head = raw_head.trim_start_matches("$(").trim_start_matches('(');
             // Normalise: remove backslash escapes, take basename.
             let unescaped: String = raw_head.chars().filter(|&c| c != '\\').collect();
             let head = basename(&unescaped).to_string();
@@ -261,7 +422,9 @@ fn analyze_rm(args: &[String]) -> SafetyVerdict {
         || args.iter().any(|a| a == "--recursive");
 
     // Targets that imply whole-system deletion.
-    const CRITICAL: &[&str] = &["/", "~", "/*", "~/", "/etc", "/usr", "/bin", "/boot", "/sys", "/dev"];
+    const CRITICAL: &[&str] = &[
+        "/", "~", "/*", "~/", "/etc", "/usr", "/bin", "/boot", "/sys", "/dev",
+    ];
     let critical_target = args
         .iter()
         .filter(|a| !a.starts_with('-'))
@@ -300,7 +463,11 @@ fn analyze_git(args: &[String]) -> SafetyVerdict {
         "clean" => {
             return SafetyVerdict::destructive("git clean permanently removes untracked files");
         }
-        "reset" if rest.contains(&"--hard") || rest.contains(&"--merge") || rest.contains(&"--keep") => {
+        "reset"
+            if rest.contains(&"--hard")
+                || rest.contains(&"--merge")
+                || rest.contains(&"--keep") =>
+        {
             return SafetyVerdict::destructive("git reset --hard discards uncommitted changes");
         }
         "push" if rest.contains(&"--force") || rest.contains(&"-f") => {
@@ -383,11 +550,15 @@ fn analyze_segment(head: &str, args: &[String]) -> SafetyVerdict {
         "swift" | "xcodebuild" => analyze_build_tool(args),
 
         // ── mkfs.* variants ───────────────────────────────────────────────────
-        _ if head.starts_with("mkfs") => SafetyVerdict::destructive("mkfs variants format filesystems"),
+        _ if head.starts_with("mkfs") => {
+            SafetyVerdict::destructive("mkfs variants format filesystems")
+        }
 
         // ── Static tables ──────────────────────────────────────────────────────
         _ if ALWAYS_SAFE.contains(&head) => SafetyVerdict::safe("read-only command"),
-        _ if ALWAYS_DESTRUCTIVE.contains(&head) => SafetyVerdict::destructive("always-destructive command"),
+        _ if ALWAYS_DESTRUCTIVE.contains(&head) => {
+            SafetyVerdict::destructive("always-destructive command")
+        }
         _ if ALWAYS_CAUTION.contains(&head) => SafetyVerdict::caution("modifying command"),
         _ => SafetyVerdict::caution("unknown command — defaulting to caution"),
     }
@@ -517,7 +688,10 @@ mod tests {
 
     #[test]
     fn git_commit_is_caution() {
-        assert_eq!(level("git commit -m 'feat: add thing'"), SafetyLevel::Caution);
+        assert_eq!(
+            level("git commit -m 'feat: add thing'"),
+            SafetyLevel::Caution
+        );
     }
 
     #[test]
@@ -552,7 +726,10 @@ mod tests {
 
     #[test]
     fn dd_is_destructive() {
-        assert_eq!(level("dd if=/dev/zero of=/dev/sda"), SafetyLevel::Destructive);
+        assert_eq!(
+            level("dd if=/dev/zero of=/dev/sda"),
+            SafetyLevel::Destructive
+        );
     }
 
     #[test]
@@ -567,12 +744,18 @@ mod tests {
 
     #[test]
     fn find_with_delete_is_destructive() {
-        assert_eq!(level("find . -name '*.tmp' -delete"), SafetyLevel::Destructive);
+        assert_eq!(
+            level("find . -name '*.tmp' -delete"),
+            SafetyLevel::Destructive
+        );
     }
 
     #[test]
     fn find_with_exec_rm_is_destructive() {
-        assert_eq!(level("find . -type f -exec rm {} \\;"), SafetyLevel::Destructive);
+        assert_eq!(
+            level("find . -type f -exec rm {} \\;"),
+            SafetyLevel::Destructive
+        );
     }
 
     #[test]
@@ -587,7 +770,10 @@ mod tests {
 
     #[test]
     fn git_push_force_is_destructive() {
-        assert_eq!(level("git push --force origin main"), SafetyLevel::Destructive);
+        assert_eq!(
+            level("git push --force origin main"),
+            SafetyLevel::Destructive
+        );
         assert_eq!(level("git push -f"), SafetyLevel::Destructive);
     }
 
@@ -615,7 +801,10 @@ mod tests {
 
     #[test]
     fn git_status_then_commit_is_caution() {
-        assert_eq!(level("git status && git commit -m 'x'"), SafetyLevel::Caution);
+        assert_eq!(
+            level("git status && git commit -m 'x'"),
+            SafetyLevel::Caution
+        );
     }
 
     // ── Expansion-free guard ──────────────────────────────────────────────────
@@ -729,7 +918,10 @@ mod tests {
     fn pip_install_is_caution() {
         assert_eq!(level("pip install requests"), SafetyLevel::Caution);
         assert_eq!(level("pip3 uninstall requests"), SafetyLevel::Caution);
-        assert_eq!(level("pip install -r requirements.txt"), SafetyLevel::Caution);
+        assert_eq!(
+            level("pip install -r requirements.txt"),
+            SafetyLevel::Caution
+        );
     }
 
     #[test]
@@ -763,7 +955,10 @@ mod tests {
     #[test]
     fn dotnet_publish_is_caution() {
         assert_eq!(level("dotnet publish"), SafetyLevel::Caution);
-        assert_eq!(level("dotnet add package Newtonsoft.Json"), SafetyLevel::Caution);
+        assert_eq!(
+            level("dotnet add package Newtonsoft.Json"),
+            SafetyLevel::Caution
+        );
     }
 
     #[test]

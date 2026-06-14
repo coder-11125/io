@@ -622,8 +622,7 @@ impl Agent {
 }
 
 fn audit_log_path() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".io").join("audit.log"))
+    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".io").join("audit.log"))
 }
 
 fn append_audit_log(record: &crate::types::ToolCallRecord) {

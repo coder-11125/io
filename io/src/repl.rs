@@ -1517,11 +1517,18 @@ fn process_ev(
             let icon = if success { "✓" } else { "✗" };
             push_line(line_buf, format!("  ├ {}  {}", name, icon));
         }
-        AgentEvent::PermissionRequest { name, input, respond } => {
+        AgentEvent::PermissionRequest {
+            name,
+            input,
+            respond,
+        } => {
             use crossterm::style::Stylize;
             let detail = tool_detail(&name, &input);
             if detail.is_empty() {
-                print!("\r\n  allow \"{}\"? [y]es / [a]lways / [n]o: ", name.yellow());
+                print!(
+                    "\r\n  allow \"{}\"? [y]es / [a]lways / [n]o: ",
+                    name.yellow()
+                );
             } else {
                 print!(
                     "\r\n  allow \"{}\" ({})? [y]es / [a]lways / [n]o: ",
