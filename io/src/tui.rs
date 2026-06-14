@@ -812,9 +812,8 @@ fn splash_read_line(
     let mut slash_selected: Option<usize> = None;
     let mut popup_rows: u16 = 0;
 
-    let splash_name = |tc: usize| -> &str {
-        full_agents.get(tc).map(|a| a.name).unwrap_or("build")
-    };
+    let splash_name =
+        |tc: usize| -> &str { full_agents.get(tc).map(|a| a.name).unwrap_or("build") };
 
     let mut layout = io_tui::render::draw_splash(
         &buf,
@@ -1427,8 +1426,7 @@ pub async fn run_interactive(
                             }
                         }
                         Ok(crossterm::event::Event::Mouse(m)) => {
-                            let cur =
-                                stream_scroll2.load(std::sync::atomic::Ordering::Relaxed);
+                            let cur = stream_scroll2.load(std::sync::atomic::Ordering::Relaxed);
                             let n = line_buf_scroll.lock().unwrap().len();
                             let next = match m.kind {
                                 crossterm::event::MouseEventKind::ScrollUp => {
@@ -1440,17 +1438,14 @@ pub async fn run_interactive(
                                 _ => cur,
                             };
                             if next != cur {
-                                stream_scroll2
-                                    .store(next, std::sync::atomic::Ordering::Relaxed);
+                                stream_scroll2.store(next, std::sync::atomic::Ordering::Relaxed);
                                 let _ = io_tui::render::render_scroll_view(
                                     &line_buf_scroll.lock().unwrap(),
                                     next,
                                     &theme,
                                 );
-                                let _ = crossterm::execute!(
-                                    std::io::stdout(),
-                                    crossterm::cursor::Hide
-                                );
+                                let _ =
+                                    crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
                             }
                         }
                         Ok(crossterm::event::Event::Resize(_, _)) => {
@@ -1493,10 +1488,7 @@ pub async fn run_interactive(
                         format!("\x01\x1b[36m{prefix}\x1b[90m{first}\x1b[0m"),
                     );
                     for line in thought_lines {
-                        push_line(
-                            &line_buf,
-                            format!("\x01{indent}\x1b[90m{line}\x1b[0m"),
-                        );
+                        push_line(&line_buf, format!("\x01{indent}\x1b[90m{line}\x1b[0m"));
                     }
                 }
                 push_line(&line_buf, String::new());

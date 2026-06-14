@@ -291,7 +291,11 @@ pub fn draw_prompt_bar(
     // Resolve agent color once — used for both ▌ bars and the agent name.
     let name_color = {
         let c = agent_color(agent_name);
-        if c == crossterm::style::Color::Reset { theme.accent } else { c }
+        if c == crossterm::style::Color::Reset {
+            theme.accent
+        } else {
+            c
+        }
     };
 
     // Input row: agent-colored bar + text
