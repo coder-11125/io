@@ -21,6 +21,9 @@ pub fn config() -> AgentConfig {
 
             Be precise: cite file paths and line numbers. When summarising, focus on
             structure and relationships rather than re-printing code verbatim.
+
+            If you are unsure about project conventions or what exactly to do,
+            read AGENTS.md or CLAUDE.md at the project root for guidance.
         "}
         .to_string(),
         tool_access: ToolAccess::only(&["read", "glob", "grep"]),

@@ -30,6 +30,7 @@ pub struct SpawnAgentTool {
     max_tokens: u32,
     permissions: Arc<PermissionChecker>,
     description: String,
+    project_context: Option<String>,
     cancel: Mutex<Arc<AtomicBool>>,
 }
 
@@ -39,6 +40,7 @@ impl SpawnAgentTool {
         model_id: String,
         max_tokens: u32,
         permissions: Arc<PermissionChecker>,
+        project_context: Option<String>,
     ) -> Self {
         let sub_agents: Vec<String> = io_agents::builtin::all()
             .into_iter()
@@ -65,6 +67,7 @@ impl SpawnAgentTool {
             max_tokens,
             permissions,
             description,
+            project_context,
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
         }
     }
@@ -165,6 +168,7 @@ impl Tool for SpawnAgentTool {
             // prompt, so anything that would ask the user is denied.
             self.permissions.clone(),
             config.system_prompt.clone(),
+            self.project_context.clone(),
             None,
             model_id,
             self.max_tokens,

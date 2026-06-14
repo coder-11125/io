@@ -38,6 +38,9 @@ pub fn config() -> AgentConfig {
             3. Write documentation that would help a new contributor understand and
                use the code correctly.
             4. Do not modify logic, signatures, or tests.
+
+            If you are unsure about project conventions or what exactly to do,
+            read AGENTS.md or CLAUDE.md at the project root for guidance.
         "}
         .to_string(),
         tool_access: ToolAccess::only(&["read", "write", "edit", "glob", "grep"]),

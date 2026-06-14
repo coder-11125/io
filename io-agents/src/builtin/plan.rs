@@ -39,6 +39,9 @@ pub fn config() -> AgentConfig {
             - Never skip the planning phase and jump straight to code.
             - Never proceed past a failing build or test without stopping to fix it.
             - If a design decision cannot be resolved alone, stop and ask.
+
+            If you are unsure about project conventions or what exactly to do,
+            read AGENTS.md or CLAUDE.md at the project root for guidance.
         "}
         .to_string(),
         tool_access: ToolAccess::All,

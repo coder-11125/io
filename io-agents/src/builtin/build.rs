@@ -28,6 +28,9 @@ pub fn config() -> AgentConfig {
 
             Be direct and concise. No padding or restating the question.
             If a task requires a decision you cannot make alone, ask first.
+
+            If you are unsure about project conventions or what exactly to do,
+            read AGENTS.md or CLAUDE.md at the project root for guidance.
         "}.to_string(),
         tool_access: ToolAccess::All,
         suggested_model: None,

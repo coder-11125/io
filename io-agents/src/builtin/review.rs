@@ -30,6 +30,9 @@ pub fn config() -> AgentConfig {
 
             Do not rewrite code in your response unless a short snippet (≤5 lines) is
             the clearest way to explain a suggestion.
+
+            If you are unsure about project conventions or what exactly to do,
+            read AGENTS.md or CLAUDE.md at the project root for guidance.
         "}
         .to_string(),
         tool_access: ToolAccess::only(&["read", "glob", "grep"]),

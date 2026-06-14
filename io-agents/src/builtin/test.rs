@@ -31,6 +31,9 @@ pub fn config() -> AgentConfig {
               why.
             - If you spot a bug while reading the code, report it separately from the
               coverage analysis.
+
+            If you are unsure about project conventions or what exactly to do,
+            read AGENTS.md or CLAUDE.md at the project root for guidance.
         "}
         .to_string(),
         tool_access: ToolAccess::only(&["read", "glob", "grep"]),

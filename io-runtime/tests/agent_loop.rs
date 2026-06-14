@@ -148,6 +148,7 @@ fn make_agent_at(
         memory,
         Arc::new(permissions),
         "You are a test agent.".to_string(),
+        None,
         session_id,
         "mock-model".to_string(),
         1024,
@@ -419,6 +420,7 @@ async fn sub_agent_inherits_permissions_and_fails_closed() {
         "mock-model".to_string(),
         1024,
         permissions.clone(),
+        None,
     )));
     let memory = SessionStore::with_path(temp_path("io-test", ".db")).expect("session store");
     let agent = Agent::new(
@@ -427,6 +429,7 @@ async fn sub_agent_inherits_permissions_and_fails_closed() {
         memory,
         permissions,
         "You are a test agent.".to_string(),
+        None,
         None,
         "mock-model".to_string(),
         1024,

@@ -42,9 +42,11 @@ async fn build_agent(
     let model_id = config.provider.active_model();
     let provider = io_runtime::provider::create_provider(&config, &keys)?;
     let memory = io_runtime::memory::SessionStore::new()?;
+    let project_root = detect_project_root();
+    let project_context = io_runtime::load_project_context(&project_root);
     let permissions = std::sync::Arc::new(
         io_runtime::sandbox::PermissionChecker::from(&config.permissions)
-            .with_project_root(detect_project_root()),
+            .with_project_root(project_root),
     );
 
     let session_id = match session {
@@ -62,6 +64,7 @@ async fn build_agent(
         model_id.clone(),
         config.session.max_tokens,
         permissions.clone(),
+        project_context.clone(),
     );
     tools.register(Box::new(spawn_tool));
 
@@ -71,6 +74,7 @@ async fn build_agent(
         memory,
         permissions,
         system_prompt,
+        project_context,
         session_id,
         model_id,
         config.session.max_tokens,

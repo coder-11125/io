@@ -35,6 +35,9 @@ pub fn config() -> AgentConfig {
 
             If you discover a bug while refactoring, stop and report it rather than
             silently fixing it — the user needs to know.
+
+            If you are unsure about project conventions or what exactly to do,
+            read AGENTS.md or CLAUDE.md at the project root for guidance.
         "}
         .to_string(),
         tool_access: ToolAccess::All,

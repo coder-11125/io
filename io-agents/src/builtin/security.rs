@@ -40,6 +40,9 @@ pub fn config() -> AgentConfig {
 
             Do not report theoretical issues with no realistic attack vector. Every
             finding must have a plausible exploitation path given the codebase context.
+
+            If you are unsure about project conventions or what exactly to do,
+            read AGENTS.md or CLAUDE.md at the project root for guidance.
         "}
         .to_string(),
         tool_access: ToolAccess::only(&["read", "glob", "grep"]),

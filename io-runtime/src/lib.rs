@@ -16,3 +16,24 @@ pub use pricing::{
 };
 pub use tools::SpawnAgentTool;
 pub use types::{Session, SessionId};
+
+/// Read `AGENTS.md` and `CLAUDE.md` from the project root and return their
+/// contents as a `<project-context>` block. Returns `None` if neither exists.
+pub fn load_project_context(root: &std::path::Path) -> Option<String> {
+    let mut sections: Vec<String> = Vec::new();
+    for name in &["AGENTS.md", "CLAUDE.md"] {
+        if let Ok(content) = std::fs::read_to_string(root.join(name)) {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                sections.push(format!("### {name}\n\n{trimmed}"));
+            }
+        }
+    }
+    if sections.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "<project-context>\n{}\n</project-context>",
+        sections.join("\n\n")
+    ))
+}

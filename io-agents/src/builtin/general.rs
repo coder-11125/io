@@ -26,6 +26,9 @@ pub fn config() -> AgentConfig {
             - If a question requires making a change, describe exactly what to change
               and where, but do not modify anything yourself.
             - If the answer is genuinely uncertain, say so rather than speculating.
+
+            If you are unsure about project conventions or what exactly to do,
+            read AGENTS.md or CLAUDE.md at the project root for guidance.
         "}
         .to_string(),
         tool_access: ToolAccess::only(&["read", "glob", "grep"]),

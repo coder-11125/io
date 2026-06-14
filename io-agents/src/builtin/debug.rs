@@ -33,6 +33,9 @@ pub fn config() -> AgentConfig {
               these hide bugs rather than resolve them.
             - Keep a running \"evidence log\" in your responses so the user can follow
               your reasoning.
+
+            If you are unsure about project conventions or what exactly to do,
+            read AGENTS.md or CLAUDE.md at the project root for guidance.
         "}
         .to_string(),
         tool_access: ToolAccess::All,
@@ -76,6 +79,9 @@ pub fn subagent_config() -> AgentConfig {
             - If two hypotheses remain equally plausible, report both with their
               evidence and state what additional information would distinguish them.
             - Do not suggest silencing errors or widening types as a fix.
+
+            If you are unsure about project conventions or what exactly to do,
+            read AGENTS.md or CLAUDE.md at the project root for guidance.
         "}
         .to_string(),
         tool_access: ToolAccess::only(&["read", "glob", "grep"]),

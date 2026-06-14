@@ -73,6 +73,7 @@ pub struct Agent {
     memory: Arc<SessionStore>,
     permissions: Arc<PermissionChecker>,
     system_prompt: String,
+    project_context: Option<String>,
     max_tokens: u32,
     auto_compact: bool,
     cancel: Mutex<Arc<AtomicBool>>,
@@ -89,6 +90,7 @@ impl Agent {
         memory: SessionStore,
         permissions: Arc<PermissionChecker>,
         system_prompt: String,
+        project_context: Option<String>,
         session_id: Option<SessionId>,
         model_id: String,
         max_tokens: u32,
@@ -115,6 +117,7 @@ impl Agent {
             memory: Arc::new(memory),
             permissions,
             system_prompt,
+            project_context,
             max_tokens,
             auto_compact,
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
@@ -190,6 +193,25 @@ impl Agent {
             role: Role::System,
             content: vec![ContentBlock::Text { text: system_text }],
         }];
+
+        // Inject project context (AGENTS.md / CLAUDE.md) as a synthetic
+        // user/assistant exchange so it occupies a real context slot and is
+        // visible alongside the conversation history rather than buried in
+        // the system prompt.
+        if let Some(ref ctx) = self.project_context {
+            messages.push(Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: format!("<project-context>\n{ctx}\n</project-context>"),
+                }],
+            });
+            messages.push(Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text {
+                    text: "Understood. I'll use this project context to guide my work.".to_string(),
+                }],
+            });
+        }
 
         // Replay policy: prior turns are replayed as user/assistant text only.
         // Tool calls and results are deliberately dropped from history — they
