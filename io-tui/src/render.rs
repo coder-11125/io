@@ -138,6 +138,18 @@ pub const THEME_NAMES: &[&str] = &[
     "default", "ocean", "rose", "forest", "sunset", "mono", "breeze", "ink",
 ];
 
+/// Fixed per-agent accent colors — independent of the active theme.
+pub fn agent_color(name: &str) -> crossterm::style::Color {
+    use crossterm::style::Color;
+    match name {
+        "Builder" => Color::Cyan,
+        "Planner" => Color::Green,
+        "Debugger" => Color::Yellow,
+        "Refactor" => Color::Red,
+        _ => Color::Reset, // caller falls back to theme.accent
+    }
+}
+
 // ── TUI lifecycle ──────────────────────────────────────────────────────────────
 
 /// Enter TUI mode: switch to the alternate screen (hides shell history
@@ -214,41 +226,22 @@ pub fn render_scroll_view(
     }
 
     let n = lines.len();
-    let display_rows = content_h.saturating_sub(1); // row 0 = indicator bar
+    // Never scroll past the point where the first line is at the top of the
+    // content area — beyond that the screen would go blank.
+    let max_scroll = n.saturating_sub(content_h);
+    let scroll_offset = scroll_offset.min(max_scroll);
     let end = n.saturating_sub(scroll_offset);
-    let start = end.saturating_sub(display_rows);
+    let start = end.saturating_sub(content_h);
 
     for (i, line) in lines.range(start..end).enumerate() {
-        queue!(out, cursor::MoveTo(0, 1 + i as u16))?;
+        queue!(out, cursor::MoveTo(0, i as u16))?;
         if let Some(ansi) = line.strip_prefix('\x01') {
-            // Pre-rendered ANSI line — print as-is (no color override, no truncation).
             queue!(out, Print(ansi), ResetColor)?;
         } else {
             let s: String = line.chars().take(w as usize).collect();
             queue!(out, SetForegroundColor(theme.muted), Print(s), ResetColor)?;
         }
     }
-
-    // Indicator row at the top of the content area
-    let indicator = if start == 0 {
-        "── top of session ──  ↓ scroll down  ·  any key → live".to_string()
-    } else {
-        format!(
-            "↑ {} more lines  ·  ↓ scroll down  ·  any key → live",
-            start
-        )
-    };
-    let s: String = indicator
-        .chars()
-        .take(w.saturating_sub(4) as usize)
-        .collect();
-    queue!(
-        out,
-        cursor::MoveTo(2, 0),
-        SetForegroundColor(theme.accent),
-        Print(s),
-        ResetColor,
-    )?;
 
     out.flush()
 }
@@ -295,18 +288,24 @@ pub fn draw_prompt_bar(
         ResetColor,
     )?;
 
-    // Input row: accent bar + text
+    // Resolve agent color once — used for both ▌ bars and the agent name.
+    let name_color = {
+        let c = agent_color(agent_name);
+        if c == crossterm::style::Color::Reset { theme.accent } else { c }
+    };
+
+    // Input row: agent-colored bar + text
     execute!(
         std::io::stdout(),
         cursor::MoveTo(0, input_row),
         terminal::Clear(terminal::ClearType::CurrentLine),
-        SetForegroundColor(theme.accent),
+        SetForegroundColor(name_color),
         Print("▌ "),
         ResetColor,
         Print(input),
     )?;
 
-    // Status row: accent bar + agent info (left) + context usage + hint (right)
+    // Status row: agent-colored bar + agent info (left) + context usage + hint (right)
     let dot = " · ";
     let hint = "/commands";
     let ctx = format_context_info(input_tokens, context_window);
@@ -329,7 +328,7 @@ pub fn draw_prompt_bar(
         std::io::stdout(),
         cursor::MoveTo(0, status_row),
         terminal::Clear(terminal::ClearType::CurrentLine),
-        SetForegroundColor(theme.accent),
+        SetForegroundColor(name_color),
         Print("▌ "),
         Print(agent_name),
         SetForegroundColor(theme.muted),
@@ -720,34 +719,21 @@ pub fn draw_splash(
 
     execute!(out, terminal::Clear(terminal::ClearType::All))?;
 
-    let logo_w = IO_LOGO.iter().map(|l| l.len()).max().unwrap_or(0) as u16;
+    // Use char count, not byte length — █ is 3 bytes but 1 display column.
+    let logo_w = IO_LOGO.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
     let logo_h = IO_LOGO.len() as u16;
 
     let box_w = (w * 2 / 3).clamp(52, 90);
     let inner_w = box_w.saturating_sub(2) as usize;
 
-    const DROP_CMDS: &[(&str, &str)] = &[
-        ("/help", "show all commands"),
-        ("/new", "start new session"),
-        ("/agent", "switch agent"),
-        ("/model", "switch model"),
-        ("/theme", "change color theme"),
-        ("/compact", "compact context"),
-        ("/cost", "session token cost"),
-        ("/exit", "end session"),
-    ];
-    let n_cmds = DROP_CMDS.len() as u16;
-    // unified box rows: ╭╮ + input + status + ├┤ + cmds + ╰╯  = n_cmds + 5
-    let box_full = n_cmds + 5;
     let box_small = 4u16; // ╭╮ + input + status + ╰╯
-    let show_drop = h >= logo_h + 2 + box_full;
-
-    let block_h = logo_h + 2 + if show_drop { box_full } else { box_small };
+    let block_h = logo_h + 2 + box_small;
     let start_y = h.saturating_sub(block_h) / 2;
     let box_y = start_y + logo_h + 2;
 
-    let logo_x = w.saturating_sub(logo_w) / 2;
     let box_x = w.saturating_sub(box_w) / 2;
+    // Center logo over the box, not the full terminal width.
+    let logo_x = box_x + (box_w.saturating_sub(logo_w)) / 2;
 
     // Logo
     for (i, line) in IO_LOGO.iter().enumerate() {
@@ -762,7 +748,7 @@ pub fn draw_splash(
 
     let input_row = box_y + 1;
     let status_row = box_y + 2;
-    let bottom_row = box_y + if show_drop { box_full } else { box_small } - 1;
+    let bottom_row = box_y + box_small - 1;
 
     // ── Unified rounded box ────────────────────────────────────────────────────
     execute!(
@@ -782,46 +768,6 @@ pub fn draw_splash(
             Print("│"),
             ResetColor,
         )?;
-    }
-    if show_drop {
-        use crossterm::style::{Attribute, SetAttribute};
-        let sep_row = box_y + 3;
-        // ├─ commands ──────────────────────────────────────────────────────────┤
-        let title = " commands ";
-        let sep_dashes = inner_w.saturating_sub(title.len() + 1);
-        execute!(
-            out,
-            cursor::MoveTo(box_x, sep_row),
-            SetForegroundColor(theme.muted),
-            Print(format!("├─{}{}┤", title, "─".repeat(sep_dashes))),
-            ResetColor,
-        )?;
-        let name_w = 10usize; // "/compact" = 8 + 2 spaces padding
-        for (i, (cmd, desc)) in DROP_CMDS.iter().enumerate() {
-            let row = sep_row + 1 + i as u16;
-            let name_padded = format!("{:<width$}", cmd, width = name_w);
-            let desc_avail = inner_w.saturating_sub(name_w + 3);
-            let desc_str: String = format!("  {}", desc).chars().take(desc_avail).collect();
-            let fill = inner_w.saturating_sub(2 + name_w + desc_str.chars().count());
-            execute!(
-                out,
-                cursor::MoveTo(box_x, row),
-                SetForegroundColor(theme.muted),
-                Print("│"),
-                Print("  "),
-                SetAttribute(Attribute::Bold),
-                SetForegroundColor(theme.accent),
-                Print(&name_padded),
-                SetAttribute(Attribute::Reset),
-                ResetColor,
-                SetForegroundColor(theme.muted),
-                Print(&desc_str),
-                Print(format!("{:fill$}", "")),
-                SetForegroundColor(theme.muted),
-                Print("│"),
-                ResetColor,
-            )?;
-        }
     }
     execute!(
         out,
@@ -1019,11 +965,19 @@ fn draw_splash_status_at(
     }
     let model_display = &model_id[..end];
 
+    let name_color = {
+        let c = agent_color(agent_name);
+        if c == crossterm::style::Color::Reset {
+            theme.accent
+        } else {
+            c
+        }
+    };
     execute!(
         out,
         cursor::MoveTo(box_x + 1, row),
         Print("  "),
-        SetForegroundColor(theme.accent),
+        SetForegroundColor(name_color),
         Print(agent_name),
         SetForegroundColor(theme.muted),
         Print(sep),

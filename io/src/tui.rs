@@ -8,8 +8,7 @@ use io_tui::picker;
 use io_tui::readline;
 use io_tui::render::{
     clear_prompt_input, draw_prompt_bar, enter_tui, exit_tui, prepare_streaming,
-    render_scroll_view, render_thoughts, render_tool_done, render_tool_start, tool_detail,
-    PROMPT_BAR_HEIGHT,
+    render_scroll_view, render_tool_done, render_tool_start, tool_detail, PROMPT_BAR_HEIGHT,
 };
 use std::io::Write;
 
@@ -205,19 +204,7 @@ pub async fn run_single_shot(prompt: &str) -> anyhow::Result<()> {
 
 // ── Slash commands (for TUI completion popup) ──────────────────────────────────
 
-const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/help", "Show available commands"),
-    ("/new", "Start a new session"),
-    ("/agent", "Switch agent mode"),
-    ("/connect", "Set up a provider"),
-    ("/model", "Switch model"),
-    ("/theme", "Switch UI theme"),
-    ("/cost", "Show API cost for current session"),
-    ("/compact", "Summarize and compress conversation history"),
-    ("/exit", "Exit"),
-    ("/quit", "Exit"),
-    ("/q", "Exit"),
-];
+use io_tui::SLASH_COMMANDS;
 
 fn filter_slash_commands(buf: &str) -> Vec<usize> {
     if buf.is_empty() || !buf.starts_with('/') {
@@ -379,7 +366,9 @@ fn draw_slash_popup(matches: &[usize], selected: Option<usize>) -> std::io::Resu
     let total_rows = n as u16 + 2;
     let top_row = h.saturating_sub(PROMPT_BAR_HEIGHT + total_rows);
 
-    clear_rows_above(total_rows)?;
+    // Clear the maximum possible popup height so a previously larger popup
+    // doesn't leave ghost rows when the match list shrinks.
+    clear_rows_above(MAX_POPUP_ROWS + 2)?;
 
     // Top border
     execute!(
@@ -524,11 +513,17 @@ fn tui_read_line(
                         let n = line_buf.lock().unwrap().len();
                         scroll_offset = scroll_offset.saturating_add(SCROLL_STEP).min(n);
                         render_scroll_view(&line_buf.lock().unwrap(), scroll_offset, theme)?;
+                        crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide)?;
                     }
                     MouseEventKind::ScrollDown if scroll_offset > 0 => {
                         scroll_offset = scroll_offset.saturating_sub(SCROLL_STEP);
                         render_scroll_view(&line_buf.lock().unwrap(), scroll_offset, theme)?;
-                        bar(&buf, *tab_current)?;
+                        if scroll_offset == 0 {
+                            bar(&buf, *tab_current)?;
+                            crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
+                        } else {
+                            crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide)?;
+                        }
                     }
                     _ => {}
                 }
@@ -543,6 +538,7 @@ fn tui_read_line(
                     scroll_offset = 0;
                     render_scroll_view(&line_buf.lock().unwrap(), scroll_offset, theme)?;
                     bar(&buf, *tab_current)?;
+                    crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
                 }
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
@@ -812,62 +808,115 @@ fn splash_read_line(
     };
 
     let mut buf = String::new();
+    let mut slash_matches: Vec<usize> = Vec::new();
+    let mut slash_selected: Option<usize> = None;
+    let mut popup_rows: u16 = 0;
 
-    let agent_name = full_agents
-        .get(*tab_current)
-        .map(|a| a.name)
-        .unwrap_or("build");
-    let mut layout =
-        io_tui::render::draw_splash(&buf, agent_name, agent.provider_id, &agent.model_id, theme)?;
+    let splash_name = |tc: usize| -> &str {
+        full_agents.get(tc).map(|a| a.name).unwrap_or("build")
+    };
+
+    let mut layout = io_tui::render::draw_splash(
+        &buf,
+        splash_name(*tab_current),
+        agent.provider_id,
+        &agent.model_id,
+        theme,
+    )?;
     let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf);
     execute!(std::io::stdout(), cursor::MoveTo(cx, cy), cursor::Show)?;
 
     loop {
         match event::read()? {
             Event::Resize(_, _) => {
-                let name = full_agents
-                    .get(*tab_current)
-                    .map(|a| a.name)
-                    .unwrap_or("build");
                 layout = io_tui::render::draw_splash(
                     &buf,
-                    name,
+                    splash_name(*tab_current),
                     agent.provider_id,
                     &agent.model_id,
                     theme,
                 )?;
+                if !slash_matches.is_empty() {
+                    popup_rows = draw_slash_popup(&slash_matches, slash_selected)?;
+                }
                 let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf);
                 execute!(std::io::stdout(), cursor::MoveTo(cx, cy), cursor::Show)?;
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                        clear_rows_above(popup_rows)?;
                         execute!(std::io::stdout(), cursor::Hide)?;
                         return Ok(None);
                     }
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                         buf.clear();
+                        slash_matches.clear();
+                        slash_selected = None;
+                        clear_rows_above(popup_rows)?;
+                        popup_rows = 0;
                         io_tui::render::splash_update_input(&layout, &buf, theme)?;
                         let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
                     }
-                    (KeyCode::Enter, _) if !buf.trim().is_empty() => {
-                        execute!(std::io::stdout(), cursor::Hide)?;
-                        return Ok(Some(buf));
+                    (KeyCode::Enter, _) => {
+                        if let Some(s) = slash_selected {
+                            if s < slash_matches.len() {
+                                buf = SLASH_COMMANDS[slash_matches[s]].0.to_string();
+                            }
+                        }
+                        clear_rows_above(popup_rows)?;
+                        if !buf.trim().is_empty() {
+                            execute!(std::io::stdout(), cursor::Hide)?;
+                            return Ok(Some(buf));
+                        }
                     }
-                    (KeyCode::Enter, _) => {}
+                    (KeyCode::Esc, _) if !slash_matches.is_empty() => {
+                        slash_matches.clear();
+                        slash_selected = None;
+                        clear_rows_above(popup_rows)?;
+                        popup_rows = 0;
+                        io_tui::render::splash_update_input(&layout, &buf, theme)?;
+                        let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf);
+                        execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
+                    }
                     (KeyCode::Backspace, _) => {
                         buf.pop();
+                        slash_matches = filter_slash_commands(&buf);
+                        slash_selected = None;
+                        if !slash_matches.is_empty() {
+                            popup_rows = draw_slash_popup(&slash_matches, slash_selected)?;
+                        } else {
+                            clear_rows_above(popup_rows)?;
+                            popup_rows = 0;
+                        }
                         io_tui::render::splash_update_input(&layout, &buf, theme)?;
                         let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
                     }
-                    (KeyCode::Tab, _) if !full_agents.is_empty() => {
+                    (KeyCode::Tab, _) | (KeyCode::Down, _) if !slash_matches.is_empty() => {
+                        slash_selected = Some(match slash_selected {
+                            None => 0,
+                            Some(s) => (s + 1) % slash_matches.len(),
+                        });
+                        popup_rows = draw_slash_popup(&slash_matches, slash_selected)?;
+                        let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf);
+                        execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
+                    }
+                    (KeyCode::Up, _) if !slash_matches.is_empty() => {
+                        slash_selected = Some(match slash_selected {
+                            None | Some(0) => slash_matches.len() - 1,
+                            Some(s) => s - 1,
+                        });
+                        popup_rows = draw_slash_popup(&slash_matches, slash_selected)?;
+                        let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf);
+                        execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
+                    }
+                    (KeyCode::Tab, _) if buf.is_empty() && !full_agents.is_empty() => {
                         *tab_current = (*tab_current + 1) % full_agents.len();
-                        let name = full_agents[*tab_current].name;
                         io_tui::render::splash_update_status(
                             &layout,
-                            name,
+                            splash_name(*tab_current),
                             agent.provider_id,
                             &agent.model_id,
                             theme,
@@ -877,6 +926,14 @@ fn splash_read_line(
                     }
                     (KeyCode::Char(c), _) => {
                         buf.push(c);
+                        slash_matches = filter_slash_commands(&buf);
+                        slash_selected = None;
+                        if !slash_matches.is_empty() {
+                            popup_rows = draw_slash_popup(&slash_matches, slash_selected)?;
+                        } else {
+                            clear_rows_above(popup_rows)?;
+                            popup_rows = 0;
+                        }
                         io_tui::render::splash_update_input(&layout, &buf, theme)?;
                         let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
@@ -1316,6 +1373,10 @@ pub async fn run_interactive(
         let streaming_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let streaming_done2 = streaming_done.clone();
         let (esc_tx, esc_rx) = tokio::sync::oneshot::channel::<()>();
+        // Shared scroll offset so the key listener can scroll during streaming.
+        let stream_scroll = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stream_scroll2 = stream_scroll.clone();
+        let line_buf_scroll = line_buf.clone();
         let key_listener = tokio::task::spawn_blocking(move || {
             use crossterm::event;
             use io_runtime::PermissionReply;
@@ -1365,6 +1426,33 @@ pub async fn run_interactive(
                                 break;
                             }
                         }
+                        Ok(crossterm::event::Event::Mouse(m)) => {
+                            let cur =
+                                stream_scroll2.load(std::sync::atomic::Ordering::Relaxed);
+                            let n = line_buf_scroll.lock().unwrap().len();
+                            let next = match m.kind {
+                                crossterm::event::MouseEventKind::ScrollUp => {
+                                    (cur + SCROLL_STEP).min(n)
+                                }
+                                crossterm::event::MouseEventKind::ScrollDown if cur > 0 => {
+                                    cur.saturating_sub(SCROLL_STEP)
+                                }
+                                _ => cur,
+                            };
+                            if next != cur {
+                                stream_scroll2
+                                    .store(next, std::sync::atomic::Ordering::Relaxed);
+                                let _ = io_tui::render::render_scroll_view(
+                                    &line_buf_scroll.lock().unwrap(),
+                                    next,
+                                    &theme,
+                                );
+                                let _ = crossterm::execute!(
+                                    std::io::stdout(),
+                                    crossterm::cursor::Hide
+                                );
+                            }
+                        }
                         Ok(crossterm::event::Event::Resize(_, _)) => {
                             let _ = io_tui::render::handle_resize();
                         }
@@ -1391,9 +1479,33 @@ pub async fn run_interactive(
         if turn_input_tokens > last_input_tokens {
             last_input_tokens = turn_input_tokens;
         }
+        // Push thoughts into the scroll buffer so they appear in the clean re-render.
         if let Some(ref t) = agent_thoughts {
-            render_thoughts(t);
+            let trimmed = t.trim();
+            if !trimmed.is_empty() {
+                push_line(&line_buf, String::new());
+                let prefix = "(thought): ";
+                let indent = " ".repeat(prefix.len());
+                let mut thought_lines = trimmed.lines();
+                if let Some(first) = thought_lines.next() {
+                    push_line(
+                        &line_buf,
+                        format!("\x01\x1b[36m{prefix}\x1b[90m{first}\x1b[0m"),
+                    );
+                    for line in thought_lines {
+                        push_line(
+                            &line_buf,
+                            format!("\x01{indent}\x1b[90m{line}\x1b[0m"),
+                        );
+                    }
+                }
+                push_line(&line_buf, String::new());
+            }
         }
+        // Re-render the content area from the structured line buffer so the clean
+        // "> prompt / tool tree / markdown" view is visible immediately after each
+        // turn — not only after scrolling up and back down.
+        render_scroll_view(&line_buf.lock().unwrap(), 0, &theme)?;
         draw_prompt_bar(
             "",
             current_agent.name,
@@ -1492,7 +1604,16 @@ fn process_ev(
         AgentEvent::Thinking(delta) => {
             think.push_str(&delta);
         }
-        AgentEvent::ToolStart { name, input } => render_tool_start(&name, &input),
+        AgentEvent::ToolStart { name, input } => {
+            render_tool_start(&name, &input);
+            let detail = tool_detail(&name, &input);
+            let entry = if detail.is_empty() {
+                format!("  ╭ {name}")
+            } else {
+                format!("  ╭ {name}  {detail}")
+            };
+            push_line(line_buf, entry);
+        }
         AgentEvent::ToolDone {
             name,
             output,
@@ -1500,7 +1621,7 @@ fn process_ev(
         } => {
             render_tool_done(&name, &output, success, &theme);
             let icon = if success { "✓" } else { "✗" };
-            push_line(line_buf, format!("  ├ {}  {}", name, icon));
+            push_line(line_buf, format!("  ╰ {name}  {icon}"));
         }
         AgentEvent::PermissionRequest {
             name,
