@@ -581,6 +581,49 @@ pub fn render_tool_start(name: &str, input: &serde_json::Value) {
     let _ = std::io::stdout().flush();
 }
 
+const MAX_TOOL_OUTPUT_LINES: usize = 20;
+const MAX_TOOL_LINE_CHARS: usize = 160;
+
+fn render_text_output(output: &str) {
+    use crossterm::{
+        execute,
+        style::{Color, Print, ResetColor, SetForegroundColor},
+    };
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let truncated = lines.len() > MAX_TOOL_OUTPUT_LINES;
+    for line in lines.iter().take(MAX_TOOL_OUTPUT_LINES) {
+        let s: String = line
+            .trim_end_matches('\r')
+            .chars()
+            .take(MAX_TOOL_LINE_CHARS)
+            .collect();
+        let _ = execute!(
+            std::io::stdout(),
+            SetForegroundColor(Color::DarkGrey),
+            Print(format!("    {s}\r\n")),
+            ResetColor,
+        );
+    }
+    if truncated {
+        let remaining = lines.len() - MAX_TOOL_OUTPUT_LINES;
+        let _ = execute!(
+            std::io::stdout(),
+            SetForegroundColor(Color::DarkGrey),
+            Print(format!(
+                "    … {} more line{}\r\n",
+                remaining,
+                if remaining == 1 { "" } else { "s" }
+            )),
+            ResetColor,
+        );
+    }
+    let _ = std::io::stdout().flush();
+}
+
 pub fn render_tool_done(name: &str, output: &str, success: bool, theme: &Theme) {
     if !success {
         use crossterm::style::Stylize;
@@ -590,6 +633,7 @@ pub fn render_tool_done(name: &str, output: &str, success: bool, theme: &Theme) 
     }
     match name {
         "write" | "edit" => render_diff(output, theme),
+        "bash" | "read" | "grep" | "glob" => render_text_output(output),
         _ => {}
     }
 }

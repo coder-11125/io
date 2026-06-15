@@ -154,7 +154,14 @@ fn read_at_path(path: &str) -> Option<String> {
     let p = std::path::Path::new(clean);
 
     if p.is_dir() {
-        let entries = std::fs::read_dir(p).ok()?;
+        let entries = match std::fs::read_dir(p) {
+            Ok(e) => e,
+            Err(err) => {
+                return Some(format!(
+                    "<file path=\"{path}\">\n[error reading directory: {err}]\n</file>"
+                ))
+            }
+        };
         let mut lines: Vec<String> = entries
             .filter_map(|e| e.ok())
             .map(|e| {
@@ -173,7 +180,14 @@ fn read_at_path(path: &str) -> Option<String> {
             lines.join("\n")
         ))
     } else if p.is_file() {
-        let raw = std::fs::read(p).ok()?;
+        let raw = match std::fs::read(p) {
+            Ok(r) => r,
+            Err(err) => {
+                return Some(format!(
+                    "<file path=\"{path}\">\n[error reading file: {err}]\n</file>"
+                ))
+            }
+        };
         if raw.len() > MAX_AT_FILE_BYTES {
             return Some(format!(
                 "<file path=\"{path}\">\n[file too large to inline ({} bytes)]\n</file>",
@@ -183,7 +197,9 @@ fn read_at_path(path: &str) -> Option<String> {
         let text = String::from_utf8_lossy(&raw);
         Some(format!("<file path=\"{path}\">\n{text}\n</file>"))
     } else {
-        None
+        Some(format!(
+            "<file path=\"{path}\">\n[not found: '{path}']\n</file>"
+        ))
     }
 }
 
@@ -1356,19 +1372,48 @@ pub async fn run_interactive(
             _ if input.starts_with('!') => {
                 let cmd = input[1..].trim();
                 let output = run_bash(cmd).await;
-                // Show bash output at bottom of scroll region
+                prepare_streaming()?;
                 {
-                    let (_, h) = crossterm::terminal::size()?;
-                    let row = h.saturating_sub(PROMPT_BAR_HEIGHT + 1);
-                    use crossterm::{cursor, execute, style::Print, terminal};
-                    execute!(
-                        std::io::stdout(),
-                        cursor::MoveTo(0, row),
-                        terminal::Clear(crossterm::terminal::ClearType::UntilNewLine),
-                        Print(output),
-                    )?;
+                    use crossterm::{
+                        execute,
+                        style::{Color, Print, ResetColor, SetForegroundColor},
+                    };
+                    const MAX_LINES: usize = 50;
+                    const MAX_CHARS: usize = 200;
+                    let lines: Vec<&str> = output.lines().collect();
+                    let truncated = lines.len() > MAX_LINES;
+                    for line in lines.iter().take(MAX_LINES) {
+                        let s: String = line
+                            .trim_end_matches('\r')
+                            .chars()
+                            .take(MAX_CHARS)
+                            .collect();
+                        execute!(
+                            std::io::stdout(),
+                            SetForegroundColor(Color::DarkGrey),
+                            Print(format!("  {s}\r\n")),
+                            ResetColor,
+                        )?;
+                        push_line(&line_buf, format!("  {s}"));
+                    }
+                    if truncated {
+                        let remaining = lines.len() - MAX_LINES;
+                        let msg = format!(
+                            "  … {} more line{}",
+                            remaining,
+                            if remaining == 1 { "" } else { "s" }
+                        );
+                        execute!(
+                            std::io::stdout(),
+                            SetForegroundColor(Color::DarkGrey),
+                            Print(format!("{msg}\r\n")),
+                            ResetColor,
+                        )?;
+                        push_line(&line_buf, msg);
+                    }
                     std::io::stdout().flush()?;
                 }
+                render_scroll_view(&line_buf.lock().unwrap(), 0, &theme)?;
                 continue;
             }
             _ => {}

@@ -2,7 +2,7 @@
 
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind},
     queue,
     style::{Color, Print, ResetColor, SetForegroundColor, Stylize},
     terminal::{self, ClearType},
@@ -496,7 +496,34 @@ fn input_loop(
     let mut popup_lines = redraw(stdout, &buf, slash_selected, 0, None, popup_capacity)?;
 
     loop {
-        let Event::Key(key) = event::read()? else {
+        let ev = event::read()?;
+        if let Event::Mouse(mouse) = &ev {
+            if file_all.is_some() && !file_filtered.is_empty() {
+                let new_sel = match mouse.kind {
+                    MouseEventKind::ScrollDown => file_selected
+                        .map(|s| (s + 1) % file_filtered.len())
+                        .unwrap_or(0),
+                    MouseEventKind::ScrollUp => match file_selected {
+                        None | Some(0) => file_filtered.len() - 1,
+                        Some(s) => s - 1,
+                    },
+                    _ => continue,
+                };
+                file_selected = Some(new_sel);
+                adjust_scroll(new_sel, &mut file_scroll, popup_capacity);
+                let fs = Some((file_filtered.as_slice(), file_selected, file_scroll));
+                popup_lines = redraw(
+                    stdout,
+                    &buf,
+                    slash_selected,
+                    popup_lines,
+                    fs,
+                    popup_capacity,
+                )?;
+            }
+            continue;
+        }
+        let Event::Key(key) = ev else {
             continue;
         };
         if key.kind == KeyEventKind::Release {
