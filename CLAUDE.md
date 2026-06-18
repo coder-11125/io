@@ -466,7 +466,7 @@ denied_commands = ["rm", "sudo"]
 
 ### Theme System (io/src/render.rs + io/src/theme.rs)
 
-The terminal has 8 built-in themes with configurable accent colors and dark/light
+The terminal has 12 built-in themes with configurable accent colors and dark/light
 modes. Each theme defines:
 - `accent` — primary color (logo, status bar, highlights)
 - `muted` — secondary color (borders, dots, hints)
@@ -484,9 +484,18 @@ modes. Each theme defines:
 | `mono` | dark | White |
 | `breeze` | light | DarkCyan |
 | `ink` | light | DarkBlue |
+| `dawn` | light | DarkRed |
+| `sand` | light | DarkYellow |
+| `mint` | light | DarkGreen |
+| `dusk` | light | DarkMagenta |
 
 The active theme is persisted in `~/.io/config.toml` via the `theme` key.
 Switch with `/theme` in the REPL or `io config set theme <name>`.
+
+**Theme-aware rendering**: `render_thoughts(thoughts, theme)` uses `theme.accent` for
+the `(thought):` prefix and `theme.muted` for the body. The `ansi_fg(Color) -> String`
+helper in `render.rs` converts any crossterm `Color` to its ANSI foreground escape
+sequence — used to embed theme colors into pre-rendered lines stored in the scroll buffer.
 
 ## CLI Implementation Details
 
@@ -551,6 +560,8 @@ The interactive REPL uses an alternate-screen TUI with:
 
 - **Splash screen**: Centered logo, input box with placeholder, agent/model/provider
   status line, commands reference, cwd/version footer. Agent cycling with Tab.
+  Long input is truncated with `…` so text never overflows the box border;
+  `splash_cursor` accounts for the truncation offset.
 - **Fixed prompt bar** (bottom 3 rows): Thin separator, `▌`-accented input line,
   status row with `agent · model · provider` and context usage info (`X% used · Y rem · Z ctx`).
 - **Scrollback**: Mouse scroll-wheel navigates session history; any key returns to live.

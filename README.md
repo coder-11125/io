@@ -23,7 +23,7 @@
 - **7 built-in tools** — `read`, `write`, `edit`, `bash`, `glob`, `grep`, `spawn_agent` for full codebase interaction
 - **Cost tracking** — Built-in API cost calculation with `/cost` command for supported providers
 - **Interactive & single-shot modes** — Full-screen REPL with splash screen, prompt bar, and scrollback
-- **Color themes** — 8 built-in themes (dark/light) with live `/theme` switcher
+- **Color themes** — 12 built-in themes (dark/light) with live `/theme` switcher
 - **Permission sandbox** — Allow/deny/prompt modes with granular bash command control and security-hardened command validation
 - **Session persistence** — SQLite-backed conversation history, resume anytime
 - **Streaming responses** — Real-time token-by-token streaming with live indicator
@@ -113,7 +113,7 @@ Launches an interactive session with a streaming agent loop. Commands:
 | `/agent` | Switch agent mode (build, plan, debug, refactor) |
 | `/connect` | Set up a provider interactively (with live model fetching) |
 | `/model` | Switch between configured providers |
-| `/theme` | Switch UI color theme (8 themes) |
+| `/theme` | Switch UI color theme (12 themes) |
 | `/cost` | Show API cost summary for the current session |
 | `/compact` | Summarize and compress conversation history |
 | `/exit`, `/quit`, `/q` | Exit the session |
@@ -125,7 +125,9 @@ Type `@path/to/file` to expand file or directory contents inline.
 The TUI features a splash screen with centered logo and command reference,
 a fixed prompt bar at the bottom showing agent/model/provider and context usage,
 mouse scrollback through session history, and streaming tool call visualization
-with syntax-colored diffs.
+with syntax-colored diffs. Long splash input is automatically truncated with `…`
+so it never overflows the input box border. Thought blocks are rendered in the
+active theme's accent and muted colors.
 
 ### Single-shot
 
@@ -184,7 +186,7 @@ default = "prompt"       # "allow" | "deny" | "prompt"
 allowed_commands = []
 denied_commands = ["rm", "sudo"]
 
-# Optional: theme = "ocean"  (default, ocean, rose, forest, sunset, mono, breeze, ink)
+# Optional: theme = "ocean"  (default, ocean, rose, forest, sunset, mono, breeze, ink, dawn, sand, mint, dusk)
 ```
 
 ### API Keys

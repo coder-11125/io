@@ -4,6 +4,8 @@
 use std::io::Write;
 
 pub const PROMPT_BAR_HEIGHT: u16 = 3;
+/// Maximum input lines before the prompt stops growing (capped at this height).
+pub const MAX_INPUT_LINES: u16 = 5;
 
 // ── Theme ──────────────────────────────────────────────────────────────────────
 
@@ -29,6 +31,16 @@ pub struct Theme {
     pub diff_add_prefix: &'static str,
     /// Single display-width char used as the deletion prefix symbol.
     pub diff_del_prefix: &'static str,
+    /// Inline code / code block foreground color.
+    pub code_fg: crossterm::style::Color,
+    /// Bold text and heading foreground color.
+    pub bold_fg: crossterm::style::Color,
+    /// Italic text foreground color.
+    pub italic_fg: crossterm::style::Color,
+    /// Tool name badge foreground color.
+    pub tool_tag_fg: crossterm::style::Color,
+    /// Tool name badge background color.
+    pub tool_tag_bg: crossterm::style::Color,
 }
 
 pub fn get_theme(name: &str) -> Theme {
@@ -45,6 +57,11 @@ pub fn get_theme(name: &str) -> Theme {
             diff_del_bg: Color::Black,
             diff_add_prefix: "▶",
             diff_del_prefix: "◀",
+            code_fg: Color::Cyan,
+            bold_fg: Color::Blue,
+            italic_fg: Color::Grey,
+            tool_tag_fg: Color::Black,
+            tool_tag_bg: Color::DarkBlue,
         },
         "rose" => Theme {
             name: "rose",
@@ -57,6 +74,11 @@ pub fn get_theme(name: &str) -> Theme {
             diff_del_bg: Color::Black,
             diff_add_prefix: "◆",
             diff_del_prefix: "◇",
+            code_fg: Color::Yellow,
+            bold_fg: Color::Magenta,
+            italic_fg: Color::Grey,
+            tool_tag_fg: Color::Black,
+            tool_tag_bg: Color::DarkMagenta,
         },
         "forest" => Theme {
             name: "forest",
@@ -69,6 +91,11 @@ pub fn get_theme(name: &str) -> Theme {
             diff_del_bg: Color::Black,
             diff_add_prefix: "+",
             diff_del_prefix: "-",
+            code_fg: Color::Cyan,
+            bold_fg: Color::Green,
+            italic_fg: Color::Grey,
+            tool_tag_fg: Color::Black,
+            tool_tag_bg: Color::DarkGreen,
         },
         "sunset" => Theme {
             name: "sunset",
@@ -81,6 +108,11 @@ pub fn get_theme(name: &str) -> Theme {
             diff_del_bg: Color::Black,
             diff_add_prefix: "›",
             diff_del_prefix: "‹",
+            code_fg: Color::Yellow,
+            bold_fg: Color::Yellow,
+            italic_fg: Color::DarkGrey,
+            tool_tag_fg: Color::Black,
+            tool_tag_bg: Color::DarkYellow,
         },
         "mono" => Theme {
             name: "mono",
@@ -93,6 +125,11 @@ pub fn get_theme(name: &str) -> Theme {
             diff_del_bg: Color::Black,
             diff_add_prefix: "+",
             diff_del_prefix: "-",
+            code_fg: Color::Grey,
+            bold_fg: Color::White,
+            italic_fg: Color::DarkGrey,
+            tool_tag_fg: Color::White,
+            tool_tag_bg: Color::DarkGrey,
         },
         // ── Light-terminal themes (Reset bg = terminal default, dark fg for contrast) ──
         "breeze" => Theme {
@@ -106,6 +143,11 @@ pub fn get_theme(name: &str) -> Theme {
             diff_del_bg: Color::Reset,
             diff_add_prefix: "+",
             diff_del_prefix: "-",
+            code_fg: Color::DarkYellow,
+            bold_fg: Color::DarkGreen,
+            italic_fg: Color::DarkGrey,
+            tool_tag_fg: Color::White,
+            tool_tag_bg: Color::DarkCyan,
         },
         "ink" => Theme {
             name: "ink",
@@ -118,6 +160,79 @@ pub fn get_theme(name: &str) -> Theme {
             diff_del_bg: Color::Reset,
             diff_add_prefix: "▶",
             diff_del_prefix: "◀",
+            code_fg: Color::DarkBlue,
+            bold_fg: Color::DarkBlue,
+            italic_fg: Color::DarkGrey,
+            tool_tag_fg: Color::White,
+            tool_tag_bg: Color::DarkBlue,
+        },
+        "dawn" => Theme {
+            name: "dawn",
+            dark: false,
+            accent: Color::DarkRed,
+            muted: Color::DarkGrey,
+            diff_add_fg: Color::DarkGreen,
+            diff_add_bg: Color::Reset,
+            diff_del_fg: Color::DarkRed,
+            diff_del_bg: Color::Reset,
+            diff_add_prefix: "+",
+            diff_del_prefix: "-",
+            code_fg: Color::DarkYellow,
+            bold_fg: Color::DarkRed,
+            italic_fg: Color::DarkGrey,
+            tool_tag_fg: Color::White,
+            tool_tag_bg: Color::DarkRed,
+        },
+        "sand" => Theme {
+            name: "sand",
+            dark: false,
+            accent: Color::DarkYellow,
+            muted: Color::DarkGrey,
+            diff_add_fg: Color::DarkGreen,
+            diff_add_bg: Color::Reset,
+            diff_del_fg: Color::DarkRed,
+            diff_del_bg: Color::Reset,
+            diff_add_prefix: "›",
+            diff_del_prefix: "‹",
+            code_fg: Color::DarkCyan,
+            bold_fg: Color::DarkYellow,
+            italic_fg: Color::DarkGrey,
+            tool_tag_fg: Color::White,
+            tool_tag_bg: Color::DarkYellow,
+        },
+        "mint" => Theme {
+            name: "mint",
+            dark: false,
+            accent: Color::DarkGreen,
+            muted: Color::DarkGrey,
+            diff_add_fg: Color::DarkGreen,
+            diff_add_bg: Color::Reset,
+            diff_del_fg: Color::DarkRed,
+            diff_del_bg: Color::Reset,
+            diff_add_prefix: "◆",
+            diff_del_prefix: "◇",
+            code_fg: Color::DarkCyan,
+            bold_fg: Color::DarkGreen,
+            italic_fg: Color::DarkGrey,
+            tool_tag_fg: Color::White,
+            tool_tag_bg: Color::DarkGreen,
+        },
+        "dusk" => Theme {
+            name: "dusk",
+            dark: false,
+            accent: Color::DarkMagenta,
+            muted: Color::DarkGrey,
+            diff_add_fg: Color::DarkGreen,
+            diff_add_bg: Color::Reset,
+            diff_del_fg: Color::DarkMagenta,
+            diff_del_bg: Color::Reset,
+            diff_add_prefix: "◆",
+            diff_del_prefix: "◇",
+            code_fg: Color::DarkBlue,
+            bold_fg: Color::DarkMagenta,
+            italic_fg: Color::DarkGrey,
+            tool_tag_fg: Color::White,
+            tool_tag_bg: Color::DarkMagenta,
         },
         _ => Theme {
             name: "default",
@@ -130,12 +245,18 @@ pub fn get_theme(name: &str) -> Theme {
             diff_del_bg: Color::DarkRed,
             diff_add_prefix: "+",
             diff_del_prefix: "-",
+            code_fg: Color::Yellow,
+            bold_fg: Color::Green,
+            italic_fg: Color::White,
+            tool_tag_fg: Color::Black,
+            tool_tag_bg: Color::DarkGrey,
         },
     }
 }
 
 pub const THEME_NAMES: &[&str] = &[
-    "default", "ocean", "rose", "forest", "sunset", "mono", "breeze", "ink",
+    "default", "breeze", "ocean", "ink", "rose", "dawn", "forest", "mint", "sunset", "sand",
+    "mono", "dusk",
 ];
 
 /// Fixed per-agent accent colors — independent of the active theme.
@@ -203,10 +324,12 @@ pub fn handle_resize() -> std::io::Result<()> {
 
 /// Render a page of session history from the line buffer.
 /// `scroll_offset` = how many lines from the bottom are currently hidden.
+/// `prompt_height` = current height of the prompt bar (default: `PROMPT_BAR_HEIGHT`).
 pub fn render_scroll_view(
     lines: &std::collections::VecDeque<String>,
     scroll_offset: usize,
     theme: &Theme,
+    prompt_height: u16,
 ) -> std::io::Result<()> {
     use crossterm::{
         cursor, queue,
@@ -214,7 +337,7 @@ pub fn render_scroll_view(
         terminal::{self, ClearType},
     };
     let (w, h) = terminal::size()?;
-    let content_h = h.saturating_sub(PROMPT_BAR_HEIGHT) as usize;
+    let content_h = h.saturating_sub(prompt_height) as usize;
     let mut out = std::io::stdout();
 
     for row in 0..content_h as u16 {
@@ -248,16 +371,18 @@ pub fn render_scroll_view(
 
 // ── Prompt bar ─────────────────────────────────────────────────────────────────
 
-/// Draw the fixed prompt bar at the bottom of the terminal.
+/// Draw the prompt bar at the bottom of the terminal.
 ///
-/// Layout (3 rows):
+/// Supports multiline input (newlines in `input`). Returns the actual height
+/// used: `input_lines + 2` (separator + input lines + status row).
+///
+/// Layout for N input lines:
 /// ```text
-/// ──────────────────────────────────────  ← thin separator
-/// ▌ user input text                        ← cyan accent + input
-/// ▌ Build · model · provider   8.7K /cmds  ← status + right info
+/// ──────────────────────────────  ← separator  (row h - N - 2)
+/// ▌ first line of input           ← accent bar  (row h - N - 1)
+///   second line …                 ← continuation (row h - N)
+/// ▌ Build · model   8.7K /cmds    ← status       (row h - 1)
 /// ```
-///
-/// Cursor is placed at the end of the input on the middle row.
 pub fn draw_prompt_bar(
     input: &str,
     agent_name: &str,
@@ -266,7 +391,7 @@ pub fn draw_prompt_bar(
     input_tokens: u32,
     context_window: u64,
     theme: &Theme,
-) -> std::io::Result<()> {
+) -> std::io::Result<u16> {
     use crossterm::{
         cursor, execute,
         style::{Print, ResetColor, SetForegroundColor},
@@ -274,15 +399,29 @@ pub fn draw_prompt_bar(
     };
 
     let (w, h) = crossterm::terminal::size()?;
-    let sep_row = h.saturating_sub(PROMPT_BAR_HEIGHT);
-    let input_row = sep_row + 1;
-    let status_row = sep_row + 2;
+
+    // Cap input lines so the prompt never consumes more than half the screen.
+    let raw_lines: Vec<&str> = input.split('\n').collect();
+    let n = (raw_lines.len() as u16).min(MAX_INPUT_LINES);
+    let input_lines = &raw_lines[..n as usize];
+    let prompt_height = n + 2; // separator + n input lines + status
+
+    // Always clear the maximum possible prompt area (MAX_INPUT_LINES + 2) so
+    // that shrinking the prompt (e.g. deleting a newline) doesn't leave stale rows.
+    let clear_from = h.saturating_sub(MAX_INPUT_LINES + 2);
+    execute!(
+        std::io::stdout(),
+        cursor::MoveTo(0, clear_from),
+        terminal::Clear(terminal::ClearType::FromCursorDown),
+    )?;
+
+    let sep_row = h.saturating_sub(prompt_height);
+    let status_row = h - 1;
 
     // Separator
     execute!(
         std::io::stdout(),
         cursor::MoveTo(0, sep_row),
-        terminal::Clear(terminal::ClearType::CurrentLine),
         SetForegroundColor(theme.muted),
         Print("─".repeat(w as usize)),
         ResetColor,
@@ -298,16 +437,28 @@ pub fn draw_prompt_bar(
         }
     };
 
-    // Input row: agent-colored bar + text
-    execute!(
-        std::io::stdout(),
-        cursor::MoveTo(0, input_row),
-        terminal::Clear(terminal::ClearType::CurrentLine),
-        SetForegroundColor(name_color),
-        Print("▌ "),
-        ResetColor,
-        Print(input),
-    )?;
+    // Input lines
+    for (i, line) in input_lines.iter().enumerate() {
+        let row = sep_row + 1 + i as u16;
+        execute!(std::io::stdout(), cursor::MoveTo(0, row))?;
+        if i == 0 {
+            execute!(
+                std::io::stdout(),
+                SetForegroundColor(name_color),
+                Print("▌ "),
+                ResetColor,
+                Print(line),
+            )?;
+        } else {
+            execute!(
+                std::io::stdout(),
+                SetForegroundColor(theme.muted),
+                Print("╎ "),
+                ResetColor,
+                Print(line),
+            )?;
+        }
+    }
 
     // Status row: agent-colored bar + agent info (left) + context usage + hint (right)
     let dot = " · ";
@@ -331,7 +482,6 @@ pub fn draw_prompt_bar(
     execute!(
         std::io::stdout(),
         cursor::MoveTo(0, status_row),
-        terminal::Clear(terminal::ClearType::CurrentLine),
         SetForegroundColor(name_color),
         Print("▌ "),
         Print(agent_name),
@@ -355,12 +505,15 @@ pub fn draw_prompt_bar(
         ResetColor,
     )?;
 
-    // Park cursor at end of input
+    // Park cursor at end of last input line (caller will reposition via move_prompt_cursor)
+    let last_row = sep_row + n;
+    let last_line_cols = input_lines.last().unwrap_or(&"").chars().count() as u16;
     execute!(
         std::io::stdout(),
-        cursor::MoveTo(2 + input.len() as u16, input_row),
+        cursor::MoveTo(2 + last_line_cols, last_row)
     )?;
-    std::io::stdout().flush()
+    std::io::stdout().flush()?;
+    Ok(prompt_height)
 }
 
 fn format_context_info(used: u32, window: u64) -> String {
@@ -382,7 +535,7 @@ fn format_context_info(used: u32, window: u64) -> String {
     } else {
         format!("{}K", remaining / 1_000)
     };
-    format!("{}% used · {}  rem · {} ctx", pct, rem_label, window_label)
+    format!("{}% used · {} rem · {} ctx", pct, rem_label, window_label)
 }
 
 /// Clear the input portion of the prompt bar (line after `> `) without
@@ -434,6 +587,33 @@ fn render_context_bar(input_tokens: u32, context_window: u64) -> String {
     )
 }
 
+/// Convert our crossterm Color (0.28) to the version termimad bundles (0.29).
+/// Both enums have identical named variants so the match is exhaustive for our palette.
+fn to_skin_color(c: crossterm::style::Color) -> termimad::crossterm::style::Color {
+    use termimad::crossterm::style::Color as TC;
+    match c {
+        crossterm::style::Color::Black => TC::Black,
+        crossterm::style::Color::DarkGrey => TC::DarkGrey,
+        crossterm::style::Color::Red => TC::Red,
+        crossterm::style::Color::DarkRed => TC::DarkRed,
+        crossterm::style::Color::Green => TC::Green,
+        crossterm::style::Color::DarkGreen => TC::DarkGreen,
+        crossterm::style::Color::Yellow => TC::Yellow,
+        crossterm::style::Color::DarkYellow => TC::DarkYellow,
+        crossterm::style::Color::Blue => TC::Blue,
+        crossterm::style::Color::DarkBlue => TC::DarkBlue,
+        crossterm::style::Color::Magenta => TC::Magenta,
+        crossterm::style::Color::DarkMagenta => TC::DarkMagenta,
+        crossterm::style::Color::Cyan => TC::Cyan,
+        crossterm::style::Color::DarkCyan => TC::DarkCyan,
+        crossterm::style::Color::White => TC::White,
+        crossterm::style::Color::Grey => TC::Grey,
+        crossterm::style::Color::Rgb { r, g, b } => TC::Rgb { r, g, b },
+        crossterm::style::Color::AnsiValue(v) => TC::AnsiValue(v),
+        _ => TC::Reset,
+    }
+}
+
 fn make_skin(theme: &Theme) -> termimad::MadSkin {
     use termimad::crossterm::style::Color;
     let mut skin = termimad::MadSkin::default();
@@ -448,11 +628,11 @@ fn make_skin(theme: &Theme) -> termimad::MadSkin {
     skin.table.align = termimad::Alignment::Left;
     skin.table.left_margin = 0;
 
-    let (code_fg, bold_fg, italic_fg) = if theme.dark {
-        (Color::Yellow, Color::Green, Color::White)
-    } else {
-        (Color::DarkYellow, Color::DarkGreen, Color::DarkGrey)
-    };
+    let (code_fg, bold_fg, italic_fg) = (
+        to_skin_color(theme.code_fg),
+        to_skin_color(theme.bold_fg),
+        to_skin_color(theme.italic_fg),
+    );
     skin.headers[0].set_fg(bold_fg);
     skin.headers[0].add_attr(termimad::crossterm::style::Attribute::Bold);
     skin.bold.set_fg(bold_fg);
@@ -471,10 +651,37 @@ pub fn render_markdown_lines(text: &str, theme: &Theme) -> Vec<String> {
     rendered.lines().map(|l| l.to_string()).collect()
 }
 
-pub fn render_thoughts(thoughts: &str) {
+/// Convert a crossterm Color to its ANSI foreground escape sequence.
+/// Used to embed theme colors into pre-rendered ANSI strings stored in the scroll buffer.
+pub fn ansi_fg(c: crossterm::style::Color) -> String {
+    use crossterm::style::Color;
+    match c {
+        Color::Reset => "\x1b[39m".to_string(),
+        Color::Black => "\x1b[30m".to_string(),
+        Color::DarkGrey => "\x1b[90m".to_string(),
+        Color::Red => "\x1b[91m".to_string(),
+        Color::DarkRed => "\x1b[31m".to_string(),
+        Color::Green => "\x1b[92m".to_string(),
+        Color::DarkGreen => "\x1b[32m".to_string(),
+        Color::Yellow => "\x1b[93m".to_string(),
+        Color::DarkYellow => "\x1b[33m".to_string(),
+        Color::Blue => "\x1b[94m".to_string(),
+        Color::DarkBlue => "\x1b[34m".to_string(),
+        Color::Magenta => "\x1b[95m".to_string(),
+        Color::DarkMagenta => "\x1b[35m".to_string(),
+        Color::Cyan => "\x1b[96m".to_string(),
+        Color::DarkCyan => "\x1b[36m".to_string(),
+        Color::White => "\x1b[97m".to_string(),
+        Color::Grey => "\x1b[37m".to_string(),
+        Color::Rgb { r, g, b } => format!("\x1b[38;2;{r};{g};{b}m"),
+        Color::AnsiValue(v) => format!("\x1b[38;5;{v}m"),
+    }
+}
+
+pub fn render_thoughts(thoughts: &str, theme: &Theme) {
     use crossterm::{
         execute,
-        style::{Color, Print, ResetColor, SetForegroundColor},
+        style::{Print, ResetColor, SetForegroundColor},
     };
     use std::io::stdout;
 
@@ -488,7 +695,7 @@ pub fn render_thoughts(thoughts: &str) {
 
     let _ = execute!(
         stdout(),
-        SetForegroundColor(Color::DarkCyan),
+        SetForegroundColor(theme.accent),
         Print(prefix),
         ResetColor,
     );
@@ -497,7 +704,7 @@ pub fn render_thoughts(thoughts: &str) {
     if let Some(first) = lines.next() {
         let _ = execute!(
             stdout(),
-            SetForegroundColor(Color::DarkGrey),
+            SetForegroundColor(theme.muted),
             Print(first),
             Print("\n"),
             ResetColor,
@@ -506,7 +713,7 @@ pub fn render_thoughts(thoughts: &str) {
             let _ = execute!(
                 stdout(),
                 Print(&indent),
-                SetForegroundColor(Color::DarkGrey),
+                SetForegroundColor(theme.muted),
                 Print(line),
                 Print("\n"),
                 ResetColor,
@@ -569,9 +776,11 @@ pub fn tool_detail(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
-pub fn render_tool_start(name: &str, input: &serde_json::Value) {
-    use crossterm::style::{Color, Stylize};
-    let label = format!(" {name} ").with(Color::Black).on(Color::DarkGrey);
+pub fn render_tool_start(name: &str, input: &serde_json::Value, theme: &Theme) {
+    use crossterm::style::Stylize;
+    let label = format!(" {name} ")
+        .with(theme.tool_tag_fg)
+        .on(theme.tool_tag_bg);
     let detail = tool_detail(name, input);
     if detail.is_empty() {
         print!("  {label}\r\n");
@@ -742,10 +951,62 @@ impl SplashLayout {
     }
 }
 
-/// Terminal column for the input cursor given the current buffer.
-pub fn splash_cursor(layout: &SplashLayout, buf: &str) -> (u16, u16) {
-    // box_x+1 (border) + 2 (prefix spaces) + buf
-    (layout.box_x + 3 + buf.len() as u16, layout.input_row)
+/// Truncate `buf` to fit inside the input box, prefixing with `…` when clipped.
+/// Returns the display string. Max visible chars = inner_w - 2 (for the "  " prefix).
+fn splash_buf_display(buf: &str, inner_w: usize) -> String {
+    let max_chars = inner_w.saturating_sub(2);
+    let total = buf.chars().count();
+    if total <= max_chars {
+        buf.to_string()
+    } else {
+        // Show the tail, with an ellipsis taking the first slot.
+        let skip = total - max_chars + 1;
+        let start = buf.char_indices().nth(skip).map(|(i, _)| i).unwrap_or(0);
+        format!("…{}", &buf[start..])
+    }
+}
+
+/// Terminal column for the input cursor given the current buffer and cursor byte position.
+pub fn splash_cursor(layout: &SplashLayout, buf: &str, cursor: usize) -> (u16, u16) {
+    let inner_w = layout.inner_w();
+    let max_chars = inner_w.saturating_sub(2);
+    let total_chars = buf.chars().count();
+    let cursor_chars = buf[..cursor.min(buf.len())].chars().count();
+    let col = if total_chars <= max_chars {
+        layout.box_x + 3 + cursor_chars as u16
+    } else {
+        let skip = total_chars - max_chars + 1;
+        if cursor_chars >= skip {
+            // +1 because the "…" occupies one display column
+            layout.box_x + 3 + 1 + (cursor_chars - skip) as u16
+        } else {
+            layout.box_x + 3 // cursor before the visible window — clamp to start
+        }
+    };
+    (col, layout.input_row)
+}
+
+/// Reposition the terminal cursor to the correct (col, row) within a
+/// possibly-multiline prompt input, given the current byte cursor position.
+pub fn move_prompt_cursor(input: &str, cursor_byte: usize) -> std::io::Result<()> {
+    use crossterm::{cursor, execute};
+    let (_, h) = crossterm::terminal::size()?;
+    let before = &input[..cursor_byte.min(input.len())];
+    let line_idx = before.chars().filter(|&c| c == '\n').count() as u16;
+    let col_text = before.rsplit('\n').next().unwrap_or("").chars().count() as u16;
+    let total_input_lines =
+        (input.chars().filter(|&c| c == '\n').count() as u16 + 1).min(MAX_INPUT_LINES);
+    let prompt_height = total_input_lines + 2;
+    let sep_row = h.saturating_sub(prompt_height);
+    let row = sep_row + 1 + line_idx.min(total_input_lines - 1);
+    execute!(std::io::stdout(), cursor::MoveTo(2 + col_text, row))
+}
+
+/// Set the terminal scroll region to protect `prompt_height` rows at the bottom.
+pub fn handle_resize_with_height(prompt_height: u16) -> std::io::Result<()> {
+    let (_, h) = crossterm::terminal::size()?;
+    set_scroll_region(1, h.saturating_sub(prompt_height));
+    Ok(())
 }
 
 /// Full redraw: logo + centered input box + cwd/version footer.
@@ -835,7 +1096,7 @@ pub fn draw_splash(
             ResetColor,
         )?;
     } else {
-        execute!(out, Print(buf))?;
+        execute!(out, Print(splash_buf_display(buf, inner_w)))?;
     }
 
     // Status line
@@ -940,7 +1201,7 @@ pub fn splash_update_input(layout: &SplashLayout, buf: &str, theme: &Theme) -> s
             ResetColor,
         )?;
     } else {
-        execute!(out, Print(buf))?;
+        execute!(out, Print(splash_buf_display(buf, layout.inner_w())))?;
     }
 
     out.flush()
