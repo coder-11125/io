@@ -6,7 +6,9 @@ mod agent;
 mod config_cmd;
 mod connect;
 mod cost;
+mod input;
 mod model;
+mod stream;
 mod tui;
 
 #[derive(Parser)]

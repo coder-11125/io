@@ -29,7 +29,9 @@ io/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs            # Entry point, CLI parsing, subcommand dispatch
-│       ├── tui.rs             # Interactive TUI + single-shot runner, streaming turn loop
+│       ├── tui.rs             # REPL orchestration: agent construction, slash command dispatch
+│       ├── input.rs           # Readline loops (REPL + splash), popup helpers, @file resolution
+│       ├── stream.rs          # Streaming event processing: ThinkParser, blink_and_print
 │       ├── cost.rs            # /cost report
 │       ├── config_cmd.rs      # `io config …` and `io init` handlers
 │       ├── agent.rs           # Agent switching (/agent command)
@@ -88,7 +90,7 @@ io/
 
 **io (CLI crate)**:
 - Command-line argument parsing with `clap`
-- Interactive TUI loop with streaming display (`tui.rs`)
+- Interactive TUI loop with streaming display (`tui.rs`, `input.rs`, `stream.rs`)
 - Provider/model switching commands
 - Session management commands
 - Configuration management commands
@@ -538,16 +540,26 @@ to the `PermissionChecker` when `agent_config.auto_allow_writes` is `true`.
 **@file mentions**: Typing `@path/to/file` expands the file or directory contents inline
 before sending to the LLM. Supports text files (up to 100KB) and directories (lists entries).
 
-### TUI Loop (io/src/tui.rs)
+### TUI Loop (io/src/tui.rs + input.rs + stream.rs)
 
-The interactive TUI:
+`tui.rs` is the REPL orchestrator — agent construction, slash command dispatch,
+the streaming turn loop, and `run_interactive` / `run_single_shot`. It is split
+into two focused helpers:
+
+- **`input.rs`** — `tui_read_line` (REPL) and `splash_read_line` (splash screen):
+  key event loops, cursor movement, bracketed paste, @file popups, slash-command
+  popups, `PasteBlock`, `resolve_at_mentions`.
+- **`stream.rs`** — `blink_and_print`, `process_ev`, `ThinkParser`, `push_line`,
+  and the shared `LineBuf` / `PendingPermission` types.
+
+The interactive REPL:
 
 1. Load/create session
 2. Initialize agent with provider, tools, permissions
 3. Enter read-eval-print loop:
-   - Read user input with custom readline
+   - Read user input via `tui_read_line` / `splash_read_line`
    - Handle slash commands (/help, /connect, /model, /cost, /exit)
-   - Execute agent turn with streaming
+   - Execute agent turn with streaming via `blink_and_print`
    - Display tool calls and results inline
    - Save session after each turn
 
@@ -656,7 +668,7 @@ mid-turn provider failure). Run with `cargo test`.
 | `provider/mod.rs` | retry classification by HTTP status, unknown-provider rejection, compat provider resolution, context-window tuning |
 | `config.rs` | default config, roundtrip serialization |
 | `pricing.rs` | cost calculation, known models, free/subscription/passthrough providers |
-| `io/src/tui.rs` | ThinkParser: plain text, think blocks, tags split across deltas, unterminated blocks, multibyte boundaries |
+| `io/src/stream.rs` | ThinkParser: plain text, think blocks, tags split across deltas, unterminated blocks, multibyte boundaries |
 
 ### CI
 

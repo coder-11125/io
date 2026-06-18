@@ -237,7 +237,9 @@ io/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs              # Entry point, CLI parsing, subcommand dispatch
-│       ├── tui.rs               # Interactive TUI + single-shot runner, streaming turn loop
+│       ├── tui.rs               # REPL orchestration: agent construction, slash command dispatch
+│       ├── input.rs             # Readline loops (REPL + splash), popup helpers, @file resolution
+│       ├── stream.rs            # Streaming event processing: ThinkParser, blink_and_print
 │       ├── cost.rs              # /cost report
 │       ├── config_cmd.rs        # `io config …` and `io init` handlers
 │       ├── agent.rs             # Agent switching (/agent command)
