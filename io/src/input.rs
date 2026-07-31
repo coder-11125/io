@@ -444,7 +444,7 @@ pub fn paste_display(buf: &str, cursor: usize, pb: Option<&PasteBlock>) -> (Stri
     match pb {
         None => (buf.to_string(), cursor),
         Some(p) => {
-            let display = format!("{}{}{}", &buf[..p.pos], &p.label, &buf[p.pos..]);
+            let display = format!("{}{}{}", &buf[..p.pos], p.label, &buf[p.pos..]);
             let dcursor = if cursor >= p.pos {
                 p.pos + p.label.len() + (cursor - p.pos)
             } else {
@@ -646,7 +646,7 @@ pub fn tui_read_line(
                             }
                         }
                         let final_msg = if let Some(ref pb) = paste_block {
-                            format!("{}{}{}", &buf[..pb.pos], &pb.content, &buf[pb.pos..])
+                            format!("{}{}{}", &buf[..pb.pos], pb.content, &buf[pb.pos..])
                         } else {
                             buf.clone()
                         };
