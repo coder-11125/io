@@ -43,7 +43,27 @@ pub fn pick_with_hint(items: &[(&str, &str)], current: Option<usize>) -> anyhow:
     }
     let mut stdout = io::stdout();
     terminal::enable_raw_mode()?;
-    let result = pick_hint_loop(&mut stdout, items, current);
+    let result = pick_hint_loop(&mut stdout, items, current, None, current.unwrap_or(0));
+    let _ = terminal::disable_raw_mode();
+    let _ = execute!(io::stdout(), cursor::Show);
+    result
+}
+
+/// Show an interactive arrow-key list with a title line above the items.
+/// `initial` is the index preselected when the picker opens (used by the
+/// permission modal to default to the safe choice, e.g. deny). Returns the
+/// selected index, or [`Dismissed`] when the user cancels.
+pub fn pick_permission(
+    title: &str,
+    items: &[(&str, &str)],
+    initial: usize,
+) -> anyhow::Result<usize> {
+    if items.is_empty() {
+        anyhow::bail!("no items to pick from");
+    }
+    let mut stdout = io::stdout();
+    terminal::enable_raw_mode()?;
+    let result = pick_hint_loop(&mut stdout, items, None, Some(title), initial);
     let _ = terminal::disable_raw_mode();
     let _ = execute!(io::stdout(), cursor::Show);
     result
@@ -70,6 +90,8 @@ fn pick_hint_loop(
     stdout: &mut impl Write,
     items: &[(&str, &str)],
     current: Option<usize>,
+    title: Option<&str>,
+    initial: usize,
 ) -> anyhow::Result<usize> {
     execute!(stdout, cursor::Hide)?;
 
@@ -78,20 +100,23 @@ fn pick_hint_loop(
 
     let col = items.iter().map(|(l, _)| l.len()).max().unwrap_or(0) + 4;
 
-    let mut selected = current.unwrap_or(0).min(items.len().saturating_sub(1));
+    let mut selected = initial.min(items.len().saturating_sub(1));
     let mut viewport_start = selected.saturating_sub(VIEWPORT / 2);
 
-    // Reserve rows: items + status bar.
-    let reserve = (VIEWPORT + 2).min(items.len() + 2);
+    let title_rows = usize::from(title.is_some());
+
+    // Reserve rows: title + items + status bar.
+    let reserve = (VIEWPORT + 2).min(items.len() + 2) + title_rows;
     for _ in 0..reserve {
         queue!(stdout, crossterm::style::Print("\n"))?;
     }
     queue!(stdout, cursor::MoveUp(reserve as u16))?;
     stdout.flush()?;
 
-    // How many item rows were drawn in the last frame (used for MoveUp on redraw).
-    // Does NOT include the status bar — see clear_picker for why.
-    let mut drawn_items = 0usize;
+    // Rows drawn in the last frame (title + items). The status bar sits on the
+    // row after the items, so MoveUp(drawn_rows) returns to the very top of the
+    // picker area on redraw.
+    let mut drawn_rows = 0usize;
 
     loop {
         if selected < viewport_start {
@@ -101,8 +126,19 @@ fn pick_hint_loop(
         }
 
         // Return cursor to the top of the picker area.
-        if drawn_items > 0 {
-            queue!(stdout, cursor::MoveUp(drawn_items as u16))?;
+        if drawn_rows > 0 {
+            queue!(stdout, cursor::MoveUp(drawn_rows as u16))?;
+        }
+
+        // Title line, drawn above the items.
+        if let Some(title) = title {
+            queue!(
+                stdout,
+                cursor::MoveToColumn(0),
+                terminal::Clear(ClearType::CurrentLine),
+                crossterm::style::PrintStyledContent(title.with(Color::Yellow).bold()),
+                cursor::MoveToNextLine(1),
+            )?;
         }
 
         let visible = VIEWPORT.min(items.len().saturating_sub(viewport_start));
@@ -162,9 +198,9 @@ fn pick_hint_loop(
         )?;
         stdout.flush()?;
 
-        // Cursor is now at R + visible (same row as status bar, no MoveToNextLine).
-        // MoveUp(visible) on next frame returns exactly to R.
-        drawn_items = visible;
+        // Cursor is now at the status bar row; MoveUp(drawn_rows) on the next
+        // frame returns exactly to the top of the picker area.
+        drawn_rows = visible + title_rows;
 
         if let Event::Key(key) = event::read()? {
             match key.code {
@@ -181,13 +217,13 @@ fn pick_hint_loop(
                 KeyCode::Home => selected = 0,
                 KeyCode::End => selected = items.len() - 1,
                 KeyCode::Enter => {
-                    clear_picker(stdout, drawn_items)?;
+                    clear_picker(stdout, drawn_rows)?;
                     execute!(stdout, cursor::Show)?;
                     stdout.flush()?;
                     return Ok(selected);
                 }
                 KeyCode::Esc | KeyCode::Char('q') => {
-                    clear_picker(stdout, drawn_items)?;
+                    clear_picker(stdout, drawn_rows)?;
                     execute!(stdout, cursor::Show)?;
                     stdout.flush()?;
                     return Err(Dismissed::Cancelled.into());

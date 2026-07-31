@@ -11,8 +11,15 @@ use std::sync::{Arc, Mutex};
 /// Shared plain-text line buffer used for in-session scrollback.
 pub type LineBuf = Arc<Mutex<VecDeque<String>>>;
 
-pub type PendingPermission =
-    Arc<Mutex<Option<tokio::sync::oneshot::Sender<io_runtime::PermissionReply>>>>;
+/// A pending permission request: the tool being verified plus the channel to
+/// answer it. Rendered by the interactive arrow picker modal in the TUI.
+pub struct PendingPerm {
+    pub name: String,
+    pub detail: String,
+    pub respond: tokio::sync::oneshot::Sender<io_runtime::PermissionReply>,
+}
+
+pub type PendingPermission = Arc<Mutex<Option<PendingPerm>>>;
 
 pub const MAX_SCROLL_LINES: usize = 5000;
 pub const SCROLL_STEP: usize = 3;
@@ -128,22 +135,15 @@ fn process_ev(
             input,
             respond,
         } => {
-            use crossterm::style::Stylize;
+            // The interactive TUI renders an arrow picker modal for this;
+            // single-shot mode answers via `prompt_fn` instead. Nothing is
+            // printed here — the picker draws its own title and options.
             let detail = tool_detail(&name, &input);
-            if detail.is_empty() {
-                print!(
-                    "\r\n  allow \"{}\"? [y]es / [a]lways / [n]o: ",
-                    name.yellow()
-                );
-            } else {
-                print!(
-                    "\r\n  allow \"{}\" ({})? [y]es / [a]lways / [n]o: ",
-                    name.yellow(),
-                    detail
-                );
-            }
-            let _ = std::io::stdout().flush();
-            *pending_perm.lock().unwrap() = Some(respond);
+            *pending_perm.lock().unwrap() = Some(PendingPerm {
+                name,
+                detail,
+                respond,
+            });
         }
         AgentEvent::Usage { .. } => {}
         AgentEvent::AutoCompact { turns_compacted } => {

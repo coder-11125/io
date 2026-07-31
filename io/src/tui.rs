@@ -722,47 +722,51 @@ pub async fn run_interactive(
                 if streaming_done2.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
+
+                // A permission request pauses the stream until answered. Open
+                // the arrow picker modal as soon as one is pending — no key
+                // press is required to trigger it.
+                let pending = pending_for_listener.lock().unwrap().take();
+                if let Some(pending) = pending {
+                    let title = if pending.detail.is_empty() {
+                        format!("allow \"{}\"?", pending.name)
+                    } else {
+                        format!("allow \"{}\" ({})?", pending.name, pending.detail)
+                    };
+                    // Default to "No" (deny) — the safe choice.
+                    let reply = match picker::pick_permission(
+                        &title,
+                        &[
+                            ("Yes, once", "allow this one call"),
+                            ("Always", "allow for the rest of the session"),
+                            ("No", "deny"),
+                        ],
+                        2,
+                    ) {
+                        Ok(0) => PermissionReply::AllowOnce,
+                        Ok(1) => PermissionReply::AllowSession,
+                        // No, Esc, q, Ctrl+C, or picker failure.
+                        _ => PermissionReply::Deny,
+                    };
+                    let label = match reply {
+                        PermissionReply::AllowOnce => "yes",
+                        PermissionReply::AllowSession => "always",
+                        PermissionReply::Deny => "no",
+                    };
+                    print!("  → {label}\r\n");
+                    let _ = std::io::stdout().flush();
+                    let _ = pending.respond.send(reply);
+                    continue;
+                }
+
                 if event::poll(std::time::Duration::from_millis(50)).unwrap_or(false) {
                     match event::read() {
-                        Ok(crossterm::event::Event::Key(k)) => {
-                            let mut slot = pending_for_listener.lock().unwrap();
-                            if slot.is_some() {
-                                let reply = match k.code {
-                                    crossterm::event::KeyCode::Char('y')
-                                    | crossterm::event::KeyCode::Char('Y')
-                                    | crossterm::event::KeyCode::Enter => {
-                                        Some(PermissionReply::AllowOnce)
-                                    }
-                                    crossterm::event::KeyCode::Char('a')
-                                    | crossterm::event::KeyCode::Char('A') => {
-                                        Some(PermissionReply::AllowSession)
-                                    }
-                                    crossterm::event::KeyCode::Char('n')
-                                    | crossterm::event::KeyCode::Char('N')
-                                    | crossterm::event::KeyCode::Esc => Some(PermissionReply::Deny),
-                                    _ => None,
-                                };
-                                if let Some(reply) = reply {
-                                    let label = match reply {
-                                        PermissionReply::AllowOnce => "yes",
-                                        PermissionReply::AllowSession => "always",
-                                        PermissionReply::Deny => "no",
-                                    };
-                                    print!("{label}\r\n");
-                                    let _ = std::io::stdout().flush();
-                                    if let Some(tx) = slot.take() {
-                                        let _ = tx.send(reply);
-                                    }
-                                }
-                                continue;
-                            }
-                            drop(slot);
-                            if k.code == crossterm::event::KeyCode::Esc {
-                                cancel_for_listener
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                                let _ = esc_tx.send(());
-                                break;
-                            }
+                        Ok(crossterm::event::Event::Key(k))
+                            if k.code == crossterm::event::KeyCode::Esc =>
+                        {
+                            cancel_for_listener.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let _ = esc_tx.send(());
+                            break;
                         }
                         Ok(crossterm::event::Event::Mouse(m)) => {
                             let cur = stream_scroll2.load(std::sync::atomic::Ordering::Relaxed);
