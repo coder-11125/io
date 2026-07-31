@@ -58,7 +58,7 @@ The permission sandbox system provides defense-in-depth protection against comma
 
 **Permission Modes**:
 - `allow` — Auto-approve all tool executions
-- `agent` — Agent decides (default): read-only and caution-level commands run without asking; destructive and network commands still prompt. The user's `allowed_commands`/`denied_commands` always win.
+- `agent` — Agent decides (default): read-only and caution-level commands run without asking; destructive and network commands still prompt. Sub-agent spawns are delegated to the agent (sub-agents inherit the same checker and fail closed). The user's `allowed_commands`/`denied_commands` always win.
 - `prompt` — Ask user for approval for anything beyond read-only commands (strict)
 - `deny` — Block all tool executions
 
@@ -69,9 +69,13 @@ io config set permissions.default prompt    # strict: ask for anything non-read-
 io config set permissions.default allow     # fully autonomous
 io config set permissions.default deny      # deny everything
 
-# Allow/deny specific commands (coordinated with every mode)
+# Allow/deny specific commands (coordinated with every mode, persisted in config)
 io config set permissions.allowed_commands '["ls", "git", "cargo", "curl"]'
 io config set permissions.denied_commands '["rm", "sudo"]'
+
+# Opt into read-only network fetches in agent mode (curl to stdout, wget -O-).
+# File-writing, upload, and custom-method network commands still prompt.
+io config set permissions.allow_network_fetch true
 ```
 
 **Security Features**:
@@ -82,6 +86,7 @@ io config set permissions.denied_commands '["rm", "sudo"]'
 - **Conservative denylist**: Any dangerous token denies the entire command
 - **Strict allowlist**: Requires all pipeline heads to be explicitly allowed
 - **Expansion guard**: Commands containing `$`, backtick, or `(` bypass auto-allow (static analysis can't classify them safely)
+- **Privilege escalation gated**: `sudo`/`su`/`pkexec` always prompt unless explicitly allowlisted, and `sudo` is analyzed by the command it elevates — `sudo rm -rf /` is destructive, never hidden behind `sudo`
 
 **Command Safety Classifications**:
 | Level | Examples | Prompt mode | Agent mode |
@@ -89,7 +94,8 @@ io config set permissions.denied_commands '["rm", "sudo"]'
 | `Safe` | `ls`, `cat`, `grep`, `git status`, `cargo check`, `find` (no `-delete`) | Auto-allowed | Auto-allowed |
 | `Caution` | `mv`, `git commit`, `rm file.txt`, `sed -i`, `chmod`, `mkdir` | Prompts | Auto-allowed (agent decides) |
 | `Destructive` | `rm -rf`, `dd`, `git reset --hard`, `git push --force`, `mkfs.*` | Prompts | Prompts |
-| Network | `curl`, `wget`, `ssh`, `scp` | Prompts | Prompts (unless allowlisted) |
+| Network | `curl`, `wget`, `ssh`, `scp` | Prompts | Prompts (unless allowlisted, or read-only fetch with `allow_network_fetch = true`) |
+| Privilege | `sudo`, `su`, `pkexec` | Prompts | Prompts (unless allowlisted) |
 
 **Ecosystem-agnostic build tool classification** — subcommands are classified consistently across all package managers:
 

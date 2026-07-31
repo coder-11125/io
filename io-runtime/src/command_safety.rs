@@ -119,6 +119,8 @@ const ALWAYS_SAFE: &[&str] = &[
     "stat",
     "readlink",
     "realpath",
+    "basename",
+    "dirname",
     // hashing / verification
     "md5sum",
     "sha1sum",
@@ -384,7 +386,7 @@ fn basename(s: &str) -> &str {
 /// Split a compound command into (head, args) segments.
 /// Splits at `;`, `|`, `&`, and newline — not at spaces — so arguments
 /// stay attached to their command head for flag analysis.
-fn parse_segments(command: &str) -> Vec<(String, Vec<String>)> {
+pub(crate) fn parse_segments(command: &str) -> Vec<(String, Vec<String>)> {
     command
         .split([';', '|', '&', '\n'])
         .filter_map(|seg| {
@@ -528,6 +530,17 @@ fn analyze_segment(head: &str, args: &[String]) -> SafetyVerdict {
         "cargo" => analyze_cargo(args),
         "sed" => analyze_sed(args),
         "chmod" => analyze_chmod(args),
+        // `sudo` elevates the *next* command, so classify that command. This
+        // keeps `sudo rm -rf /` destructive instead of hiding behind `sudo`.
+        // (The sandbox additionally prompts for any sudo/su head unless the
+        // user explicitly allowlists it — see sandbox::PRIVILEGE_COMMANDS.)
+        "sudo" => {
+            let Some(inner) = args.first() else {
+                return SafetyVerdict::caution("sudo with no command");
+            };
+            let inner_args: Vec<String> = args.iter().skip(1).cloned().collect();
+            analyze_segment(inner, &inner_args)
+        }
 
         // ── Ecosystem-agnostic build tools ────────────────────────────────────
         // Node / JS
@@ -676,6 +689,16 @@ mod tests {
         assert_eq!(level("sed 's/foo/bar/g' file.txt"), SafetyLevel::Safe);
     }
 
+    #[test]
+    fn basename_and_dirname_are_safe() {
+        assert_eq!(level("basename src/main.rs"), SafetyLevel::Safe);
+        assert_eq!(level("basename -s .rs src/main.rs"), SafetyLevel::Safe);
+        assert_eq!(level("dirname src/main.rs"), SafetyLevel::Safe);
+        // The analyzer classifies the head only; the sandbox separately gates
+        // shell expansions, so this stays Safe here even with $(...).
+        assert_eq!(level("basename $(ls)"), SafetyLevel::Safe);
+    }
+
     // ── Caution commands ──────────────────────────────────────────────────────
 
     #[test]
@@ -788,6 +811,21 @@ mod tests {
     #[test]
     fn fdisk_is_destructive() {
         assert_eq!(level("fdisk /dev/sda"), SafetyLevel::Destructive);
+    }
+
+    #[test]
+    fn sudo_delegates_to_the_inner_command() {
+        // `sudo` must not hide the command it elevates.
+        assert_eq!(level("sudo rm -rf /"), SafetyLevel::Destructive);
+        assert_eq!(level("sudo rm file.txt"), SafetyLevel::Caution);
+        assert_eq!(
+            level("sudo dd if=/dev/zero of=/dev/sda"),
+            SafetyLevel::Destructive
+        );
+        assert_eq!(level("sudo apt update"), SafetyLevel::Caution);
+        assert_eq!(level("sudo ls -la"), SafetyLevel::Safe);
+        // Bare sudo (no inner command) is caution.
+        assert_eq!(level("sudo"), SafetyLevel::Caution);
     }
 
     // ── Compound commands: worst level wins ───────────────────────────────────

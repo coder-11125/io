@@ -33,6 +33,24 @@ fn set_config_key(
             .map_err(|_| anyhow::anyhow!("invalid value for {key}: expected true or false"))
     }
 
+    /// Parse a command list from `config set`. Accepts a JSON array
+    /// (`'["ls", "git"]'`) or a comma-separated string (`"ls, git"`).
+    fn parse_command_list(key: &str, value: &str) -> anyhow::Result<Vec<String>> {
+        let trimmed = value.trim();
+        if trimmed.starts_with('[') {
+            let list: Vec<String> = serde_json::from_str(trimmed)
+                .map_err(|_| anyhow::anyhow!("invalid value for {key}: expected a JSON array"))?;
+            Ok(list)
+        } else {
+            Ok(trimmed
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect())
+        }
+    }
+
     let parts: Vec<&str> = key.split('.').collect();
     match parts.as_slice() {
         ["provider", "default"] => config.provider.default = value.to_string(),
@@ -50,11 +68,18 @@ fn set_config_key(
         }
         ["permissions", "default"] => {
             if !matches!(value, "allow" | "agent" | "prompt" | "deny") {
-                anyhow::bail!(
-                    "invalid value for {key}: expected allow, agent, prompt, or deny"
-                );
+                anyhow::bail!("invalid value for {key}: expected allow, agent, prompt, or deny");
             }
             config.permissions.default = value.to_string();
+        }
+        ["permissions", "allow_network_fetch"] => {
+            config.permissions.allow_network_fetch = parse_bool(key, value)?;
+        }
+        ["permissions", "allowed_commands"] => {
+            config.permissions.allowed_commands = parse_command_list(key, value)?;
+        }
+        ["permissions", "denied_commands"] => {
+            config.permissions.denied_commands = parse_command_list(key, value)?;
         }
         ["theme"] => {
             if !io_tui::render::THEME_NAMES.contains(&value) {
@@ -72,7 +97,9 @@ fn set_config_key(
             "unknown config key: {key}\nSupported: provider.default, provider.<name>.model, \
              provider.<name>.api_key_env, provider.<name>.auth (api_key|oauth), \
              provider.azure.deployment, session.auto_compact, \
-             session.memory_enabled, session.max_turns, session.max_tokens, permissions.default, theme"
+             session.memory_enabled, session.max_turns, session.max_tokens, \
+             permissions.default, permissions.allow_network_fetch, \
+             permissions.allowed_commands, permissions.denied_commands, theme"
         ),
     }
     Ok(())
@@ -173,4 +200,40 @@ pub fn handle_init() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_set_supports_permission_lists_and_network_fetch() {
+        let mut config = io_runtime::config::Config::default();
+        set_config_key(
+            &mut config,
+            "permissions.allowed_commands",
+            "[\"ls\", \"git\"]",
+        )
+        .unwrap();
+        assert_eq!(config.permissions.allowed_commands, vec!["ls", "git"]);
+        // Comma-separated form works too.
+        set_config_key(
+            &mut config,
+            "permissions.allowed_commands",
+            "ls, git, cargo",
+        )
+        .unwrap();
+        assert_eq!(
+            config.permissions.allowed_commands,
+            vec!["ls", "git", "cargo"]
+        );
+        set_config_key(&mut config, "permissions.denied_commands", "[\"rm\"]").unwrap();
+        assert_eq!(config.permissions.denied_commands, vec!["rm"]);
+        set_config_key(&mut config, "permissions.allow_network_fetch", "true").unwrap();
+        assert!(config.permissions.allow_network_fetch);
+        // Invalid values are errors, not silent defaults.
+        assert!(set_config_key(&mut config, "permissions.allow_network_fetch", "yes").is_err());
+        assert!(set_config_key(&mut config, "permissions.allowed_commands", "[not json]").is_err());
+        assert!(set_config_key(&mut config, "permissions.default", "always").is_err());
+    }
 }

@@ -571,6 +571,12 @@ pub struct PermissionConfig {
     pub allowed_commands: Vec<String>,
     #[serde(default)]
     pub denied_commands: Vec<String>,
+    /// Opt-in lenience: in `agent` mode, read-only network fetches that only
+    /// write to stdout (`curl URL`, `wget -O- URL`) run without prompting.
+    /// File-writing, upload, and custom-method network commands still prompt.
+    /// Defaults to false so network egress stays gated unless the user opts in.
+    #[serde(default)]
+    pub allow_network_fetch: bool,
 }
 
 fn default_permission_mode() -> String {
@@ -620,6 +626,7 @@ impl Default for PermissionConfig {
             default: default_permission_mode(),
             allowed_commands: Vec::new(),
             denied_commands: Vec::new(),
+            allow_network_fetch: false,
         }
     }
 }

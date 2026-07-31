@@ -384,7 +384,11 @@ Mode is configured via `permissions.default` (a string):
 - `allow` — everything allowed
 - `agent` — the agent decides (default): read-only **and** caution-level bash
   commands auto-run; destructive and network commands still prompt. The user's
-  `allowed_commands`/`denied_commands` always win.
+  `allowed_commands`/`denied_commands` always win. `spawn_agent` is delegated
+  to the agent (sub-agents inherit the same checker, run restricted, and fail
+  closed — no escalation). With `permissions.allow_network_fetch = true`,
+  read-only fetches (`curl URL`, `wget -O- URL`) also auto-run; file-writing,
+  upload, and custom-method network commands still prompt.
 - `prompt` — strict: only read-only commands auto-run; everything else asks
 - `deny` — everything denied
 
@@ -402,8 +406,15 @@ Mode is configured via `permissions.default` (a string):
   is allowlisted, even network commands or caution-classified ones; then the
   semantic analyzer classifies: Safe → auto-allowed, Caution → auto-allowed in
   `agent` mode / prompted in `prompt` mode, Destructive → always prompted.
-  Network commands prompt unless allowlisted. Shell expansions (`$`, backtick,
-  `(`) prompt unless every head is statically read-only in `agent` mode.
+  Network commands prompt unless allowlisted, or unless the opt-in
+  `permissions.allow_network_fetch` is on in `agent` mode — then GET-style
+  fetches that only write to stdout (`curl URL`, `wget -O- URL`) auto-run;
+  file-writing, upload, and custom-method variants still prompt. Privilege
+  escalation (`sudo`/`su`/`pkexec`) always prompts unless explicitly
+  allowlisted, and `sudo` is classified by the command it elevates
+  (`sudo rm -rf /` is destructive, not caution). Shell
+  expansions (`$`, backtick, `(`) prompt unless every head (including inside
+  `$(...)`) is statically read-only in `agent` mode.
 - Streaming turns ask via `AgentEvent::PermissionRequest` (answered by the REPL
   key listener); non-streaming turns use the agent's `set_prompt_fn` callback
   (single-shot mode reads from stdin). With no way to ask, the call is denied.
@@ -412,7 +423,8 @@ Mode is configured via `permissions.default` (a string):
   approve `rm -rf`); for other tools, approval applies to all uses of that tool
 - Sub-agents spawned via `spawn_agent` share the parent's checker (same
   deny/allow lists and session approvals) and fail closed on anything that
-  would prompt
+  would prompt. In `agent` mode the spawn itself is delegated to the agent —
+  no user prompt — since sub-agents cannot do more than the parent could.
 
 ### Security Analysis
 
@@ -438,7 +450,7 @@ identify potential bypass vectors. Key security properties:
 
 **Semantic Safety Tiers** (`command_safety.rs`):
 - `Safe` → auto-allowed: read-only filesystem ops, system info, build-tool test/check/lint/doc subcommands across all ecosystems (cargo, npm/yarn/pnpm/bun, go, pip, mvn/gradle, dotnet, …), read-only git subcommands
-- `Caution` → always prompts: file mutations (mv/cp/rm), package installs, git write ops, ecosystem deploy/publish subcommands
+- `Caution` → auto-allowed in `agent` mode / prompted in `prompt` mode: file mutations (mv/cp/rm), package installs, git write ops, ecosystem deploy/publish subcommands
 - `Destructive` → always prompts: `rm -rf`, `dd`, `git reset --hard`, `git push --force`, `mkfs.*`, `shred`
 
 **Known Limitations** (by design):
@@ -476,6 +488,7 @@ max_turns = 100
 default = "agent"   # "allow" | "agent" | "prompt" | "deny"
 allowed_commands = []
 denied_commands = ["rm", "sudo"]
+allow_network_fetch = false   # agent mode: auto-run read-only curl/wget fetches
 ```
 
 ### Theme System (io/src/render.rs + io/src/theme.rs)
