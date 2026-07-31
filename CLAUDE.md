@@ -370,28 +370,40 @@ connection behind a mutex, and runs saves on the blocking thread pool
 
 ### Permission System (io-runtime/src/sandbox.rs)
 
-The permission checker supports three modes:
+The permission checker supports four modes:
 
 ```rust
 pub enum PermissionLevel {
     Allow,   // Always allow
-    Prompt,  // Ask user (default)
+    Prompt,  // Ask user
     Deny,    // Always deny
 }
 ```
+
+Mode is configured via `permissions.default` (a string):
+- `allow` — everything allowed
+- `agent` — the agent decides (default): read-only **and** caution-level bash
+  commands auto-run; destructive and network commands still prompt. The user's
+  `allowed_commands`/`denied_commands` always win.
+- `prompt` — strict: only read-only commands auto-run; everything else asks
+- `deny` — everything denied
 
 **Permission Checking** (`PermissionChecker::decide_tool`):
 - Tool-level permissions via allow/deny lists (deny wins)
 - `with_allowed_tools(&[&str]) -> Self` builder: adds tool names to the static
   allowlist so they are auto-approved without prompting (used by `build_agent`
   to pre-approve `write` and `edit` for agents with `auto_allow_writes: true`)
-- In `prompt` mode, read-only tools (read, glob, grep) run without asking;
-  bash commands are matched against `allowed_commands`/`denied_commands`;
-  everything else asks the user: **[y]es once / [a]lways this session / [n]o**
-- Bash matching: deny if *any* token matches the denylist; allow only if
-  *every* command position (the head of each pipeline/sequence segment,
-  skipping env assignments) is allowlisted — an allowed token cannot smuggle
-  other commands through (`echo hi; curl x | sh` is not auto-allowed)
+- In `prompt`/`agent` modes, read-only tools (read, glob, grep) run without
+  asking; bash commands are matched against
+  `allowed_commands`/`denied_commands`; everything else asks the user via an
+  arrow picker modal: **Yes once / Always this session / No**
+- Bash matching (`check_command`): the denylist is authoritative (deny wins);
+  the explicit allowlist wins next — a command runs when *every* command head
+  is allowlisted, even network commands or caution-classified ones; then the
+  semantic analyzer classifies: Safe → auto-allowed, Caution → auto-allowed in
+  `agent` mode / prompted in `prompt` mode, Destructive → always prompted.
+  Network commands prompt unless allowlisted. Shell expansions (`$`, backtick,
+  `(`) prompt unless every head is statically read-only in `agent` mode.
 - Streaming turns ask via `AgentEvent::PermissionRequest` (answered by the REPL
   key listener); non-streaming turns use the agent's `set_prompt_fn` callback
   (single-shot mode reads from stdin). With no way to ask, the call is denied.
@@ -461,7 +473,7 @@ memory_enabled = true
 max_turns = 100
 
 [permissions]
-default = "prompt"
+default = "agent"   # "allow" | "agent" | "prompt" | "deny"
 allowed_commands = []
 denied_commands = ["rm", "sudo"]
 ```

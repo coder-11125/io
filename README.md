@@ -58,8 +58,21 @@ The permission sandbox system provides defense-in-depth protection against comma
 
 **Permission Modes**:
 - `allow` — Auto-approve all tool executions
+- `agent` — Agent decides (default): read-only and caution-level commands run without asking; destructive and network commands still prompt. The user's `allowed_commands`/`denied_commands` always win.
+- `prompt` — Ask user for approval for anything beyond read-only commands (strict)
 - `deny` — Block all tool executions
-- `prompt` — Ask user for approval (default)
+
+```bash
+# Switch modes
+io config set permissions.default agent     # agent decides (default)
+io config set permissions.default prompt    # strict: ask for anything non-read-only
+io config set permissions.default allow     # fully autonomous
+io config set permissions.default deny      # deny everything
+
+# Allow/deny specific commands (coordinated with every mode)
+io config set permissions.allowed_commands '["ls", "git", "cargo", "curl"]'
+io config set permissions.denied_commands '["rm", "sudo"]'
+```
 
 **Security Features**:
 - **Semantic command analyzer**: Classifies every bash command as `Safe`, `Caution`, or `Destructive` before execution — `ls`, `git status`, `cargo check` are auto-allowed; `rm -rf`, `dd`, `git reset --hard` always prompt
@@ -71,11 +84,12 @@ The permission sandbox system provides defense-in-depth protection against comma
 - **Expansion guard**: Commands containing `$`, backtick, or `(` bypass auto-allow (static analysis can't classify them safely)
 
 **Command Safety Classifications**:
-| Level | Examples | Behavior |
-|---|---|---|
-| `Safe` | `ls`, `cat`, `grep`, `git status`, `cargo check`, `find` (no `-delete`) | Auto-allowed in prompt mode |
-| `Caution` | `mv`, `git commit`, `rm file.txt`, `sed -i`, `chmod` | Always prompts |
-| `Destructive` | `rm -rf`, `dd`, `git reset --hard`, `git push --force`, `mkfs.*` | Always prompts with implied risk |
+| Level | Examples | Prompt mode | Agent mode |
+|---|---|---|---|
+| `Safe` | `ls`, `cat`, `grep`, `git status`, `cargo check`, `find` (no `-delete`) | Auto-allowed | Auto-allowed |
+| `Caution` | `mv`, `git commit`, `rm file.txt`, `sed -i`, `chmod`, `mkdir` | Prompts | Auto-allowed (agent decides) |
+| `Destructive` | `rm -rf`, `dd`, `git reset --hard`, `git push --force`, `mkfs.*` | Prompts | Prompts |
+| Network | `curl`, `wget`, `ssh`, `scp` | Prompts | Prompts (unless allowlisted) |
 
 **Ecosystem-agnostic build tool classification** — subcommands are classified consistently across all package managers:
 
@@ -183,7 +197,7 @@ memory_enabled = true
 max_turns = 100
 
 [permissions]
-default = "prompt"       # "allow" | "deny" | "prompt"
+default = "agent"       # "allow" | "agent" | "prompt" | "deny"
 allowed_commands = []
 denied_commands = ["rm", "sudo"]
 

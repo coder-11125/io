@@ -589,6 +589,14 @@ pub fn is_expansion_free(command: &str) -> bool {
     !command.contains('$') && !command.contains('`') && !command.contains('(')
 }
 
+/// Whether a single command head is statically read-only (from the
+/// `ALWAYS_SAFE` table). Used by the agent-decides permission mode to allow
+/// commands with shell expansions (`ls $(pwd)`) only when every head —
+/// including ones hidden inside `$(...)` — is provably safe.
+pub fn is_safe_head(head: &str) -> bool {
+    ALWAYS_SAFE.contains(&head)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

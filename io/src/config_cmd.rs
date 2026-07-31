@@ -49,8 +49,10 @@ fn set_config_key(
                 .map_err(|_| anyhow::anyhow!("invalid value for {key}: expected a number"))?;
         }
         ["permissions", "default"] => {
-            if !matches!(value, "allow" | "prompt" | "deny") {
-                anyhow::bail!("invalid value for {key}: expected allow, prompt, or deny");
+            if !matches!(value, "allow" | "agent" | "prompt" | "deny") {
+                anyhow::bail!(
+                    "invalid value for {key}: expected allow, agent, prompt, or deny"
+                );
             }
             config.permissions.default = value.to_string();
         }

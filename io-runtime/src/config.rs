@@ -574,7 +574,7 @@ pub struct PermissionConfig {
 }
 
 fn default_permission_mode() -> String {
-    "prompt".to_string()
+    "agent".to_string()
 }
 
 impl Default for Config {
@@ -617,7 +617,7 @@ impl Default for SessionConfig {
 impl Default for PermissionConfig {
     fn default() -> Self {
         Self {
-            default: "prompt".to_string(),
+            default: default_permission_mode(),
             allowed_commands: Vec::new(),
             denied_commands: Vec::new(),
         }
