@@ -52,6 +52,11 @@ io "explain this codebase"
 On first run, `io` creates a default configuration at `~/.io/config.toml`.
 Use `/connect` inside the REPL to set up your preferred LLM provider.
 
+When a new `io` release adds config options, your existing config file is
+auto-upgraded on load: missing keys are filled in from defaults, your values
+are preserved, and OAuth tokens (`~/.io/oauth.toml`) and API keys
+(`~/.io/keys.toml`) are never touched.
+
 ## Security
 
 The permission sandbox system provides defense-in-depth protection against command injection and unauthorized execution:

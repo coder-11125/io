@@ -468,6 +468,16 @@ Configuration is loaded from TOML files with the following hierarchy:
 1. Global config: `~/.io/config.toml`
 2. Project config: `.io/config.toml` (if exists)
 3. API keys: `~/.io/keys.toml` (chmod 600)
+4. OAuth tokens: `~/.io/oauth.toml` (chmod 600)
+
+**Schema auto-upgrade**: when the global config file lags the current `Config`
+schema (a key is missing — e.g. a new option added in a release), `Config::load`
+rewrites the file in place, filling missing keys from the defaults. The rewrite
+is strictly additive: existing values (including inline `api_key` entries) are
+never overwritten, unknown keys survive, and optional provider sections the
+user omitted are not resurrected. OAuth tokens and the key store live in
+separate files and are never touched by a config rewrite. A current-schema
+file is never rewritten (comments stay intact).
 
 **Config Structure**:
 ```toml

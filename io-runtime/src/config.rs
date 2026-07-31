@@ -636,12 +636,56 @@ impl Config {
         let config_path = Self::config_path();
         if config_path.exists() {
             let contents = std::fs::read_to_string(&config_path)?;
-            Ok(toml::from_str(&contents)?)
+            Self::load_with_schema_upgrade(&config_path, &contents)
         } else {
             let cfg = Config::default();
             cfg.save()?;
             Ok(cfg)
         }
+    }
+
+    /// Deserialize a config file, rewriting it in place when it lags the
+    /// current schema.
+    ///
+    /// When the file is missing keys the current `Config` knows about (for
+    /// example after an upgrade added a new option like
+    /// `permissions.allow_network_fetch`), the file is rewritten with the
+    /// missing keys filled in from the defaults — while preserving every
+    /// existing value, including inline `api_key` entries.
+    ///
+    /// This is strictly additive: unknown keys and comments are left alone
+    /// when there is no drift, and nothing the user wrote is ever overwritten
+    /// or removed. OAuth tokens (`~/.io/oauth.toml`) and the key store
+    /// (`~/.io/keys.toml`) live in separate files and are never touched.
+    ///
+    /// Optional provider sections the file does not contain are not
+    /// resurrected: a missing `[provider.groq]` means "not configured", not
+    /// "use defaults". Existing sections do get new fields merged in.
+    fn load_with_schema_upgrade(path: &std::path::Path, contents: &str) -> anyhow::Result<Self> {
+        let config: Config = toml::from_str(contents)?;
+        let original: toml::Table = contents.parse()?;
+        let mut merged = original.clone();
+
+        let mut defaults: toml::Table =
+            toml::from_str(&toml::to_string_pretty(&Config::default())?)?;
+        // Never resurrect optional provider slots the user omitted.
+        if let Some(toml::Value::Table(def_provider)) = defaults.get_mut("provider") {
+            let present = original
+                .get("provider")
+                .and_then(toml::Value::as_table)
+                .map(|t| t.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            def_provider.retain(|key, _| key == "default" || present.iter().any(|k| k == key));
+        }
+
+        merge_missing(&mut merged, &defaults);
+        if merged != original {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, toml::to_string_pretty(&merged)?)?;
+        }
+        Ok(config)
     }
 
     pub fn config_path() -> PathBuf {
@@ -663,6 +707,22 @@ impl Config {
         let contents = toml::to_string_pretty(self)?;
         std::fs::write(&path, contents)?;
         Ok(())
+    }
+}
+
+/// Recursively insert keys from `defaults` that `raw` is missing. Existing
+/// values — api keys, provider settings, whatever the user has — always win.
+fn merge_missing(raw: &mut toml::Table, defaults: &toml::Table) {
+    for (key, default_val) in defaults {
+        match (raw.get_mut(key), default_val) {
+            (Some(toml::Value::Table(raw_table)), toml::Value::Table(default_table)) => {
+                merge_missing(raw_table, default_table);
+            }
+            (None, value) => {
+                raw.insert(key.clone(), value.clone());
+            }
+            _ => {}
+        }
     }
 }
 
@@ -761,5 +821,170 @@ mod tests {
         config.provider.openai.as_mut().unwrap().auth = AuthMethod::OAuth;
         assert!(config.provider.uses_oauth("openai"));
         assert!(!config.provider.uses_oauth("anthropic"));
+    }
+
+    // ── Schema-upgrade rewrite tests ──────────────────────────────────────────
+
+    /// Unique temp config path per test (parallel-safe, cleaned up by caller).
+    fn temp_config_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("io-config-{name}-{}.toml", std::process::id()))
+    }
+
+    #[test]
+    fn schema_upgrade_adds_missing_keys_and_keeps_values() {
+        let path = temp_config_path("upgrade");
+        let contents = r#"
+            [provider]
+            default = "anthropic"
+
+            [provider.anthropic]
+            model = "claude-sonnet-4-20250514"
+            api_key = "sk-ant-inline-test"
+
+            [session]
+            auto_compact = true
+            max_turns = 50
+        "#;
+        std::fs::write(&path, contents).unwrap();
+
+        let config = Config::load_with_schema_upgrade(&path, contents).unwrap();
+
+        // New schema keys come in with defaults.
+        assert_eq!(config.permissions.default, "agent");
+        assert!(!config.permissions.allow_network_fetch);
+        assert_eq!(config.theme, "default");
+        // Existing values are preserved.
+        assert_eq!(config.provider.default, "anthropic");
+        assert_eq!(
+            config
+                .provider
+                .anthropic
+                .as_ref()
+                .unwrap()
+                .api_key
+                .as_deref(),
+            Some("sk-ant-inline-test")
+        );
+        assert_eq!(config.session.max_turns, 50);
+
+        // The file on disk was rewritten to the current schema…
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(rewritten.contains("allow_network_fetch = false"));
+        assert!(rewritten.contains("theme = \"default\""));
+        // …and the inline api key survived the rewrite.
+        assert!(rewritten.contains("api_key = \"sk-ant-inline-test\""));
+
+        // A second load of the migrated file is a no-op rewrite.
+        let _ = Config::load_with_schema_upgrade(&path, &rewritten).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), rewritten);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn schema_upgrade_does_not_resurrect_omitted_providers() {
+        let path = temp_config_path("noresurrect");
+        let contents = r#"
+            [provider]
+            default = "groq"
+
+            [provider.groq]
+            model = "llama-3.3-70b-versatile"
+        "#;
+        std::fs::write(&path, contents).unwrap();
+
+        let config = Config::load_with_schema_upgrade(&path, contents).unwrap();
+        assert!(config.provider.openai.is_none());
+        assert!(config.provider.groq.is_some());
+        assert_eq!(config.provider.default, "groq");
+
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(!rewritten.contains("[provider.openai]"));
+        assert!(rewritten.contains("[provider.groq]"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn schema_upgrade_is_strictly_additive_and_preserves_unknown_keys() {
+        let path = temp_config_path("additive");
+        let contents = "future_option = \"keep me\"\n[permissions]\ndefault = \"prompt\"\n";
+        std::fs::write(&path, contents).unwrap();
+
+        let config = Config::load_with_schema_upgrade(&path, contents).unwrap();
+        assert_eq!(config.permissions.default, "prompt");
+
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        // Unknown keys survive and are not clobbered by the rewrite.
+        assert!(rewritten.contains("future_option = \"keep me\""));
+        assert!(rewritten.contains("allow_network_fetch = false"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn schema_upgrade_current_schema_is_not_rewritten() {
+        let path = temp_config_path("current");
+        let mut config = Config::default();
+        config.permissions.default = "agent".to_string();
+        config.permissions.allow_network_fetch = true;
+        config.permissions.allowed_commands = vec!["git".to_string(), "curl".to_string()];
+        let mut contents = toml::to_string_pretty(&config).unwrap();
+        // A comment serialization would drop — proof the file was not rewritten.
+        contents = format!("# user comment\n{contents}");
+        std::fs::write(&path, &contents).unwrap();
+
+        let _ = Config::load_with_schema_upgrade(&path, &contents).unwrap();
+        // No drift → no rewrite, comment preserved byte-for-byte.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn schema_upgrade_malformed_config_errors_without_rewriting() {
+        let path = temp_config_path("malformed");
+        let contents = "this is not = [valid toml";
+        std::fs::write(&path, contents).unwrap();
+
+        assert!(Config::load_with_schema_upgrade(&path, contents).is_err());
+        // The broken file is left untouched — never destroyed.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn schema_upgrade_never_touches_keys_or_oauth_files() {
+        // Migration writes only the config file; sibling key/oauth stores
+        // (separate files with their own 0600 handling) must be untouched.
+        let path = temp_config_path("siblings");
+        let keys_path = std::env::temp_dir().join(format!(
+            "io-config-siblings-{}-keys.toml",
+            std::process::id()
+        ));
+        let oauth_path = std::env::temp_dir().join(format!(
+            "io-config-siblings-{}-oauth.toml",
+            std::process::id()
+        ));
+        std::fs::write(&keys_path, "openai = \"sk-sibling-key\"\n").unwrap();
+        std::fs::write(&oauth_path, "[tokens]\nopenai = {}\n").unwrap();
+
+        let contents = "[permissions]\ndefault = \"prompt\"\n";
+        std::fs::write(&path, contents).unwrap();
+        let _ = Config::load_with_schema_upgrade(&path, contents).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&keys_path).unwrap(),
+            "openai = \"sk-sibling-key\"\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&oauth_path).unwrap(),
+            "[tokens]\nopenai = {}\n"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&keys_path);
+        let _ = std::fs::remove_file(&oauth_path);
     }
 }
