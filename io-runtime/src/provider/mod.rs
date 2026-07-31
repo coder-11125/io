@@ -497,6 +497,13 @@ pub fn missing_api_key(
     keys: &crate::config::KeyStore,
 ) -> Option<String> {
     let provider_id = config.provider.default.as_str();
+
+    // OAuth-backed providers (OpenAI ChatGPT / Anthropic Claude subscription)
+    // authenticate via `io login` and need no API key.
+    if config.provider.uses_oauth(provider_id) {
+        return None;
+    }
+
     let default_env = default_key_env(provider_id)?;
 
     if keys.get(provider_id).is_some() {
@@ -554,6 +561,7 @@ pub fn create_provider(
                 base_url: cfg.base_url,
                 api_key_env: None,
                 api_key,
+                auth: cfg.auth,
                 context_window: ctx_override,
             }))
         }
@@ -564,6 +572,7 @@ pub fn create_provider(
                 base_url: cfg.base_url,
                 api_key_env: None,
                 api_key,
+                auth: cfg.auth,
                 context_window: ctx_override,
             }))
         }
@@ -608,6 +617,7 @@ pub fn create_provider(
                     api_key_env: None,
                     api_key: Some("ollama".to_string()),
                     context_window: None,
+                    auth: crate::config::AuthMethod::ApiKey,
                 },
                 ctx,
             ))
@@ -630,6 +640,7 @@ pub fn create_provider(
                     api_key_env: None,
                     api_key,
                     context_window: None,
+                    auth: crate::config::AuthMethod::ApiKey,
                 },
                 ctx,
             ))
@@ -688,6 +699,28 @@ mod tests {
         let keys = crate::config::KeyStore::default();
         let err = create_provider(&config, &keys).unwrap_err();
         assert!(err.to_string().contains("unsupported provider"));
+    }
+
+    #[test]
+    fn oauth_provider_needs_no_api_key() {
+        let mut config = crate::config::Config::default();
+        config.provider.openai.as_mut().unwrap().auth = crate::config::AuthMethod::OAuth;
+        config.provider.default = "openai".to_string();
+        let keys = crate::config::KeyStore::default();
+        // OAuth providers are ready to use without any API key.
+        assert!(missing_api_key(&config, &keys).is_none());
+        // And create_provider constructs them without resolving a key.
+        let p = create_provider(&config, &keys).expect("openai provider");
+        assert_eq!(p.provider_name(), "openai");
+        assert!(p.context_window() > 0);
+    }
+
+    #[test]
+    fn api_key_provider_still_requires_key() {
+        let mut config = crate::config::Config::default();
+        config.provider.default = "openai".to_string();
+        let keys = crate::config::KeyStore::default();
+        assert!(missing_api_key(&config, &keys).is_some());
     }
 
     #[test]

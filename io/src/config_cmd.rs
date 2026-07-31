@@ -63,12 +63,13 @@ fn set_config_key(
             }
             config.theme = value.to_string();
         }
-        ["provider", provider, field @ ("model" | "api_key_env" | "deployment")] => {
+        ["provider", provider, field @ ("model" | "api_key_env" | "auth" | "deployment")] => {
             set_provider_field(config, provider, field, value)?;
         }
         _ => anyhow::bail!(
             "unknown config key: {key}\nSupported: provider.default, provider.<name>.model, \
-             provider.<name>.api_key_env, provider.azure.deployment, session.auto_compact, \
+             provider.<name>.api_key_env, provider.<name>.auth (api_key|oauth), \
+             provider.azure.deployment, session.auto_compact, \
              session.memory_enabled, session.max_turns, session.max_tokens, permissions.default, theme"
         ),
     }
@@ -83,6 +84,23 @@ fn set_provider_field(
 ) -> anyhow::Result<()> {
     let p = &mut config.provider;
     let value = value.to_string();
+
+    // OAuth login is only meaningful for providers that support it
+    // (openai = ChatGPT, anthropic = Claude). Handle it separately so the
+    // shared macro below stays applicable to every provider config.
+    if field == "auth" {
+        let method = match value.as_str() {
+            "oauth" => io_runtime::config::AuthMethod::OAuth,
+            "api_key" => io_runtime::config::AuthMethod::ApiKey,
+            _ => anyhow::bail!("invalid value for {provider}.auth: expected api_key or oauth"),
+        };
+        match provider {
+            "openai" => p.openai.get_or_insert_with(Default::default).auth = method,
+            "anthropic" => p.anthropic.get_or_insert_with(Default::default).auth = method,
+            _ => anyhow::bail!("provider.{provider} does not support OAuth login"),
+        }
+        return Ok(());
+    }
 
     // Each arm materializes the provider's config (with defaults) if absent,
     // then assigns the requested field.

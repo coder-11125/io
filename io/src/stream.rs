@@ -1,7 +1,9 @@
 //! Streaming event processing: spinner, token rendering, tool output, thought extraction.
 
 use io_runtime::AgentEvent;
-use io_tui::render::{render_markdown_lines, render_tool_done, render_tool_start, tool_detail, Theme};
+use io_tui::render::{
+    render_markdown_lines, render_tool_done, render_tool_start, tool_detail, Theme,
+};
 use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Mutex};

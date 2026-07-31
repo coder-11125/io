@@ -3,6 +3,7 @@ pub mod command_safety;
 pub mod compact;
 pub mod config;
 pub mod memory;
+pub mod oauth;
 pub mod pricing;
 pub mod provider;
 pub mod sandbox;

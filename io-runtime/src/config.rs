@@ -54,6 +54,22 @@ fn default_provider() -> String {
 }
 
 impl ProviderConfig {
+    /// Whether the provider is configured to authenticate via OAuth login
+    /// instead of an API key.
+    pub fn uses_oauth(&self, id: &str) -> bool {
+        match id {
+            "openai" => self
+                .openai
+                .as_ref()
+                .is_some_and(|c| c.auth == AuthMethod::OAuth),
+            "anthropic" => self
+                .anthropic
+                .as_ref()
+                .is_some_and(|c| c.auth == AuthMethod::OAuth),
+            _ => false,
+        }
+    }
+
     /// Configured `(api_key, api_key_env)` overrides for a provider id.
     /// This is the single place that maps provider ids to their config slots
     /// for credential lookup — keep new providers in sync here.
@@ -145,6 +161,9 @@ pub struct OpenAIConfig {
     /// Actual context window for this provider+model (tokens).
     /// When set, overrides the model-name-based guess in `context_window_for_model`.
     pub context_window: Option<u64>,
+    /// Authentication method: API key (default) or OAuth subscription login.
+    #[serde(default)]
+    pub auth: AuthMethod,
 }
 
 impl Default for OpenAIConfig {
@@ -155,6 +174,7 @@ impl Default for OpenAIConfig {
             api_key_env: None,
             api_key: None,
             context_window: None,
+            auth: AuthMethod::ApiKey,
         }
     }
 }
@@ -178,6 +198,9 @@ pub struct AnthropicConfig {
     /// Actual context window for this model (tokens).
     /// When set, overrides the built-in model-name-based guess.
     pub context_window: Option<u64>,
+    /// Authentication method: API key (default) or OAuth subscription login.
+    #[serde(default)]
+    pub auth: AuthMethod,
 }
 
 impl Default for AnthropicConfig {
@@ -188,6 +211,7 @@ impl Default for AnthropicConfig {
             api_key_env: None,
             api_key: None,
             context_window: None,
+            auth: AuthMethod::ApiKey,
         }
     }
 }
@@ -504,6 +528,17 @@ fn default_opencode_zen_model() -> String {
     "opencode/deepseek-v3".to_string()
 }
 
+/// How a provider authenticates: a traditional API key, or an OAuth login
+/// (OpenAI ChatGPT / Anthropic Claude subscription).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthMethod {
+    #[default]
+    #[serde(rename = "api_key")]
+    ApiKey,
+    #[serde(rename = "oauth")]
+    OAuth,
+}
+
 // ── Session / Permission configs ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -690,5 +725,34 @@ mod tests {
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.provider.default, config.provider.default);
+    }
+
+    #[test]
+    fn test_auth_method_serde_and_default() {
+        #[derive(Serialize, Deserialize)]
+        struct Wrap {
+            auth: AuthMethod,
+        }
+        assert_eq!(AuthMethod::default(), AuthMethod::ApiKey);
+        assert_eq!(
+            toml::to_string(&Wrap {
+                auth: AuthMethod::OAuth
+            })
+            .unwrap(),
+            "auth = \"oauth\"\n"
+        );
+        assert_eq!(
+            toml::from_str::<Wrap>("auth = \"oauth\"").unwrap().auth,
+            AuthMethod::OAuth
+        );
+    }
+
+    #[test]
+    fn test_uses_oauth() {
+        let mut config = Config::default();
+        assert!(!config.provider.uses_oauth("openai"));
+        config.provider.openai.as_mut().unwrap().auth = AuthMethod::OAuth;
+        assert!(config.provider.uses_oauth("openai"));
+        assert!(!config.provider.uses_oauth("anthropic"));
     }
 }

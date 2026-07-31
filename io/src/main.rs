@@ -7,6 +7,7 @@ mod config_cmd;
 mod connect;
 mod cost;
 mod input;
+mod login;
 mod model;
 mod stream;
 mod tui;
@@ -47,6 +48,9 @@ enum Commands {
     },
     /// Initialize io in the current project
     Init,
+    /// Sign in with OAuth for a provider that offers subscription access
+    /// (openai = ChatGPT, anthropic = Claude) instead of an API key
+    Login { provider: String },
 }
 
 #[derive(Subcommand)]
@@ -78,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Session { action }) => handle_session(action).await?,
         Some(Commands::Config { action }) => config_cmd::handle_config(action)?,
         Some(Commands::Init) => config_cmd::handle_init()?,
+        Some(Commands::Login { provider }) => login::run(&provider).await?,
         None => {
             if let Some(prompt) = cli.prompt {
                 tui::run_single_shot(&prompt, cli.model.as_deref()).await?;

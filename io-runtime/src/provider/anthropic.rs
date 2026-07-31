@@ -31,6 +31,18 @@ impl AnthropicProvider {
             .map_err(|_| anyhow::anyhow!("missing {env_var} environment variable"))
     }
 
+    /// The authentication header for this request: `Authorization: Bearer` for
+    /// OAuth (Claude subscription) logins, `x-api-key` for API keys. OAuth
+    /// tokens are refreshed (and persisted) automatically when expired.
+    async fn auth_header(&self) -> anyhow::Result<(reqwest::header::HeaderName, String)> {
+        if self.config.auth == crate::config::AuthMethod::OAuth {
+            let token = crate::oauth::oauth_access_token("anthropic").await?;
+            Ok((reqwest::header::AUTHORIZATION, format!("Bearer {token}")))
+        } else {
+            Ok(("x-api-key".parse()?, self.api_key()?))
+        }
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}/{}", self.config.base_url.trim_end_matches('/'), path)
     }
@@ -156,7 +168,7 @@ impl CompletionModel for AnthropicProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse> {
-        let api_key = self.api_key()?;
+        let (auth_header, auth_value) = self.auth_header().await?;
 
         let mut body = serde_json::json!({
             "model": self.config.model,
@@ -180,7 +192,7 @@ impl CompletionModel for AnthropicProvider {
         let resp = self
             .client
             .post(self.url("messages"))
-            .header("x-api-key", &api_key)
+            .header(auth_header, auth_value)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&body)
@@ -199,7 +211,7 @@ impl CompletionModel for AnthropicProvider {
         &self,
         request: CompletionRequest,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<StreamEvent>>> {
-        let api_key = self.api_key()?;
+        let (auth_header, auth_value) = self.auth_header().await?;
 
         let mut body = serde_json::json!({
             "model": self.config.model,
@@ -223,7 +235,7 @@ impl CompletionModel for AnthropicProvider {
         let resp = self
             .client
             .post(self.url("messages"))
-            .header("x-api-key", &api_key)
+            .header(auth_header, auth_value)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&body)

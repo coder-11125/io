@@ -201,6 +201,29 @@ openai = "sk-proj-..."
 
 Or set `api_key_env` in `config.toml` to reference an environment variable.
 
+### OAuth Login (subscription access)
+
+OpenAI and Anthropic also support signing in with your ChatGPT or Claude
+account instead of an API key. This uses the OAuth 2.0 authorization-code flow
+with PKCE; tokens are stored in `~/.io/oauth.toml` (with `chmod 600` on Unix)
+and refreshed automatically as they expire.
+
+```bash
+# Sign in with ChatGPT (opens a browser, waits for the callback)
+io login openai
+
+# Sign in with a Claude subscription (opens a browser, paste the code back)
+io login anthropic
+```
+
+`io login` marks the provider as OAuth-authenticated and makes it active. You
+can also pick this flow interactively with `io connect`, or toggle it manually:
+
+```bash
+io config set provider.openai.auth oauth      # use ChatGPT login
+io config set provider.openai.auth api_key    # back to API key
+```
+
 ### Commands
 
 ```bash
@@ -214,6 +237,10 @@ io config set permissions.default allow
 
 # Initialize io in the current project
 io init
+
+# OAuth sign-in (ChatGPT / Claude subscription)
+io login openai
+io login anthropic
 ```
 
 ### Session Management

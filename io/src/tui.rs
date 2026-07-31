@@ -309,8 +309,7 @@ pub async fn run_interactive(
                     "  !<cmd>         Run a shell command",
                 ];
                 let (_, h) = crossterm::terminal::size()?;
-                let start_row =
-                    h.saturating_sub(PROMPT_BAR_HEIGHT + 1 + help_lines.len() as u16);
+                let start_row = h.saturating_sub(PROMPT_BAR_HEIGHT + 1 + help_lines.len() as u16);
                 for (i, line) in help_lines.iter().enumerate() {
                     use crossterm::{cursor, execute, style::Print, terminal};
                     execute!(
@@ -607,8 +606,7 @@ pub async fn run_interactive(
         agent.set_cancel(cancel_flag.clone());
 
         let (token_tx, token_rx) = tokio::sync::mpsc::channel::<io_runtime::AgentEvent>(64);
-        let pending_perm: PendingPermission =
-            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let pending_perm: PendingPermission = std::sync::Arc::new(std::sync::Mutex::new(None));
 
         clear_prompt_input()?;
         prepare_streaming()?;
@@ -667,9 +665,7 @@ pub async fn run_interactive(
                                     }
                                     crossterm::event::KeyCode::Char('n')
                                     | crossterm::event::KeyCode::Char('N')
-                                    | crossterm::event::KeyCode::Esc => {
-                                        Some(PermissionReply::Deny)
-                                    }
+                                    | crossterm::event::KeyCode::Esc => Some(PermissionReply::Deny),
                                     _ => None,
                                 };
                                 if let Some(reply) = reply {
@@ -695,8 +691,7 @@ pub async fn run_interactive(
                             }
                         }
                         Ok(crossterm::event::Event::Mouse(m)) => {
-                            let cur =
-                                stream_scroll2.load(std::sync::atomic::Ordering::Relaxed);
+                            let cur = stream_scroll2.load(std::sync::atomic::Ordering::Relaxed);
                             let n = line_buf_scroll.lock().unwrap().len();
                             let next = match m.kind {
                                 crossterm::event::MouseEventKind::ScrollUp => {
@@ -708,18 +703,15 @@ pub async fn run_interactive(
                                 _ => cur,
                             };
                             if next != cur {
-                                stream_scroll2
-                                    .store(next, std::sync::atomic::Ordering::Relaxed);
+                                stream_scroll2.store(next, std::sync::atomic::Ordering::Relaxed);
                                 let _ = io_tui::render::render_scroll_view(
                                     &line_buf_scroll.lock().unwrap(),
                                     next,
                                     &theme,
                                     PROMPT_BAR_HEIGHT,
                                 );
-                                let _ = crossterm::execute!(
-                                    std::io::stdout(),
-                                    crossterm::cursor::Hide
-                                );
+                                let _ =
+                                    crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide);
                             }
                         }
                         Ok(crossterm::event::Event::Resize(_, _)) => {

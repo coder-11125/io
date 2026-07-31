@@ -83,6 +83,17 @@ fn is_env_var_name(s: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
+/// Ask whether to authenticate with an API key or an OAuth login.
+async fn ask_auth_oauth(lines: &mut Lines) -> anyhow::Result<bool> {
+    let answer = ask(
+        lines,
+        "Authentication (api key / oauth login) [api key]",
+        "api key",
+    )
+    .await?;
+    Ok(answer.trim().eq_ignore_ascii_case("oauth") || answer.trim().eq_ignore_ascii_case("login"))
+}
+
 pub async fn run() -> anyhow::Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let lines = &mut lines;
@@ -94,50 +105,90 @@ pub async fn run() -> anyhow::Result<()> {
 
     match p.id {
         "openai" => {
-            let key_input = ask(
-                lines,
-                &format!("API key or env var name [{}]", p.default_key_env),
-                p.default_key_env,
-            )
-            .await?;
-            let (api_key_env, api_key_inline) = split_key_input(&key_input, p.id, &mut keys);
-            let resolved = resolve_key(&api_key_env, &keys, p.id);
-            let model = pick_model(
-                lines,
-                fetch_openai_models("https://api.openai.com/v1", &resolved).await,
-                "gpt-4o",
-            )
-            .await?;
-            config.provider.openai = Some(io_runtime::config::OpenAIConfig {
-                model,
-                base_url: "https://api.openai.com/v1".to_string(),
-                api_key_env,
-                api_key: api_key_inline,
-                context_window: None,
-            });
+            if ask_auth_oauth(lines).await? {
+                crate::login::run(p.id).await?;
+                let token = io_runtime::oauth::oauth_access_token(p.id).await?;
+                let model = pick_model(
+                    lines,
+                    fetch_openai_models("https://api.openai.com/v1", &token).await,
+                    "gpt-4o",
+                )
+                .await?;
+                config.provider.openai = Some(io_runtime::config::OpenAIConfig {
+                    model,
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key_env: None,
+                    api_key: None,
+                    auth: io_runtime::config::AuthMethod::OAuth,
+                    context_window: None,
+                });
+            } else {
+                let key_input = ask(
+                    lines,
+                    &format!("API key or env var name [{}]", p.default_key_env),
+                    p.default_key_env,
+                )
+                .await?;
+                let (api_key_env, api_key_inline) = split_key_input(&key_input, p.id, &mut keys);
+                let resolved = resolve_key(&api_key_env, &keys, p.id);
+                let model = pick_model(
+                    lines,
+                    fetch_openai_models("https://api.openai.com/v1", &resolved).await,
+                    "gpt-4o",
+                )
+                .await?;
+                config.provider.openai = Some(io_runtime::config::OpenAIConfig {
+                    model,
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key_env,
+                    api_key: api_key_inline,
+                    auth: io_runtime::config::AuthMethod::ApiKey,
+                    context_window: None,
+                });
+            }
         }
         "anthropic" => {
-            let key_input = ask(
-                lines,
-                &format!("API key or env var name [{}]", p.default_key_env),
-                p.default_key_env,
-            )
-            .await?;
-            let (api_key_env, _) = split_key_input(&key_input, p.id, &mut keys);
-            let resolved = resolve_key(&api_key_env, &keys, p.id);
-            let model = pick_model(
-                lines,
-                fetch_anthropic_models(&resolved).await,
-                "claude-sonnet-4-20250514",
-            )
-            .await?;
-            config.provider.anthropic = Some(io_runtime::config::AnthropicConfig {
-                model,
-                base_url: "https://api.anthropic.com/v1".to_string(),
-                api_key_env,
-                api_key: None,
-                context_window: None,
-            });
+            if ask_auth_oauth(lines).await? {
+                crate::login::run(p.id).await?;
+                let token = io_runtime::oauth::oauth_access_token(p.id).await?;
+                let model = pick_model(
+                    lines,
+                    fetch_anthropic_models(&token, true).await,
+                    "claude-sonnet-4-20250514",
+                )
+                .await?;
+                config.provider.anthropic = Some(io_runtime::config::AnthropicConfig {
+                    model,
+                    base_url: "https://api.anthropic.com/v1".to_string(),
+                    api_key_env: None,
+                    api_key: None,
+                    auth: io_runtime::config::AuthMethod::OAuth,
+                    context_window: None,
+                });
+            } else {
+                let key_input = ask(
+                    lines,
+                    &format!("API key or env var name [{}]", p.default_key_env),
+                    p.default_key_env,
+                )
+                .await?;
+                let (api_key_env, _) = split_key_input(&key_input, p.id, &mut keys);
+                let resolved = resolve_key(&api_key_env, &keys, p.id);
+                let model = pick_model(
+                    lines,
+                    fetch_anthropic_models(&resolved, false).await,
+                    "claude-sonnet-4-20250514",
+                )
+                .await?;
+                config.provider.anthropic = Some(io_runtime::config::AnthropicConfig {
+                    model,
+                    base_url: "https://api.anthropic.com/v1".to_string(),
+                    api_key_env,
+                    api_key: None,
+                    auth: io_runtime::config::AuthMethod::ApiKey,
+                    context_window: None,
+                });
+            }
         }
         "gemini" => {
             let key_input = ask(
@@ -491,19 +542,22 @@ pub(crate) async fn fetch_openai_models(base_url: &str, api_key: &str) -> Vec<St
     ids
 }
 
-pub(crate) async fn fetch_anthropic_models(api_key: &str) -> Vec<String> {
-    if api_key.is_empty() {
+pub(crate) async fn fetch_anthropic_models(credential: &str, use_bearer: bool) -> Vec<String> {
+    if credential.is_empty() {
         return vec![];
     }
 
     let client = reqwest::Client::new();
-    let Ok(resp) = client
+    let mut req = client
         .get("https://api.anthropic.com/v1/models")
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .send()
-        .await
-    else {
+        .header("anthropic-version", "2023-06-01");
+    if use_bearer {
+        req = req.header("Authorization", format!("Bearer {credential}"));
+    } else {
+        req = req.header("x-api-key", credential);
+    }
+
+    let Ok(resp) = req.send().await else {
         return vec![];
     };
 

@@ -20,4 +20,5 @@ toml.workspace = true
 indoc.workspace = true
 reqwest.workspace = true
 crossterm.workspace = true
+url = "2"
 termimad = "0.34.1"

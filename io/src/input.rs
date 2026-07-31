@@ -1,9 +1,11 @@
 //! TUI input: readline loops, popup helpers, @file resolution, text editing primitives.
 
 use crate::stream::{LineBuf, SCROLL_STEP};
-use io_tui::render::{draw_prompt_bar, handle_resize_with_height, render_scroll_view, PROMPT_BAR_HEIGHT};
-use std::io::Write;
+use io_tui::render::{
+    draw_prompt_bar, handle_resize_with_height, render_scroll_view, PROMPT_BAR_HEIGHT,
+};
 use io_tui::SLASH_COMMANDS;
+use std::io::Write;
 
 pub const MAX_AT_FILE_BYTES: usize = 100 * 1024;
 
@@ -61,7 +63,11 @@ fn read_at_path(path: &str) -> Option<String> {
             .map(|e| {
                 let name = e.file_name().into_string().unwrap_or_default();
                 let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                if is_dir { format!("{name}/") } else { name }
+                if is_dir {
+                    format!("{name}/")
+                } else {
+                    name
+                }
             })
             .collect();
         lines.sort_by(|a, b| b.ends_with('/').cmp(&a.ends_with('/')).then(a.cmp(b)));
@@ -405,7 +411,11 @@ impl PasteBlock {
                 format!("[~{} chars pasted]", content.chars().count())
             }
         };
-        PasteBlock { pos, content, label }
+        PasteBlock {
+            pos,
+            content,
+            label,
+        }
     }
 
     /// Adjust anchor after inserting `bytes` at `insert_pos` in buf.
@@ -682,22 +692,24 @@ pub fn tui_read_line(
                         }
                         let mut new_rows: u16 = 0;
                         if let Some(ref all) = file_all {
-                            let prefix =
-                                io_tui::readline::at_prefix(&buf).map(|(_, p)| p).unwrap_or("");
+                            let prefix = io_tui::readline::at_prefix(&buf)
+                                .map(|(_, p)| p)
+                                .unwrap_or("");
                             file_filtered = io_tui::readline::filter_files(all, prefix);
-                            file_selected =
-                                if file_filtered.is_empty() { None } else { Some(0) };
+                            file_selected = if file_filtered.is_empty() {
+                                None
+                            } else {
+                                Some(0)
+                            };
                             file_scroll = 0;
-                            new_rows =
-                                draw_file_popup(&file_filtered, file_selected, file_scroll)?;
+                            new_rows = draw_file_popup(&file_filtered, file_selected, file_scroll)?;
                             slash_matches.clear();
                             slash_selected = None;
                         } else {
                             slash_matches = filter_slash_commands(&buf);
                             slash_selected = None;
                             if !slash_matches.is_empty() {
-                                new_rows =
-                                    draw_slash_popup(&slash_matches, slash_selected, None)?;
+                                new_rows = draw_slash_popup(&slash_matches, slash_selected, None)?;
                             } else {
                                 clear_rows_above(popup_rows)?;
                             }
@@ -867,8 +879,8 @@ pub fn tui_read_line(
                             current_prompt_height =
                                 bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
                         } else if cursor < buf.len() {
-                            let next = cursor
-                                + buf[cursor..].chars().next().map_or(0, |c| c.len_utf8());
+                            let next =
+                                cursor + buf[cursor..].chars().next().map_or(0, |c| c.len_utf8());
                             buf.drain(cursor..next);
                             if let Some(ref mut pb) = paste_block {
                                 if !pb.on_remove(cursor, next) {
@@ -879,8 +891,7 @@ pub fn tui_read_line(
                             slash_matches = filter_slash_commands(&buf);
                             slash_selected = None;
                             if !slash_matches.is_empty() {
-                                new_rows =
-                                    draw_slash_popup(&slash_matches, slash_selected, None)?;
+                                new_rows = draw_slash_popup(&slash_matches, slash_selected, None)?;
                             } else {
                                 clear_rows_above(popup_rows)?;
                             }
@@ -954,12 +965,15 @@ pub fn tui_read_line(
                         let all = io_tui::readline::list_files();
                         file_filtered = all.clone();
                         file_all = Some(all);
-                        file_selected = if file_filtered.is_empty() { None } else { Some(0) };
+                        file_selected = if file_filtered.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        };
                         file_scroll = 0;
                         slash_matches.clear();
                         slash_selected = None;
-                        popup_rows =
-                            draw_file_popup(&file_filtered, file_selected, file_scroll)?;
+                        popup_rows = draw_file_popup(&file_filtered, file_selected, file_scroll)?;
                         current_prompt_height =
                             bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
                     }
@@ -994,8 +1008,11 @@ pub fn tui_read_line(
                                     file_filtered = io_tui::readline::filter_files(all, prefix);
                                 }
                             }
-                            file_selected =
-                                if file_filtered.is_empty() { None } else { Some(0) };
+                            file_selected = if file_filtered.is_empty() {
+                                None
+                            } else {
+                                Some(0)
+                            };
                             file_scroll = 0;
                             popup_rows =
                                 draw_file_popup(&file_filtered, file_selected, file_scroll)?;

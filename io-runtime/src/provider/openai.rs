@@ -32,6 +32,17 @@ impl OpenAIProvider {
             .map_err(|_| anyhow::anyhow!("missing {env_var} environment variable"))
     }
 
+    /// The bearer credential: the OAuth access token when the provider is
+    /// configured for OAuth login, otherwise the API key. OAuth tokens are
+    /// refreshed (and persisted) automatically when expired.
+    async fn bearer_token(&self) -> anyhow::Result<String> {
+        if self.config.auth == crate::config::AuthMethod::OAuth {
+            crate::oauth::oauth_access_token("openai").await
+        } else {
+            self.api_key()
+        }
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}/{}", self.config.base_url.trim_end_matches('/'), path)
     }
@@ -50,13 +61,13 @@ impl CompletionModel for OpenAIProvider {
     }
 
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse> {
-        let api_key = self.api_key()?;
+        let token = self.bearer_token().await?;
         let body = build_chat_body(&self.config, &request, false);
 
         let resp = self
             .client
             .post(self.url("chat/completions"))
-            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&body)
             .send()
             .await?;
@@ -73,13 +84,13 @@ impl CompletionModel for OpenAIProvider {
         &self,
         request: CompletionRequest,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<StreamEvent>>> {
-        let api_key = self.api_key()?;
+        let token = self.bearer_token().await?;
         let body = build_chat_body(&self.config, &request, true);
 
         let resp = self
             .client
             .post(self.url("chat/completions"))
-            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Authorization", format!("Bearer {token}"))
             .json(&body)
             .send()
             .await?;
@@ -238,6 +249,7 @@ pub(crate) fn build_chat_body_with_model(
         api_key_env: None,
         api_key: None,
         context_window: None,
+        auth: crate::config::AuthMethod::ApiKey,
     };
     build_chat_body(&cfg, request, stream)
 }

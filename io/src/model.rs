@@ -27,8 +27,26 @@ async fn fetch_for(provider_id: &'static str, config: Config, keys: KeyStore) ->
     let p = &config.provider;
 
     match provider_id {
-        "openai" => fetch_openai_models("https://api.openai.com/v1", &key).await,
-        "anthropic" => fetch_anthropic_models(&key).await,
+        "openai" => {
+            let credential = if p.uses_oauth("openai") {
+                io_runtime::oauth::oauth_access_token("openai")
+                    .await
+                    .unwrap_or_default()
+            } else {
+                key
+            };
+            fetch_openai_models("https://api.openai.com/v1", &credential).await
+        }
+        "anthropic" => {
+            if p.uses_oauth("anthropic") {
+                match io_runtime::oauth::oauth_access_token("anthropic").await {
+                    Ok(token) => fetch_anthropic_models(&token, true).await,
+                    Err(_) => vec![],
+                }
+            } else {
+                fetch_anthropic_models(&key, false).await
+            }
+        }
         "gemini" => fetch_gemini_models(&key).await,
         "groq" => fetch_openai_models("https://api.groq.com/openai/v1", &key).await,
         "ollama" => {
