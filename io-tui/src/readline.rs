@@ -28,6 +28,10 @@ const COMMANDS: &[Cmd] = &[
         desc: "Set up a provider",
     },
     Cmd {
+        name: "/login",
+        desc: "Sign in with OAuth (ChatGPT / Claude)",
+    },
+    Cmd {
         name: "/model",
         desc: "Switch model",
     },

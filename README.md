@@ -112,6 +112,7 @@ Launches an interactive session with a streaming agent loop. Commands:
 | `/new` | Start a new session |
 | `/agent` | Switch agent mode (build, plan, debug, refactor) |
 | `/connect` | Set up a provider interactively (with live model fetching) |
+| `/login` | Sign in with OAuth (ChatGPT / Claude) |
 | `/model` | Switch between configured providers |
 | `/theme` | Switch UI color theme (12 themes) |
 | `/cost` | Show API cost summary for the current session |

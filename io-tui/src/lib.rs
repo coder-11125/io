@@ -9,6 +9,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/new", "Start a new session"),
     ("/agent", "Switch agent mode"),
     ("/connect", "Set up a provider"),
+    ("/login", "Sign in with OAuth (ChatGPT / Claude)"),
     ("/model", "Switch model"),
     ("/theme", "Switch UI theme"),
     ("/cost", "Show API cost for current session"),
