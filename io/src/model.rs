@@ -115,15 +115,22 @@ fn set_model(config: &mut Config, provider_id: &str, model_id: &str) {
     }
 }
 
+/// Whether a provider should be listed in the `/model` picker: it has an API
+/// key, needs no key (ollama/bedrock), or is configured for OAuth login
+/// (ChatGPT / Claude subscription) — those authenticate without any API key.
+fn provider_available(config: &Config, keys: &KeyStore, provider_id: &str) -> bool {
+    keys.get(provider_id).is_some()
+        || matches!(provider_id, "ollama" | "bedrock")
+        || config.provider.uses_oauth(provider_id)
+}
+
 pub async fn run() -> anyhow::Result<()> {
     let config = Config::load()?;
     let keys = KeyStore::load();
 
-    const NO_KEY: &[&str] = &["ollama", "bedrock"];
-
     let available: Vec<(&'static str, &'static str)> = PROVIDERS
         .iter()
-        .filter(|p| keys.get(p.id).is_some() || NO_KEY.contains(&p.id))
+        .filter(|p| provider_available(&config, &keys, p.id))
         .map(|p| (p.id, p.label))
         .collect();
 
@@ -201,4 +208,42 @@ pub async fn run() -> anyhow::Result<()> {
     println!();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_available_with_api_key() {
+        let config = Config::default();
+        let mut keys = KeyStore::default();
+        keys.set("gemini", "test-key".to_string());
+        assert!(provider_available(&config, &keys, "gemini"));
+        assert!(!provider_available(&config, &keys, "openai"));
+    }
+
+    #[test]
+    fn provider_available_without_key_needed() {
+        let config = Config::default();
+        let keys = KeyStore::default();
+        // ollama and bedrock need no API key.
+        assert!(provider_available(&config, &keys, "ollama"));
+        assert!(provider_available(&config, &keys, "bedrock"));
+    }
+
+    #[test]
+    fn provider_available_with_oauth() {
+        let mut config = Config::default();
+        let keys = KeyStore::default();
+        // No API key, not oauth yet -> not listed.
+        assert!(!provider_available(&config, &keys, "openai"));
+        // After OAuth login the provider is listed without any API key.
+        config.provider.openai.as_mut().unwrap().auth = io_runtime::config::AuthMethod::OAuth;
+        assert!(provider_available(&config, &keys, "openai"));
+        // OAuth is per-provider: anthropic is not listed until logged in.
+        assert!(!provider_available(&config, &keys, "anthropic"));
+        config.provider.anthropic.as_mut().unwrap().auth = io_runtime::config::AuthMethod::OAuth;
+        assert!(provider_available(&config, &keys, "anthropic"));
+    }
 }
