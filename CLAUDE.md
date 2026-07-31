@@ -327,7 +327,13 @@ pub trait Tool: Send + Sync {
 - `ReadTool` - Read file contents
 - `WriteTool` - Write/create files
 - `EditTool` - String replacement in files
-- `BashTool` - Execute shell commands
+- `BashTool` - Execute shell commands with resource limits (512 MB VM, 60 s CPU,
+  200 MB file size) applied at spawn. Foreground runs support a timeout (ms)
+  that kills the **whole process group** (no orphaned grandchildren) and
+  returns partial output. Background jobs (`action: start` → job id, then
+  `status`/`output`/`kill`/`list`) keep running across turns and are killed if
+  the owning tool is dropped. Esc (the shared cancel flag) also kills a
+  running command via the process group.
 - `GlobTool` - File pattern matching
 - `GrepTool` - Search file contents
 - `SpawnAgentTool` - Delegate a scoped task to a restricted sub-agent

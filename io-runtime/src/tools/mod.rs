@@ -155,7 +155,7 @@ fn tool_by_name(name: &str) -> Option<Box<dyn Tool>> {
         "read" => Some(Box::new(ReadTool)),
         "write" => Some(Box::new(WriteTool)),
         "edit" => Some(Box::new(EditTool)),
-        "bash" => Some(Box::new(BashTool)),
+        "bash" => Some(Box::new(BashTool::new())),
         "glob" => Some(Box::new(GlobTool)),
         "grep" => Some(Box::new(GrepTool)),
         _ => None,
