@@ -1,4 +1,5 @@
 pub mod picker;
+pub mod raw;
 pub mod readline;
 pub mod render;
 pub mod theme;

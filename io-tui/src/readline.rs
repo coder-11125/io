@@ -90,10 +90,8 @@ pub fn read_line(ctx: ReadLineCtx) -> anyhow::Result<Option<ReadLineOutput>> {
     queue!(stdout, cursor::MoveUp(reserve as u16))?;
     stdout.flush()?;
 
-    terminal::enable_raw_mode()?;
-    let result = input_loop(&mut stdout, ctx, popup_capacity);
-    let _ = terminal::disable_raw_mode();
-    result
+    let _raw = crate::raw::RawModeGuard::acquire()?;
+    input_loop(&mut stdout, ctx, popup_capacity)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────

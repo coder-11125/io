@@ -27,10 +27,12 @@ const MOCK_DIFF: &[(&str, i8)] = &[
 const LEFT_W: usize = 20;
 
 pub fn run(current_theme: &str) -> anyhow::Result<&'static str> {
+    // Preserve the caller's raw-mode state (see `crate::raw`): inside the
+    // TUI raw mode is already on, so the guard restores only when the theme
+    // picker itself enabled it.
+    let _raw = crate::raw::RawModeGuard::acquire()?;
     let mut stdout = io::stdout();
-    terminal::enable_raw_mode()?;
     let result = theme_picker_loop(&mut stdout, current_theme);
-    let _ = terminal::disable_raw_mode();
     let _ = execute!(io::stdout(), cursor::Show);
     result
 }
@@ -97,7 +99,6 @@ fn theme_picker_loop(stdout: &mut impl Write, current_theme: &str) -> anyhow::Re
                     return Err(crate::picker::Dismissed::Cancelled.into());
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let _ = terminal::disable_raw_mode();
                     execute!(stdout, cursor::Show)?;
                     return Err(crate::picker::Dismissed::Interrupted.into());
                 }

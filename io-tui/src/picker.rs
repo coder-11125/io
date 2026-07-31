@@ -27,10 +27,13 @@ pub fn pick(items: &[&str], current: Option<usize>) -> anyhow::Result<usize> {
     if items.is_empty() {
         anyhow::bail!("no items to pick from");
     }
+    // Preserve the caller's raw-mode state: inside the TUI raw mode is
+    // already on, and disabling it here would leave the terminal cooked
+    // mid-session while mouse capture stays enabled (raw SGR garbage on
+    // mouse move). The guard only disables when it did the enabling.
+    let _raw = crate::raw::RawModeGuard::acquire()?;
     let mut stdout = io::stdout();
-    terminal::enable_raw_mode()?;
     let result = pick_loop(&mut stdout, items, current);
-    let _ = terminal::disable_raw_mode();
     let _ = execute!(io::stdout(), cursor::Show);
     result
 }
@@ -41,10 +44,9 @@ pub fn pick_with_hint(items: &[(&str, &str)], current: Option<usize>) -> anyhow:
     if items.is_empty() {
         anyhow::bail!("no items to pick from");
     }
+    let _raw = crate::raw::RawModeGuard::acquire()?;
     let mut stdout = io::stdout();
-    terminal::enable_raw_mode()?;
     let result = pick_hint_loop(&mut stdout, items, current, None, current.unwrap_or(0));
-    let _ = terminal::disable_raw_mode();
     let _ = execute!(io::stdout(), cursor::Show);
     result
 }
@@ -61,10 +63,9 @@ pub fn pick_permission(
     if items.is_empty() {
         anyhow::bail!("no items to pick from");
     }
+    let _raw = crate::raw::RawModeGuard::acquire()?;
     let mut stdout = io::stdout();
-    terminal::enable_raw_mode()?;
     let result = pick_hint_loop(&mut stdout, items, None, Some(title), initial);
-    let _ = terminal::disable_raw_mode();
     let _ = execute!(io::stdout(), cursor::Show);
     result
 }
@@ -229,7 +230,6 @@ fn pick_hint_loop(
                     return Err(Dismissed::Cancelled.into());
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let _ = terminal::disable_raw_mode();
                     execute!(stdout, cursor::Show)?;
                     stdout.flush()?;
                     return Err(Dismissed::Interrupted.into());
@@ -351,7 +351,6 @@ fn pick_loop(
                     return Err(Dismissed::Cancelled.into());
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let _ = terminal::disable_raw_mode();
                     execute!(stdout, cursor::Show)?;
                     stdout.flush()?;
                     return Err(Dismissed::Interrupted.into());
