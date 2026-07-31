@@ -544,7 +544,7 @@ pub fn clear_prompt_input() -> std::io::Result<()> {
     use crossterm::{cursor, execute, terminal};
 
     let (_, h) = crossterm::terminal::size()?;
-    let prompt_y = h - PROMPT_BAR_HEIGHT;
+    let prompt_y = h.saturating_sub(PROMPT_BAR_HEIGHT);
     execute!(
         std::io::stdout(),
         cursor::MoveTo(0, prompt_y + 1),

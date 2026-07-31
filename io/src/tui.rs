@@ -4,7 +4,7 @@
 use crate::cost::show_cost_summary;
 use crate::input::{clear_rows_above, resolve_at_mentions, splash_read_line, tui_read_line};
 use crate::stream::{blink_and_print, push_line, LineBuf, PendingPermission, SCROLL_STEP};
-use crate::{agent, connect, model};
+use crate::{agent, connect, login, model};
 use io_runtime::types::SessionId;
 use io_tui::picker;
 use io_tui::render::{
@@ -19,6 +19,40 @@ enum SessionChoice {
     New,
     Continue,
     Existing(SessionId),
+}
+
+/// Run an interactive flow with the TUI suspended: leave the alternate screen
+/// and disable raw mode so line-based prompts (API keys, pasted OAuth codes)
+/// and browser URLs behave normally, then re-enter the TUI and clear the stale
+/// alternate-screen content. The flow's result is preserved either way.
+async fn run_suspended<T>(
+    flow: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    exit_tui()?;
+    let result = flow.await;
+    enter_tui()?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+    )?;
+    result
+}
+
+/// OAuth sign-in flow for `/login`: pick a provider, then run its login flow.
+async fn login_flow() -> anyhow::Result<()> {
+    let providers = [
+        (
+            "openai",
+            "OpenAI (ChatGPT) — sign in with your ChatGPT account",
+        ),
+        (
+            "anthropic",
+            "Anthropic (Claude) — sign in with a Claude subscription",
+        ),
+    ];
+    let labels: Vec<&str> = providers.iter().map(|(_, l)| *l).collect();
+    let idx = picker::pick(&labels, None)?;
+    login::run(providers[idx].0).await
 }
 
 // ── Project root detection ─────────────────────────────────────────────────────
@@ -302,6 +336,7 @@ pub async fn run_interactive(
                     "  /new           Start a new session",
                     "  /agent         Switch agent mode",
                     "  /connect       Set up a provider interactively",
+                    "  /login         Sign in with OAuth (ChatGPT / Claude)",
                     "  /model         Switch between configured providers",
                     "  /theme         Switch UI theme",
                     "  /cost          Show API cost summary for current session",
@@ -427,7 +462,7 @@ pub async fn run_interactive(
                 continue;
             }
             "/connect" => {
-                match connect::run().await {
+                match run_suspended(connect::run()).await {
                     Ok(()) => {
                         let sid = agent.session_id().await;
                         match build_agent(SessionChoice::Existing(sid), &current_agent, None).await
@@ -446,7 +481,7 @@ pub async fn run_interactive(
                             }
                         }
                     }
-                    Err(e) => {
+                    Err(e) if !e.is::<picker::Dismissed>() => {
                         let _ = draw_prompt_bar(
                             &format!("error: {e}"),
                             current_agent.name,
@@ -457,6 +492,45 @@ pub async fn run_interactive(
                             &theme,
                         );
                     }
+                    _ => {}
+                }
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            "/login" => {
+                match run_suspended(login_flow()).await {
+                    Ok(()) => {
+                        let sid = agent.session_id().await;
+                        match build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                        {
+                            Ok(new_agent) => agent = new_agent,
+                            Err(e) => {
+                                let _ = draw_prompt_bar(
+                                    &format!("error reloading provider: {e}"),
+                                    current_agent.name,
+                                    agent.provider_id,
+                                    &agent.model_id,
+                                    last_input_tokens,
+                                    agent.context_window(),
+                                    &theme,
+                                );
+                            }
+                        }
+                    }
+                    Err(e) if !e.is::<picker::Dismissed>() => {
+                        let _ = draw_prompt_bar(
+                            &format!("error: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
+                    _ => {}
                 }
                 if from_splash {
                     is_splash = true;
