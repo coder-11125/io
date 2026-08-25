@@ -340,6 +340,7 @@ pub async fn run_interactive(
                     "  /model         Switch between configured providers",
                     "  /theme         Switch UI theme",
                     "  /cost          Show API cost summary for current session",
+                    "  /context       Fetch the real context window from the provider API",
                     "  /compact       Summarize and compress conversation history",
                     "  !<cmd>         Run a shell command",
                 ];
@@ -371,6 +372,54 @@ pub async fn run_interactive(
                         agent.context_window(),
                         &theme,
                     );
+                }
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            "/context" => {
+                match model::refresh_context_window().await {
+                    Ok(msg) => {
+                        let sid = agent.session_id().await;
+                        match build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                        {
+                            Ok(new_agent) => {
+                                agent = new_agent;
+                                let _ = draw_prompt_bar(
+                                    &msg,
+                                    current_agent.name,
+                                    agent.provider_id,
+                                    &agent.model_id,
+                                    last_input_tokens,
+                                    agent.context_window(),
+                                    &theme,
+                                );
+                            }
+                            Err(e) => {
+                                let _ = draw_prompt_bar(
+                                    &format!("error reloading provider: {e}"),
+                                    current_agent.name,
+                                    agent.provider_id,
+                                    &agent.model_id,
+                                    last_input_tokens,
+                                    agent.context_window(),
+                                    &theme,
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = draw_prompt_bar(
+                            &format!("error: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
                 }
                 if from_splash {
                     is_splash = true;

@@ -68,6 +68,60 @@ async fn fetch_for(provider_id: &'static str, config: Config, keys: KeyStore) ->
     }
 }
 
+/// Providers whose APIs expose a real context-window number we can fetch —
+/// see `io_runtime::provider::discovery`. Everything else has no such
+/// endpoint and stays on the static guess / manual config override.
+const CONTEXT_DISCOVERABLE: &[&str] = &["gemini", "groq", "openrouter", "ollama"];
+
+fn set_context_window(config: &mut Config, provider_id: &str, tokens: u64) {
+    let p = &mut config.provider;
+    match provider_id {
+        "gemini" => p.gemini.get_or_insert_with(Default::default).context_window = Some(tokens),
+        "groq" => p.groq.get_or_insert_with(Default::default).context_window = Some(tokens),
+        "openrouter" => {
+            p.openrouter
+                .get_or_insert_with(Default::default)
+                .context_window = Some(tokens)
+        }
+        "ollama" => p.ollama.get_or_insert_with(Default::default).context_window = Some(tokens),
+        _ => {}
+    }
+}
+
+/// Fetch the real context window for the active provider's model from its
+/// API and persist it as that provider's `context_window` config override.
+/// Returns a human-readable result line for display.
+pub async fn refresh_context_window() -> anyhow::Result<String> {
+    let config = Config::load()?;
+    let keys = KeyStore::load();
+    let provider_id = config.provider.default.clone();
+    let model = model_for(&config, &provider_id).to_string();
+
+    if !CONTEXT_DISCOVERABLE.contains(&provider_id.as_str()) {
+        anyhow::bail!(
+            "{provider_id} doesn't expose context window via API — set it manually with \
+             `io config set provider.{provider_id}.context_window <tokens>`"
+        );
+    }
+
+    match io_runtime::provider::discovery::fetch_context_window(&provider_id, &config, &keys)
+        .await?
+    {
+        Some(tokens) => {
+            let mut config = Config::load()?;
+            set_context_window(&mut config, &provider_id, tokens);
+            config.save()?;
+            Ok(format!(
+                "{provider_id} · {model}: context window set to {tokens} tokens"
+            ))
+        }
+        None => anyhow::bail!(
+            "{model} not found in {provider_id}'s catalog — set it manually with \
+             `io config set provider.{provider_id}.context_window <tokens>`"
+        ),
+    }
+}
+
 fn set_model(config: &mut Config, provider_id: &str, model_id: &str) {
     let m = model_id.to_string();
     let p = &mut config.provider;

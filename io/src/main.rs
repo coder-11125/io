@@ -51,6 +51,18 @@ enum Commands {
     /// Sign in with OAuth for a provider that offers subscription access
     /// (openai = ChatGPT, anthropic = Claude) instead of an API key
     Login { provider: String },
+    /// Model management
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelAction {
+    /// Fetch the active provider's real context window from its API (Gemini,
+    /// Groq, OpenRouter, Ollama only) and save it as a config override.
+    Refresh,
 }
 
 #[derive(Subcommand)]
@@ -83,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Config { action }) => config_cmd::handle_config(action)?,
         Some(Commands::Init) => config_cmd::handle_init()?,
         Some(Commands::Login { provider }) => login::run(&provider).await?,
+        Some(Commands::Model {
+            action: ModelAction::Refresh,
+        }) => println!("{}", model::refresh_context_window().await?),
         None => {
             if let Some(prompt) = cli.prompt {
                 tui::run_single_shot(&prompt, cli.model.as_deref()).await?;

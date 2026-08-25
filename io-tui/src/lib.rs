@@ -14,6 +14,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "Switch model"),
     ("/theme", "Switch UI theme"),
     ("/cost", "Show API cost for current session"),
+    (
+        "/context",
+        "Fetch the real context window from the provider API",
+    ),
     ("/compact", "Summarize and compress conversation history"),
     ("/exit", "Exit"),
     ("/quit", "Exit"),

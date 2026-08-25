@@ -4,6 +4,7 @@ use std::sync::Arc;
 pub mod anthropic;
 pub mod azure;
 pub mod bedrock;
+pub mod discovery;
 pub mod gemini;
 pub mod openai;
 
