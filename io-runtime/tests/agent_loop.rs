@@ -153,6 +153,7 @@ fn make_agent_at(
         "mock-model".to_string(),
         1024,
         false,
+        None,
     )
 }
 
@@ -434,6 +435,7 @@ async fn sub_agent_inherits_permissions_and_fails_closed() {
         "mock-model".to_string(),
         1024,
         false,
+        None,
     );
     // The user approves spawning the sub-agent — but nothing else.
     agent.set_prompt_fn(Arc::new(|name, _| {

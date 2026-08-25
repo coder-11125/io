@@ -16,7 +16,7 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/cost", "Show API cost for current session"),
     (
         "/context",
-        "Fetch the real context window from the provider API",
+        "Fetch real context window, pricing, and tool support from the provider catalog",
     ),
     ("/compact", "Summarize and compress conversation history"),
     ("/exit", "Exit"),

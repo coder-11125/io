@@ -121,6 +121,8 @@ pub async fn run() -> anyhow::Result<()> {
                     api_key: None,
                     auth: io_runtime::config::AuthMethod::OAuth,
                     context_window: None,
+                    cost_input_per_1k: None,
+                    cost_output_per_1k: None,
                 });
             } else {
                 let key_input = ask(
@@ -144,6 +146,8 @@ pub async fn run() -> anyhow::Result<()> {
                     api_key: api_key_inline,
                     auth: io_runtime::config::AuthMethod::ApiKey,
                     context_window: None,
+                    cost_input_per_1k: None,
+                    cost_output_per_1k: None,
                 });
             }
         }
@@ -164,6 +168,8 @@ pub async fn run() -> anyhow::Result<()> {
                     api_key: None,
                     auth: io_runtime::config::AuthMethod::OAuth,
                     context_window: None,
+                    cost_input_per_1k: None,
+                    cost_output_per_1k: None,
                 });
             } else {
                 let key_input = ask(
@@ -187,6 +193,8 @@ pub async fn run() -> anyhow::Result<()> {
                     api_key: None,
                     auth: io_runtime::config::AuthMethod::ApiKey,
                     context_window: None,
+                    cost_input_per_1k: None,
+                    cost_output_per_1k: None,
                 });
             }
         }
@@ -211,6 +219,8 @@ pub async fn run() -> anyhow::Result<()> {
                 api_key_env,
                 api_key: None,
                 context_window: None,
+                cost_input_per_1k: None,
+                cost_output_per_1k: None,
             });
         }
         "groq" => {
@@ -233,6 +243,8 @@ pub async fn run() -> anyhow::Result<()> {
                 api_key_env,
                 api_key: None,
                 context_window: None,
+                cost_input_per_1k: None,
+                cost_output_per_1k: None,
             });
         }
         "ollama" => {
@@ -276,6 +288,8 @@ pub async fn run() -> anyhow::Result<()> {
                 api_key_env,
                 api_key: None,
                 context_window: None,
+                cost_input_per_1k: None,
+                cost_output_per_1k: None,
             });
         }
         "bedrock" => {
@@ -290,6 +304,8 @@ pub async fn run() -> anyhow::Result<()> {
                 model,
                 region: Some(region),
                 context_window: None,
+                cost_input_per_1k: None,
+                cost_output_per_1k: None,
             });
         }
         "mistral" => {
@@ -312,6 +328,8 @@ pub async fn run() -> anyhow::Result<()> {
                 api_key_env,
                 api_key: None,
                 context_window: None,
+                cost_input_per_1k: None,
+                cost_output_per_1k: None,
             });
         }
         "deepseek" => {
@@ -334,6 +352,8 @@ pub async fn run() -> anyhow::Result<()> {
                 api_key_env,
                 api_key: None,
                 context_window: None,
+                cost_input_per_1k: None,
+                cost_output_per_1k: None,
             });
         }
         "openrouter" => {
@@ -356,6 +376,8 @@ pub async fn run() -> anyhow::Result<()> {
                 api_key_env,
                 api_key: None,
                 context_window: None,
+                cost_input_per_1k: None,
+                cost_output_per_1k: None,
             });
         }
         "xai" => {
@@ -378,6 +400,8 @@ pub async fn run() -> anyhow::Result<()> {
                 api_key_env,
                 api_key: None,
                 context_window: None,
+                cost_input_per_1k: None,
+                cost_output_per_1k: None,
             });
         }
         "opencode_go" => {
@@ -400,6 +424,8 @@ pub async fn run() -> anyhow::Result<()> {
                 api_key_env,
                 api_key: None,
                 context_window: None,
+                cost_input_per_1k: None,
+                cost_output_per_1k: None,
             });
         }
         "opencode_zen" => {
@@ -422,6 +448,8 @@ pub async fn run() -> anyhow::Result<()> {
                 api_key_env,
                 api_key: None,
                 context_window: None,
+                cost_input_per_1k: None,
+                cost_output_per_1k: None,
             });
         }
         _ => {}

@@ -1,3 +1,4 @@
+use crate::pricing::ModelPricing;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -141,6 +142,35 @@ impl ProviderConfig {
         }
     }
 
+    /// Configured per-token pricing override for a provider id, if both the
+    /// input and output rates are set. Takes precedence over the static
+    /// pricing table in `pricing.rs`. Ollama has no slot for this — it's
+    /// local/free and never billed.
+    pub fn pricing_override_for(&self, id: &str) -> Option<ModelPricing> {
+        macro_rules! pf {
+            ($slot:expr) => {{
+                let c = $slot.as_ref()?;
+                (c.cost_input_per_1k, c.cost_output_per_1k)
+            }};
+        }
+        let (input, output) = match id {
+            "openai" => pf!(self.openai),
+            "anthropic" => pf!(self.anthropic),
+            "gemini" => pf!(self.gemini),
+            "groq" => pf!(self.groq),
+            "azure" => pf!(self.azure),
+            "bedrock" => pf!(self.bedrock),
+            "mistral" => pf!(self.mistral),
+            "deepseek" => pf!(self.deepseek),
+            "openrouter" => pf!(self.openrouter),
+            "xai" => pf!(self.xai),
+            "opencode_go" => pf!(self.opencode_go),
+            "opencode_zen" => pf!(self.opencode_zen),
+            _ => return None,
+        };
+        Some(ModelPricing::new(input?, output?))
+    }
+
     /// Model id of the active (default) provider — used for display,
     /// pricing, and session metadata.
     pub fn active_model(&self) -> String {
@@ -161,6 +191,10 @@ pub struct OpenAIConfig {
     /// Actual context window for this provider+model (tokens).
     /// When set, overrides the model-name-based guess in `context_window_for_model`.
     pub context_window: Option<u64>,
+    /// Actual per-1K-token input/output pricing (USD) for this model.
+    /// When both are set, overrides the static table in `pricing.rs`.
+    pub cost_input_per_1k: Option<f64>,
+    pub cost_output_per_1k: Option<f64>,
     /// Authentication method: API key (default) or OAuth subscription login.
     #[serde(default)]
     pub auth: AuthMethod,
@@ -174,6 +208,8 @@ impl Default for OpenAIConfig {
             api_key_env: None,
             api_key: None,
             context_window: None,
+            cost_input_per_1k: None,
+            cost_output_per_1k: None,
             auth: AuthMethod::ApiKey,
         }
     }
@@ -198,6 +234,10 @@ pub struct AnthropicConfig {
     /// Actual context window for this model (tokens).
     /// When set, overrides the built-in model-name-based guess.
     pub context_window: Option<u64>,
+    /// Actual per-1K-token input/output pricing (USD) for this model.
+    /// When both are set, overrides the static table in `pricing.rs`.
+    pub cost_input_per_1k: Option<f64>,
+    pub cost_output_per_1k: Option<f64>,
     /// Authentication method: API key (default) or OAuth subscription login.
     #[serde(default)]
     pub auth: AuthMethod,
@@ -211,6 +251,8 @@ impl Default for AnthropicConfig {
             api_key_env: None,
             api_key: None,
             context_window: None,
+            cost_input_per_1k: None,
+            cost_output_per_1k: None,
             auth: AuthMethod::ApiKey,
         }
     }
@@ -235,6 +277,10 @@ pub struct GeminiConfig {
     /// Actual context window for this model (tokens).
     /// When set, overrides the built-in model-name-based guess.
     pub context_window: Option<u64>,
+    /// Actual per-1K-token input/output pricing (USD) for this model.
+    /// When both are set, overrides the static table in `pricing.rs`.
+    pub cost_input_per_1k: Option<f64>,
+    pub cost_output_per_1k: Option<f64>,
 }
 
 impl Default for GeminiConfig {
@@ -245,6 +291,8 @@ impl Default for GeminiConfig {
             api_key_env: None,
             api_key: None,
             context_window: None,
+            cost_input_per_1k: None,
+            cost_output_per_1k: None,
         }
     }
 }
@@ -266,6 +314,10 @@ pub struct GroqConfig {
     /// Actual context window for this model (tokens).
     /// When set, overrides the built-in model-name-based guess.
     pub context_window: Option<u64>,
+    /// Actual per-1K-token input/output pricing (USD) for this model.
+    /// When both are set, overrides the static table in `pricing.rs`.
+    pub cost_input_per_1k: Option<f64>,
+    pub cost_output_per_1k: Option<f64>,
 }
 
 impl Default for GroqConfig {
@@ -275,6 +327,8 @@ impl Default for GroqConfig {
             api_key_env: None,
             api_key: None,
             context_window: None,
+            cost_input_per_1k: None,
+            cost_output_per_1k: None,
         }
     }
 }
@@ -320,6 +374,10 @@ pub struct AzureConfig {
     /// Actual context window for this model (tokens).
     /// When set, overrides the built-in model-name-based guess.
     pub context_window: Option<u64>,
+    /// Actual per-1K-token input/output pricing (USD) for this model.
+    /// When both are set, overrides the static table in `pricing.rs`.
+    pub cost_input_per_1k: Option<f64>,
+    pub cost_output_per_1k: Option<f64>,
 }
 
 impl Default for AzureConfig {
@@ -331,6 +389,8 @@ impl Default for AzureConfig {
             api_key_env: None,
             api_key: None,
             context_window: None,
+            cost_input_per_1k: None,
+            cost_output_per_1k: None,
         }
     }
 }
@@ -350,6 +410,10 @@ pub struct BedrockConfig {
     /// Actual context window for this model (tokens).
     /// When set, overrides the built-in model-name-based guess.
     pub context_window: Option<u64>,
+    /// Actual per-1K-token input/output pricing (USD) for this model.
+    /// When both are set, overrides the static table in `pricing.rs`.
+    pub cost_input_per_1k: Option<f64>,
+    pub cost_output_per_1k: Option<f64>,
 }
 
 impl Default for BedrockConfig {
@@ -358,6 +422,8 @@ impl Default for BedrockConfig {
             model: default_bedrock_model(),
             region: None,
             context_window: None,
+            cost_input_per_1k: None,
+            cost_output_per_1k: None,
         }
     }
 }
@@ -376,6 +442,10 @@ pub struct MistralConfig {
     /// Actual context window for this model (tokens).
     /// When set, overrides the built-in model-name-based guess.
     pub context_window: Option<u64>,
+    /// Actual per-1K-token input/output pricing (USD) for this model.
+    /// When both are set, overrides the static table in `pricing.rs`.
+    pub cost_input_per_1k: Option<f64>,
+    pub cost_output_per_1k: Option<f64>,
 }
 
 impl Default for MistralConfig {
@@ -385,6 +455,8 @@ impl Default for MistralConfig {
             api_key_env: None,
             api_key: None,
             context_window: None,
+            cost_input_per_1k: None,
+            cost_output_per_1k: None,
         }
     }
 }
@@ -403,6 +475,10 @@ pub struct DeepSeekConfig {
     /// Actual context window for this model (tokens).
     /// When set, overrides the built-in model-name-based guess.
     pub context_window: Option<u64>,
+    /// Actual per-1K-token input/output pricing (USD) for this model.
+    /// When both are set, overrides the static table in `pricing.rs`.
+    pub cost_input_per_1k: Option<f64>,
+    pub cost_output_per_1k: Option<f64>,
 }
 
 impl Default for DeepSeekConfig {
@@ -412,6 +488,8 @@ impl Default for DeepSeekConfig {
             api_key_env: None,
             api_key: None,
             context_window: None,
+            cost_input_per_1k: None,
+            cost_output_per_1k: None,
         }
     }
 }
@@ -430,6 +508,10 @@ pub struct OpenRouterConfig {
     /// Actual context window for this model (tokens).
     /// When set, overrides the built-in model-name-based guess.
     pub context_window: Option<u64>,
+    /// Actual per-1K-token input/output pricing (USD) for this model.
+    /// When both are set, overrides the static table in `pricing.rs`.
+    pub cost_input_per_1k: Option<f64>,
+    pub cost_output_per_1k: Option<f64>,
 }
 
 impl Default for OpenRouterConfig {
@@ -439,6 +521,8 @@ impl Default for OpenRouterConfig {
             api_key_env: None,
             api_key: None,
             context_window: None,
+            cost_input_per_1k: None,
+            cost_output_per_1k: None,
         }
     }
 }
@@ -457,6 +541,10 @@ pub struct XAIConfig {
     /// Actual context window for this model (tokens).
     /// When set, overrides the built-in model-name-based guess.
     pub context_window: Option<u64>,
+    /// Actual per-1K-token input/output pricing (USD) for this model.
+    /// When both are set, overrides the static table in `pricing.rs`.
+    pub cost_input_per_1k: Option<f64>,
+    pub cost_output_per_1k: Option<f64>,
 }
 
 impl Default for XAIConfig {
@@ -466,6 +554,8 @@ impl Default for XAIConfig {
             api_key_env: None,
             api_key: None,
             context_window: None,
+            cost_input_per_1k: None,
+            cost_output_per_1k: None,
         }
     }
 }
@@ -484,6 +574,10 @@ pub struct OpenCodeGoConfig {
     /// Actual context window for this model (tokens).
     /// When set, overrides the built-in model-name-based guess.
     pub context_window: Option<u64>,
+    /// Actual per-1K-token input/output pricing (USD) for this model.
+    /// When both are set, overrides the static table in `pricing.rs`.
+    pub cost_input_per_1k: Option<f64>,
+    pub cost_output_per_1k: Option<f64>,
 }
 
 impl Default for OpenCodeGoConfig {
@@ -493,6 +587,8 @@ impl Default for OpenCodeGoConfig {
             api_key_env: None,
             api_key: None,
             context_window: None,
+            cost_input_per_1k: None,
+            cost_output_per_1k: None,
         }
     }
 }
@@ -511,6 +607,10 @@ pub struct OpenCodeZenConfig {
     /// Actual context window for this model (tokens).
     /// When set, overrides the built-in model-name-based guess.
     pub context_window: Option<u64>,
+    /// Actual per-1K-token input/output pricing (USD) for this model.
+    /// When both are set, overrides the static table in `pricing.rs`.
+    pub cost_input_per_1k: Option<f64>,
+    pub cost_output_per_1k: Option<f64>,
 }
 
 impl Default for OpenCodeZenConfig {
@@ -520,6 +620,8 @@ impl Default for OpenCodeZenConfig {
             api_key_env: None,
             api_key: None,
             context_window: None,
+            cost_input_per_1k: None,
+            cost_output_per_1k: None,
         }
     }
 }

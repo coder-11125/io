@@ -113,6 +113,9 @@ async fn build_agent(
     }
     let keys = io_runtime::config::KeyStore::load();
     let model_id = config.provider.active_model();
+    let pricing_override = config
+        .provider
+        .pricing_override_for(&config.provider.default);
     let provider = io_runtime::provider::create_provider(&config, &keys)?;
     let memory = io_runtime::memory::SessionStore::new()?;
     let project_root = detect_project_root();
@@ -154,6 +157,7 @@ async fn build_agent(
         model_id,
         config.session.max_tokens,
         config.session.auto_compact,
+        pricing_override,
     ))
 }
 
@@ -340,7 +344,7 @@ pub async fn run_interactive(
                     "  /model         Switch between configured providers",
                     "  /theme         Switch UI theme",
                     "  /cost          Show API cost summary for current session",
-                    "  /context       Fetch the real context window from the provider API",
+                    "  /context       Fetch real context window, pricing, and tool support",
                     "  /compact       Summarize and compress conversation history",
                     "  !<cmd>         Run a shell command",
                 ];

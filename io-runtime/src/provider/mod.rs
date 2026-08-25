@@ -564,6 +564,8 @@ pub fn create_provider(
                 api_key,
                 auth: cfg.auth,
                 context_window: ctx_override,
+                cost_input_per_1k: None,
+                cost_output_per_1k: None,
             }))
         }
         "anthropic" => {
@@ -575,6 +577,8 @@ pub fn create_provider(
                 api_key,
                 auth: cfg.auth,
                 context_window: ctx_override,
+                cost_input_per_1k: None,
+                cost_output_per_1k: None,
             }))
         }
         "gemini" => {
@@ -585,6 +589,8 @@ pub fn create_provider(
                 api_key_env: None,
                 api_key,
                 context_window: ctx_override,
+                cost_input_per_1k: None,
+                cost_output_per_1k: None,
             }))
         }
         "azure" => {
@@ -596,6 +602,8 @@ pub fn create_provider(
                 api_key_env: None,
                 api_key,
                 context_window: ctx_override,
+                cost_input_per_1k: None,
+                cost_output_per_1k: None,
             }))
         }
         "bedrock" => Arc::new(BedrockProvider::new(p.bedrock.clone().unwrap_or_default())),
@@ -618,6 +626,8 @@ pub fn create_provider(
                     api_key_env: None,
                     api_key: Some("ollama".to_string()),
                     context_window: None,
+                    cost_input_per_1k: None,
+                    cost_output_per_1k: None,
                     auth: crate::config::AuthMethod::ApiKey,
                 },
                 ctx,
@@ -641,6 +651,8 @@ pub fn create_provider(
                     api_key_env: None,
                     api_key,
                     context_window: None,
+                    cost_input_per_1k: None,
+                    cost_output_per_1k: None,
                     auth: crate::config::AuthMethod::ApiKey,
                 },
                 ctx,

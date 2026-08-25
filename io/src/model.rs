@@ -68,58 +68,112 @@ async fn fetch_for(provider_id: &'static str, config: Config, keys: KeyStore) ->
     }
 }
 
-/// Providers whose APIs expose a real context-window number we can fetch —
-/// see `io_runtime::provider::discovery`. Everything else has no such
-/// endpoint and stays on the static guess / manual config override.
-const CONTEXT_DISCOVERABLE: &[&str] = &["gemini", "groq", "openrouter", "ollama"];
-
 fn set_context_window(config: &mut Config, provider_id: &str, tokens: u64) {
     let p = &mut config.provider;
+    macro_rules! set {
+        ($slot:expr) => {
+            $slot.get_or_insert_with(Default::default).context_window = Some(tokens)
+        };
+    }
     match provider_id {
-        "gemini" => p.gemini.get_or_insert_with(Default::default).context_window = Some(tokens),
-        "groq" => p.groq.get_or_insert_with(Default::default).context_window = Some(tokens),
-        "openrouter" => {
-            p.openrouter
-                .get_or_insert_with(Default::default)
-                .context_window = Some(tokens)
-        }
-        "ollama" => p.ollama.get_or_insert_with(Default::default).context_window = Some(tokens),
+        "openai" => set!(p.openai),
+        "anthropic" => set!(p.anthropic),
+        "gemini" => set!(p.gemini),
+        "groq" => set!(p.groq),
+        "ollama" => set!(p.ollama),
+        "azure" => set!(p.azure),
+        "bedrock" => set!(p.bedrock),
+        "mistral" => set!(p.mistral),
+        "deepseek" => set!(p.deepseek),
+        "openrouter" => set!(p.openrouter),
+        "xai" => set!(p.xai),
+        "opencode_go" => set!(p.opencode_go),
+        "opencode_zen" => set!(p.opencode_zen),
         _ => {}
     }
 }
 
-/// Fetch the real context window for the active provider's model from its
-/// API and persist it as that provider's `context_window` config override.
-/// Returns a human-readable result line for display.
+/// Persist a discovered pricing override. Ollama has no pricing slot — it's
+/// local/free and never billed.
+fn set_pricing_override(
+    config: &mut Config,
+    provider_id: &str,
+    pricing: &io_runtime::ModelPricing,
+) {
+    let p = &mut config.provider;
+    macro_rules! set {
+        ($slot:expr) => {{
+            let c = $slot.get_or_insert_with(Default::default);
+            c.cost_input_per_1k = Some(pricing.input_cost_per_1k);
+            c.cost_output_per_1k = Some(pricing.output_cost_per_1k);
+        }};
+    }
+    match provider_id {
+        "openai" => set!(p.openai),
+        "anthropic" => set!(p.anthropic),
+        "gemini" => set!(p.gemini),
+        "groq" => set!(p.groq),
+        "azure" => set!(p.azure),
+        "bedrock" => set!(p.bedrock),
+        "mistral" => set!(p.mistral),
+        "deepseek" => set!(p.deepseek),
+        "openrouter" => set!(p.openrouter),
+        "xai" => set!(p.xai),
+        "opencode_go" => set!(p.opencode_go),
+        "opencode_zen" => set!(p.opencode_zen),
+        _ => {}
+    }
+}
+
+/// Fetch real metadata for the active provider's model — context window,
+/// pricing, and tool-call support — from models.dev's public catalog (Ollama
+/// uses its own native `/api/show` lookup instead; see
+/// `io_runtime::provider::discovery`) — and persist what it found as that
+/// provider's config overrides. Returns a human-readable result line.
 pub async fn refresh_context_window() -> anyhow::Result<String> {
     let config = Config::load()?;
-    let keys = KeyStore::load();
     let provider_id = config.provider.default.clone();
     let model = model_for(&config, &provider_id).to_string();
 
-    if !CONTEXT_DISCOVERABLE.contains(&provider_id.as_str()) {
-        anyhow::bail!(
-            "{provider_id} doesn't expose context window via API — set it manually with \
-             `io config set provider.{provider_id}.context_window <tokens>`"
-        );
-    }
-
-    match io_runtime::provider::discovery::fetch_context_window(&provider_id, &config, &keys)
-        .await?
-    {
-        Some(tokens) => {
-            let mut config = Config::load()?;
-            set_context_window(&mut config, &provider_id, tokens);
-            config.save()?;
-            Ok(format!(
-                "{provider_id} · {model}: context window set to {tokens} tokens"
-            ))
-        }
-        None => anyhow::bail!(
+    let not_found = || {
+        anyhow::anyhow!(
             "{model} not found in {provider_id}'s catalog — set it manually with \
              `io config set provider.{provider_id}.context_window <tokens>`"
-        ),
+        )
+    };
+
+    let Some(info) =
+        io_runtime::provider::discovery::fetch_model_info(&provider_id, &config).await?
+    else {
+        return Err(not_found());
+    };
+
+    let mut parts = Vec::new();
+    let mut config = Config::load()?;
+    if let Some(tokens) = info.context_window {
+        set_context_window(&mut config, &provider_id, tokens);
+        parts.push(format!("context {tokens} tokens"));
     }
+    if let Some(ref pricing) = info.pricing {
+        set_pricing_override(&mut config, &provider_id, pricing);
+        parts.push(format!(
+            "pricing ${:.4}/${:.4} per 1K in/out",
+            pricing.input_cost_per_1k, pricing.output_cost_per_1k
+        ));
+    }
+    if parts.is_empty() {
+        return Err(not_found());
+    }
+    config.save()?;
+
+    let mut msg = format!("{provider_id} · {model}: {}", parts.join(", "));
+    if info.tool_call == Some(false) {
+        msg.push_str(
+            "\n⚠ this model does not support tool calling — io's agents rely on tools \
+             and may not work correctly",
+        );
+    }
+    Ok(msg)
 }
 
 fn set_model(config: &mut Config, provider_id: &str, model_id: &str) {

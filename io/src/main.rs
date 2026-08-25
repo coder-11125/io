@@ -60,8 +60,9 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum ModelAction {
-    /// Fetch the active provider's real context window from its API (Gemini,
-    /// Groq, OpenRouter, Ollama only) and save it as a config override.
+    /// Fetch the active provider's real context window, pricing, and
+    /// tool-call support from the models.dev catalog (Ollama uses its own
+    /// local /api/show lookup) and save them as config overrides.
     Refresh,
 }
 

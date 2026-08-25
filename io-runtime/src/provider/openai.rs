@@ -249,6 +249,8 @@ pub(crate) fn build_chat_body_with_model(
         api_key_env: None,
         api_key: None,
         context_window: None,
+        cost_input_per_1k: None,
+        cost_output_per_1k: None,
         auth: crate::config::AuthMethod::ApiKey,
     };
     build_chat_body(&cfg, request, stream)

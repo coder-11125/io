@@ -173,6 +173,9 @@ impl Tool for SpawnAgentTool {
             model_id,
             self.max_tokens,
             false,
+            // Sub-agents don't carry the parent's Config, so no discovered
+            // pricing override — turn cost falls back to the static table.
+            None,
         );
         agent.set_cancel(cancel);
 

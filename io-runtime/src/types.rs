@@ -1,4 +1,4 @@
-use crate::pricing::get_pricing_for_model;
+use crate::pricing::{get_pricing_for_model, ModelPricing};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -88,8 +88,16 @@ impl TurnUsage {
         }
     }
 
-    pub fn with_cost(mut self, provider: &str, model: &str) -> Self {
-        if let Some(pricing) = get_pricing_for_model(provider, model) {
+    /// `pricing_override` (from `ProviderConfig::pricing_override_for`) takes
+    /// precedence over the static `pricing.rs` table when set — real,
+    /// per-model pricing discovered from a provider catalog beats a guess.
+    pub fn with_cost(
+        mut self,
+        provider: &str,
+        model: &str,
+        pricing_override: Option<ModelPricing>,
+    ) -> Self {
+        if let Some(pricing) = pricing_override.or_else(|| get_pricing_for_model(provider, model)) {
             self.cost = Some(pricing.calculate_cost(self.input_tokens, self.output_tokens));
         }
         self

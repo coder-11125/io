@@ -54,6 +54,7 @@ pub enum AgentEvent {
 pub type PromptFn = Arc<dyn Fn(&str, &serde_json::Value) -> PermissionReply + Send + Sync>;
 
 use crate::memory::SessionStore;
+use crate::pricing::ModelPricing;
 use crate::provider::{CompletionModel, CompletionRequest, ContentBlock, StreamEvent};
 use crate::provider::{Message, Role};
 use crate::sandbox::{PermissionChecker, PermissionLevel};
@@ -80,6 +81,9 @@ pub struct Agent {
     prompt_fn: Mutex<Option<PromptFn>>,
     pub model_id: String,
     pub provider_id: &'static str,
+    /// Per-token pricing discovered from a provider catalog (`ProviderConfig::pricing_override_for`),
+    /// taking precedence over the static `pricing.rs` table when set.
+    pricing_override: Option<ModelPricing>,
 }
 
 impl Agent {
@@ -95,6 +99,7 @@ impl Agent {
         model_id: String,
         max_tokens: u32,
         auto_compact: bool,
+        pricing_override: Option<ModelPricing>,
     ) -> Self {
         let provider_id = provider.provider_name();
 
@@ -124,6 +129,7 @@ impl Agent {
             prompt_fn: Mutex::new(None),
             model_id,
             provider_id,
+            pricing_override,
         }
     }
 
@@ -492,8 +498,11 @@ impl Agent {
 
         let usage = if summed_input_tokens > 0 || summed_output_tokens > 0 {
             Some(
-                TurnUsage::new(summed_input_tokens, summed_output_tokens)
-                    .with_cost(self.provider_id, &self.model_id),
+                TurnUsage::new(summed_input_tokens, summed_output_tokens).with_cost(
+                    self.provider_id,
+                    &self.model_id,
+                    self.pricing_override.clone(),
+                ),
             )
         } else {
             None

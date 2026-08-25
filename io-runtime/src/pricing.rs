@@ -382,10 +382,22 @@ mod tests {
 
     #[test]
     fn test_turnusage_with_cost() {
-        let usage = TurnUsage::new(1000, 500).with_cost("anthropic", "claude-sonnet-4-20250514");
+        let usage =
+            TurnUsage::new(1000, 500).with_cost("anthropic", "claude-sonnet-4-20250514", None);
         assert!(usage.cost.is_some());
         let cost = usage.cost.unwrap();
         // (1.0 * 0.003) + (0.5 * 0.015) = 0.0105
         assert!((cost - 0.0105).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_turnusage_with_cost_override_beats_static_table() {
+        let usage = TurnUsage::new(1000, 500).with_cost(
+            "anthropic",
+            "claude-sonnet-4-20250514",
+            Some(ModelPricing::new(0.001, 0.002)),
+        );
+        // (1.0 * 0.001) + (0.5 * 0.002) = 0.002, not the static table's 0.0105
+        assert!((usage.cost.unwrap() - 0.002).abs() < 1e-9);
     }
 }
