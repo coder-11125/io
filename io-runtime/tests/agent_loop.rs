@@ -22,6 +22,10 @@ use std::sync::{Arc, Mutex};
 struct MockProvider {
     responses: Mutex<VecDeque<CompletionResponse>>,
     requests: Mutex<Vec<CompletionRequest>>,
+    /// 0 (the derived default) means "unset" — `context_window()` falls back
+    /// to the trait's default of 128K, same as a real provider with no
+    /// configured/guessed window.
+    context_window: AtomicU64,
 }
 
 impl MockProvider {
@@ -29,11 +33,16 @@ impl MockProvider {
         Arc::new(Self {
             responses: Mutex::new(responses.into()),
             requests: Mutex::new(Vec::new()),
+            context_window: AtomicU64::new(0),
         })
     }
 
     fn recorded_requests(&self) -> Vec<CompletionRequest> {
         self.requests.lock().unwrap().clone()
+    }
+
+    fn set_context_window(&self, tokens: u64) {
+        self.context_window.store(tokens, Ordering::Relaxed);
     }
 
     fn next_response(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse> {
@@ -50,6 +59,13 @@ impl MockProvider {
 impl CompletionModel for MockProvider {
     fn provider_name(&self) -> &'static str {
         "mock"
+    }
+
+    fn context_window(&self) -> u64 {
+        match self.context_window.load(Ordering::Relaxed) {
+            0 => 128_000,
+            tokens => tokens,
+        }
     }
 
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse> {
@@ -109,6 +125,23 @@ fn text_response(text: &str) -> CompletionResponse {
     }
 }
 
+fn text_response_with_usage(
+    text: &str,
+    input_tokens: u32,
+    output_tokens: u32,
+) -> CompletionResponse {
+    CompletionResponse {
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+        stop_reason: Some("end_turn".to_string()),
+        usage: Some(Usage {
+            input_tokens,
+            output_tokens,
+        }),
+    }
+}
+
 fn tool_response(name: &str, input: serde_json::Value) -> CompletionResponse {
     CompletionResponse {
         content: vec![ContentBlock::ToolUse {
@@ -159,6 +192,29 @@ fn make_agent_at(
 
 fn make_agent(provider: Arc<MockProvider>, permissions: PermissionChecker) -> Agent {
     make_agent_at(provider, permissions, temp_path("io-test", ".db"), None)
+}
+
+/// Like `make_agent_at` but with auto-compact turned on, for testing the
+/// 80%-of-context-window auto-compact trigger in `run_turn_inner`.
+fn make_auto_compact_agent(
+    provider: Arc<MockProvider>,
+    permissions: PermissionChecker,
+    db_path: PathBuf,
+) -> Agent {
+    let memory = SessionStore::with_path(db_path).expect("session store");
+    Agent::new(
+        provider,
+        default_registry(),
+        memory,
+        Arc::new(permissions),
+        "You are a test agent.".to_string(),
+        None,
+        None,
+        "mock-model".to_string(),
+        1024,
+        true,
+        None,
+    )
 }
 
 #[tokio::test]
@@ -506,4 +562,76 @@ async fn resumed_session_carries_prior_history() {
         all_text.contains("first answer"),
         "prior assistant reply should be in context"
     );
+}
+
+#[tokio::test]
+async fn auto_compact_triggers_after_turn_crosses_80_percent_threshold() {
+    let provider = MockProvider::new(vec![
+        // The task's own turn: 900/1000 = 90%, past the 80% threshold.
+        text_response_with_usage("task done", 900, 10),
+        // compact::run's own summarization call (non-streaming `complete`).
+        text_response_with_usage("summary of the session", 50, 20),
+    ]);
+    provider.set_context_window(1000);
+    let db = temp_path("io-test", ".db");
+    let agent = make_auto_compact_agent(
+        provider.clone(),
+        PermissionChecker::new("allow"),
+        db.clone(),
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+    let consumer = tokio::spawn(async move {
+        let mut turns_compacted = None;
+        while let Some(ev) = rx.recv().await {
+            if let AgentEvent::AutoCompact { turns_compacted: n } = ev {
+                turns_compacted = Some(n);
+            }
+        }
+        turns_compacted
+    });
+
+    // The task itself must complete and return normally — compaction is a
+    // side effect that happens after, not something that interrupts it.
+    let reply = agent.run_turn_streaming("do the task", tx).await.unwrap();
+    assert_eq!(reply, "task done");
+
+    let turns_compacted = consumer.await.unwrap();
+    assert_eq!(
+        turns_compacted,
+        Some(1),
+        "AutoCompact event should fire once the turn's usage crosses 80% of the context window"
+    );
+
+    // The task's turn was compacted away into a summary, post-hoc.
+    let store = SessionStore::with_path(db).unwrap();
+    let session = store.load_session(agent.session_id().await).unwrap();
+    assert!(
+        session.turns.is_empty(),
+        "compacted turns should be cleared from the session"
+    );
+    assert_eq!(session.summary.as_deref(), Some("summary of the session"));
+}
+
+#[tokio::test]
+async fn auto_compact_does_not_trigger_below_80_percent_threshold() {
+    // 700/1000 = 70%, under the 80% threshold — no second (summarization)
+    // response is scripted, so the test would fail loudly if compaction
+    // fired anyway and tried to call the provider again.
+    let provider = MockProvider::new(vec![text_response_with_usage("task done", 700, 10)]);
+    provider.set_context_window(1000);
+    let db = temp_path("io-test", ".db");
+    let agent = make_auto_compact_agent(provider, PermissionChecker::new("allow"), db.clone());
+
+    let reply = agent.run_turn("do the task").await.unwrap();
+    assert_eq!(reply, "task done");
+
+    let store = SessionStore::with_path(db).unwrap();
+    let session = store.load_session(agent.session_id().await).unwrap();
+    assert_eq!(
+        session.turns.len(),
+        1,
+        "turn should not be compacted below the 80% threshold"
+    );
+    assert!(session.summary.is_none());
 }

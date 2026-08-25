@@ -348,6 +348,7 @@ pub async fn run_interactive(
                     "  /login         Sign in with OAuth (ChatGPT / Claude)",
                     "  /model         Switch between configured providers",
                     "  /theme         Switch UI theme",
+                    "  /config        Toggle session & permission settings",
                     "  /cost          Show API cost summary for current session",
                     "  /context       Fetch real context window, pricing, and tool support",
                     "  /compact       Summarize and compress conversation history",
@@ -655,6 +656,44 @@ pub async fn run_interactive(
                             is_splash = true;
                         }
                     }
+                }
+                continue;
+            }
+            "/config" => {
+                match io_tui::settings::run() {
+                    Ok(true) => {
+                        let sid = agent.session_id().await;
+                        match build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                        {
+                            Ok(new_agent) => agent = new_agent,
+                            Err(e) => {
+                                let _ = draw_prompt_bar(
+                                    &format!("error reloading agent: {e}"),
+                                    current_agent.name,
+                                    agent.provider_id,
+                                    &agent.model_id,
+                                    last_input_tokens,
+                                    agent.context_window(),
+                                    &theme,
+                                );
+                            }
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        let _ = draw_prompt_bar(
+                            &format!("error: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
+                }
+                if from_splash {
+                    is_splash = true;
                 }
                 continue;
             }
