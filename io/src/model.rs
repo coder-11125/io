@@ -142,8 +142,9 @@ pub async fn refresh_context_window() -> anyhow::Result<String> {
         )
     };
 
+    // Explicit user-triggered refresh: always bypass the cache for the latest data.
     let Some(info) =
-        io_runtime::provider::discovery::fetch_model_info(&provider_id, &config).await?
+        io_runtime::provider::discovery::fetch_model_info(&provider_id, &config, true).await?
     else {
         return Err(not_found());
     };
@@ -174,6 +175,54 @@ pub async fn refresh_context_window() -> anyhow::Result<String> {
         );
     }
     Ok(msg)
+}
+
+/// Best-effort background fill for the active provider's model, meant to run
+/// as a detached task at startup (see `tui::run_interactive`). If
+/// context_window and/or pricing aren't already configured, fetches them from
+/// the (cached — up to 24h stale is fine) models.dev catalog and persists
+/// them. Never overwrites a value that's already set, whether set manually or
+/// by a previous fill — `/context` is the explicit, always-fresh, always-
+/// overwrites path. Never surfaces an error: this must stay silent (no
+/// stdout — the TUI owns the screen) and never block or fail startup, so any
+/// failure (offline, rate-limited, provider not in the catalog) is simply a
+/// no-op.
+pub async fn auto_fill_missing_model_info() {
+    let Ok(config) = Config::load() else { return };
+    let provider_id = config.provider.default.clone();
+
+    let has_context = config.provider.context_window_for(&provider_id).is_some();
+    let needs_pricing =
+        provider_id != "ollama" && config.provider.pricing_override_for(&provider_id).is_none();
+    if has_context && !needs_pricing {
+        return; // nothing missing — skip the fetch entirely
+    }
+
+    let Ok(Some(info)) =
+        io_runtime::provider::discovery::fetch_model_info(&provider_id, &config, false).await
+    else {
+        return;
+    };
+
+    let Ok(mut config) = Config::load() else {
+        return;
+    };
+    let mut changed = false;
+    if !has_context {
+        if let Some(tokens) = info.context_window {
+            set_context_window(&mut config, &provider_id, tokens);
+            changed = true;
+        }
+    }
+    if needs_pricing {
+        if let Some(ref pricing) = info.pricing {
+            set_pricing_override(&mut config, &provider_id, pricing);
+            changed = true;
+        }
+    }
+    if changed {
+        let _ = config.save();
+    }
 }
 
 fn set_model(config: &mut Config, provider_id: &str, model_id: &str) {

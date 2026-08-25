@@ -214,6 +214,11 @@ pub async fn run_interactive(
     if let Some(spec) = model {
         apply_model_spec(&mut config, spec);
     }
+    // Best-effort, non-blocking: fills in context window / pricing from the
+    // models.dev catalog if either is missing for the active provider's
+    // model. Never awaited, never surfaces errors — see its doc comment.
+    // Takes effect on the next agent (re)build, not the one below.
+    tokio::spawn(model::auto_fill_missing_model_info());
     let mut theme = io_tui::render::get_theme(&config.theme);
     let line_buf: LineBuf = std::sync::Arc::new(std::sync::Mutex::new(
         std::collections::VecDeque::with_capacity(512),

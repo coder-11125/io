@@ -21,11 +21,21 @@
 //! deployment name or a fine-tune) is not an error: the static
 //! `context_window_for_model` guess / `pricing.rs` table, or a manual config
 //! override, still apply.
+//!
+//! The catalog (~4MB) is cached at `~/.io/models-cache.json` for 24h so
+//! routine lookups (including the background auto-fill at startup, see
+//! `io::model::auto_fill_missing_model_info`) don't re-download it every
+//! time. A stale cache is still used as a fallback when a fresh fetch fails
+//! (offline, rate-limited) — better than nothing. `fetch_model_info`'s
+//! `force` flag bypasses the cache for explicit user-triggered refreshes
+//! (`/context`, `io model refresh`), which should always get the latest data.
 
 use crate::config::Config;
 use crate::pricing::ModelPricing;
+use chrono::{DateTime, Utc};
 
 const MODELS_DEV_URL: &str = "https://models.dev/api.json";
+const CACHE_TTL_HOURS: i64 = 24;
 
 /// Per-model metadata discovered from a provider catalog. Any field may be
 /// `None` if the catalog didn't report it for this particular model.
@@ -46,10 +56,14 @@ fn models_dev_provider_id(provider_id: &str) -> &str {
     }
 }
 
-/// Fetch real metadata for `provider_id`'s configured model.
+/// Fetch real metadata for `provider_id`'s configured model. `force` bypasses
+/// the on-disk cache and always hits the network — use it for explicit
+/// user-triggered refreshes; leave it `false` for opportunistic background
+/// lookups, which are happy with anything up to 24h old.
 pub async fn fetch_model_info(
     provider_id: &str,
     config: &Config,
+    force: bool,
 ) -> anyhow::Result<Option<ModelInfo>> {
     if provider_id == "ollama" {
         return fetch_ollama(config).await;
@@ -59,11 +73,7 @@ pub async fn fetch_model_info(
         return Ok(None);
     };
 
-    let resp = client()?.get(MODELS_DEV_URL).send().await?;
-    if !resp.status().is_success() {
-        return Err(super::api_error("models.dev", resp).await);
-    }
-    let catalog: serde_json::Value = resp.json().await?;
+    let catalog = fetch_catalog(force).await?;
 
     let dev_id = models_dev_provider_id(provider_id);
     let entry = &catalog[dev_id]["models"][model.as_str()];
@@ -76,6 +86,76 @@ pub async fn fetch_model_info(
         pricing: model_pricing(entry),
         tool_call: entry["tool_call"].as_bool(),
     }))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedCatalog {
+    fetched_at: DateTime<Utc>,
+    catalog: serde_json::Value,
+}
+
+fn cache_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("~"))
+        .join(".io")
+        .join("models-cache.json")
+}
+
+fn load_cache() -> Option<CachedCatalog> {
+    let contents = std::fs::read_to_string(cache_path()).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn is_fresh(fetched_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    now - fetched_at < chrono::Duration::hours(CACHE_TTL_HOURS)
+}
+
+fn save_cache(catalog: &serde_json::Value) {
+    let path = cache_path();
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let entry = CachedCatalog {
+        fetched_at: Utc::now(),
+        catalog: catalog.clone(),
+    };
+    if let Ok(json) = serde_json::to_string(&entry) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+/// The models.dev catalog, from cache when fresh enough (or always, if not
+/// `force`d), otherwise fetched live and re-cached. A stale cache is used as
+/// a last-resort fallback when a live fetch fails, so a temporary outage
+/// doesn't break lookups entirely.
+async fn fetch_catalog(force: bool) -> anyhow::Result<serde_json::Value> {
+    if !force {
+        if let Some(cached) = load_cache() {
+            if is_fresh(cached.fetched_at, Utc::now()) {
+                return Ok(cached.catalog);
+            }
+        }
+    }
+
+    match fetch_catalog_live().await {
+        Ok(catalog) => {
+            save_cache(&catalog);
+            Ok(catalog)
+        }
+        Err(e) => match load_cache() {
+            Some(cached) => Ok(cached.catalog),
+            None => Err(e),
+        },
+    }
+}
+
+async fn fetch_catalog_live() -> anyhow::Result<serde_json::Value> {
+    let resp = client()?.get(MODELS_DEV_URL).send().await?;
+    if !resp.status().is_success() {
+        return Err(super::api_error("models.dev", resp).await);
+    }
+    Ok(resp.json().await?)
 }
 
 /// models.dev reports `cost.input`/`cost.output` in USD per million tokens;
@@ -199,6 +279,15 @@ mod tests {
             .as_array()
             .map(|caps| caps.iter().any(|c| c.as_str() == Some("tools")));
         assert_eq!(tool_call, Some(true));
+    }
+
+    #[test]
+    fn cache_freshness_boundary() {
+        let now = Utc::now();
+        assert!(is_fresh(now - chrono::Duration::hours(1), now));
+        assert!(is_fresh(now - chrono::Duration::hours(23), now));
+        assert!(!is_fresh(now - chrono::Duration::hours(25), now));
+        assert!(!is_fresh(now - chrono::Duration::hours(24), now));
     }
 
     #[test]
