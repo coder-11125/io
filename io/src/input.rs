@@ -611,8 +611,19 @@ pub fn tui_read_line(
                         return Ok(None);
                     }
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        // Raw mode suppresses the terminal's own SIGINT, so
+                        // this is the only interrupt signal the app gets:
+                        // first press clears the line (mirrors a shell),
+                        // second press on an already-empty line exits —
+                        // giving Ctrl+C a way back to the terminal like
+                        // Ctrl+D, without eating a single accidental press.
+                        let was_empty = buf.is_empty() && paste_block.is_none();
                         clear_rows_above(popup_rows)?;
                         crossterm::execute!(std::io::stdout(), DisableBracketedPaste)?;
+                        if was_empty {
+                            crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide)?;
+                            return Ok(None);
+                        }
                         let _ = bar("", 0, *tab_current, None)?;
                         return Ok(Some(String::new()));
                     }
@@ -1113,6 +1124,14 @@ pub fn splash_read_line(
                         return Ok(None);
                     }
                     (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        // Same first-clears/second-exits pattern as the REPL
+                        // prompt — raw mode suppresses the terminal's own
+                        // SIGINT, so this is the app's only Ctrl+C handling.
+                        if buf.is_empty() {
+                            clear_popup(&layout, popup_rows)?;
+                            execute!(std::io::stdout(), DisableBracketedPaste, cursor::Hide)?;
+                            return Ok(None);
+                        }
                         buf.clear();
                         cursor = 0;
                         slash_matches.clear();

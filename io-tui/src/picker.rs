@@ -33,7 +33,24 @@ pub fn pick(items: &[&str], current: Option<usize>) -> anyhow::Result<usize> {
     // mouse move). The guard only disables when it did the enabling.
     let _raw = crate::raw::RawModeGuard::acquire()?;
     let mut stdout = io::stdout();
-    let result = pick_loop(&mut stdout, items, current);
+    let result = pick_loop(&mut stdout, items, current, true);
+    let _ = execute!(io::stdout(), cursor::Show);
+    result
+}
+
+/// Same as [`pick`], but Esc/`q` do nothing — only Ctrl+C cancels. Used by
+/// the `/connect` and `/login` flows: they run long enough (an OAuth wait,
+/// switching to a browser for an API key) that a terminal reporting mouse
+/// motion continuously can race a bare Esc keypress against an in-flight
+/// mouse-motion escape sequence and silently absorb it. Ctrl+C (byte 0x03)
+/// has no such ambiguity, so it's the one reliable reject key for that flow.
+pub fn pick_no_esc(items: &[&str], current: Option<usize>) -> anyhow::Result<usize> {
+    if items.is_empty() {
+        anyhow::bail!("no items to pick from");
+    }
+    let _raw = crate::raw::RawModeGuard::acquire()?;
+    let mut stdout = io::stdout();
+    let result = pick_loop(&mut stdout, items, current, false);
     let _ = execute!(io::stdout(), cursor::Show);
     result
 }
@@ -46,7 +63,37 @@ pub fn pick_with_hint(items: &[(&str, &str)], current: Option<usize>) -> anyhow:
     }
     let _raw = crate::raw::RawModeGuard::acquire()?;
     let mut stdout = io::stdout();
-    let result = pick_hint_loop(&mut stdout, items, current, None, current.unwrap_or(0));
+    let result = pick_hint_loop(
+        &mut stdout,
+        items,
+        current,
+        None,
+        current.unwrap_or(0),
+        true,
+    );
+    let _ = execute!(io::stdout(), cursor::Show);
+    result
+}
+
+/// Same as [`pick_with_hint`], but Esc/`q` do nothing — only Ctrl+C cancels.
+/// See [`pick_no_esc`] for why.
+pub fn pick_with_hint_no_esc(
+    items: &[(&str, &str)],
+    current: Option<usize>,
+) -> anyhow::Result<usize> {
+    if items.is_empty() {
+        anyhow::bail!("no items to pick from");
+    }
+    let _raw = crate::raw::RawModeGuard::acquire()?;
+    let mut stdout = io::stdout();
+    let result = pick_hint_loop(
+        &mut stdout,
+        items,
+        current,
+        None,
+        current.unwrap_or(0),
+        false,
+    );
     let _ = execute!(io::stdout(), cursor::Show);
     result
 }
@@ -65,7 +112,7 @@ pub fn pick_permission(
     }
     let _raw = crate::raw::RawModeGuard::acquire()?;
     let mut stdout = io::stdout();
-    let result = pick_hint_loop(&mut stdout, items, None, Some(title), initial);
+    let result = pick_hint_loop(&mut stdout, items, None, Some(title), initial, true);
     let _ = execute!(io::stdout(), cursor::Show);
     result
 }
@@ -87,12 +134,14 @@ fn clear_picker(stdout: &mut impl Write, lines: usize) -> io::Result<()> {
 
 // ── pick_with_hint ────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn pick_hint_loop(
     stdout: &mut impl Write,
     items: &[(&str, &str)],
     current: Option<usize>,
     title: Option<&str>,
     initial: usize,
+    esc_cancels: bool,
 ) -> anyhow::Result<usize> {
     execute!(stdout, cursor::Hide)?;
 
@@ -184,13 +233,18 @@ fn pick_hint_loop(
         }
 
         // Status bar sits at cursor position after the last item row.
+        let cancel_hint = if esc_cancels {
+            "Esc cancel"
+        } else {
+            "Ctrl+C cancel"
+        };
         queue!(
             stdout,
             cursor::MoveToColumn(0),
             terminal::Clear(ClearType::CurrentLine),
             crossterm::style::PrintStyledContent(
                 format!(
-                    "  {}/{}  ↑↓ or j/k  Enter select  Esc cancel",
+                    "  {}/{}  ↑↓ or j/k  Enter select  {cancel_hint}",
                     selected + 1,
                     items.len()
                 )
@@ -223,13 +277,14 @@ fn pick_hint_loop(
                     stdout.flush()?;
                     return Ok(selected);
                 }
-                KeyCode::Esc | KeyCode::Char('q') => {
+                KeyCode::Esc | KeyCode::Char('q') if esc_cancels => {
                     clear_picker(stdout, drawn_rows)?;
                     execute!(stdout, cursor::Show)?;
                     stdout.flush()?;
                     return Err(Dismissed::Cancelled.into());
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    clear_picker(stdout, drawn_rows)?;
                     execute!(stdout, cursor::Show)?;
                     stdout.flush()?;
                     return Err(Dismissed::Interrupted.into());
@@ -246,6 +301,7 @@ fn pick_loop(
     stdout: &mut impl Write,
     items: &[&str],
     current: Option<usize>,
+    esc_cancels: bool,
 ) -> anyhow::Result<usize> {
     execute!(stdout, cursor::Hide)?;
 
@@ -307,13 +363,18 @@ fn pick_loop(
             queue!(stdout, cursor::MoveToNextLine(1))?;
         }
 
+        let cancel_hint = if esc_cancels {
+            "Esc cancel"
+        } else {
+            "Ctrl+C cancel"
+        };
         queue!(
             stdout,
             cursor::MoveToColumn(0),
             terminal::Clear(ClearType::CurrentLine),
             crossterm::style::PrintStyledContent(
                 format!(
-                    "  {}/{}  ↑↓ or j/k  Enter select  Esc cancel",
+                    "  {}/{}  ↑↓ or j/k  Enter select  {cancel_hint}",
                     selected + 1,
                     items.len()
                 )
@@ -344,13 +405,14 @@ fn pick_loop(
                     stdout.flush()?;
                     return Ok(selected);
                 }
-                KeyCode::Esc | KeyCode::Char('q') => {
+                KeyCode::Esc | KeyCode::Char('q') if esc_cancels => {
                     clear_picker(stdout, drawn_items)?;
                     execute!(stdout, cursor::Show)?;
                     stdout.flush()?;
                     return Err(Dismissed::Cancelled.into());
                 }
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    clear_picker(stdout, drawn_items)?;
                     execute!(stdout, cursor::Show)?;
                     stdout.flush()?;
                     return Err(Dismissed::Interrupted.into());

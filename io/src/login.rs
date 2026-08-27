@@ -3,22 +3,26 @@
 //!
 //! Tokens are stored in `~/.io/oauth.toml` and refreshed automatically by the
 //! providers when they expire. Run `io connect` for API-key setup.
+//!
+//! The whole flow renders as in-TUI popups (`io_tui::modal`) so it never
+//! leaves the alternate screen when driven from `/login` in the REPL; the
+//! same code path also works from a plain terminal via `io login <provider>`.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::process::Command;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use io_runtime::config::{AuthMethod, Config};
 use io_runtime::oauth::{self, OAuthToken};
+use io_tui::modal;
 
 /// How long to wait for the OpenAI browser callback.
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 
-pub async fn run(provider: &str) -> anyhow::Result<()> {
+pub async fn run(provider: &str) -> anyhow::Result<String> {
     match provider {
         "openai" => login_openai().await,
         "anthropic" => login_anthropic().await,
@@ -31,23 +35,33 @@ pub async fn run(provider: &str) -> anyhow::Result<()> {
 
 // ── OpenAI (ChatGPT / Codex) — local callback server ─────────────────────────
 
-async fn login_openai() -> anyhow::Result<()> {
+async fn login_openai() -> anyhow::Result<String> {
     let pkce = oauth::generate_pkce();
     let (listener, port) = bind_callback_port().await?;
     let auth_url = oauth::openai_authorize_url(&pkce, port);
-
-    println!();
-    println!("  1. Open this URL in your browser:");
-    println!("     {auth_url}");
     open_browser(&auth_url);
-    println!("  2. Sign in with ChatGPT and approve access.");
-    println!("     Waiting for the browser callback…");
-    println!();
 
-    let code = wait_for_openai_callback(listener, &pkce.state).await?;
-    let token = oauth::exchange_openai_code(port, &code, &pkce).await?;
-    save_token("openai", token)?;
-    Ok(())
+    let (tx, rx) = std::sync::mpsc::channel();
+    let state = pkce.state.clone();
+    tokio::spawn(async move {
+        let result: anyhow::Result<OAuthToken> = async {
+            let code = wait_for_openai_callback(listener, &state).await?;
+            oauth::exchange_openai_code(port, &code, &pkce).await
+        }
+        .await;
+        let _ = tx.send(result);
+    });
+
+    let token = modal::wait_for(
+        &[
+            "Sign in with ChatGPT",
+            "A browser window should have opened.",
+            &auth_url,
+            "Waiting for the browser to redirect back…",
+        ],
+        rx,
+    )??;
+    save_token("openai", token)
 }
 
 async fn bind_callback_port() -> anyhow::Result<(TcpListener, u16)> {
@@ -121,23 +135,21 @@ async fn wait_for_openai_callback(
 
 // ── Anthropic (Claude subscription) — copy/paste flow ────────────────────────
 
-async fn login_anthropic() -> anyhow::Result<()> {
+async fn login_anthropic() -> anyhow::Result<String> {
     let pkce = oauth::generate_pkce();
     let auth_url = oauth::anthropic_authorize_url(&pkce);
-
-    println!();
-    println!("  1. Open this URL in your browser:");
-    println!("     {auth_url}");
     open_browser(&auth_url);
-    println!("  2. Sign in with Claude and approve access.");
-    println!(
-        "  3. Paste the code shown on the page (if it shows CODE#STATE, paste the full string):"
-    );
-    print!("     Code: ");
-    std::io::stdout().flush()?;
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let input = lines.next_line().await?.unwrap_or_default();
+    let input = modal::text_prompt(
+        &[
+            "Sign in with Claude",
+            "A browser window should have opened.",
+            &auth_url,
+            "Paste the code shown on the page (CODE#STATE):",
+        ],
+        "",
+        false,
+    )?;
     let input = input.trim().to_string();
     if input.is_empty() {
         anyhow::bail!("no code pasted — login aborted");
@@ -147,16 +159,22 @@ async fn login_anthropic() -> anyhow::Result<()> {
         Some((code, state)) => (code.to_string(), Some(state.to_string())),
         None => (input, None),
     };
-    let token = oauth::exchange_anthropic_code(&code, state.as_deref(), &pkce).await?;
-    save_token("anthropic", token)?;
-    Ok(())
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        let result = oauth::exchange_anthropic_code(&code, state.as_deref(), &pkce).await;
+        let _ = tx.send(result);
+    });
+
+    let token = modal::wait_for(&["Verifying code…"], rx)??;
+    save_token("anthropic", token)
 }
 
 // ── Shared ───────────────────────────────────────────────────────────────────
 
 /// Persist the token, mark the provider as OAuth-authenticated, and make it
-/// the active provider.
-fn save_token(provider: &str, token: OAuthToken) -> anyhow::Result<()> {
+/// the active provider. Returns a summary line for the caller to display.
+fn save_token(provider: &str, token: OAuthToken) -> anyhow::Result<String> {
     let mut store = oauth::OAuthStore::load();
     store.set(provider, token);
     store.save()?;
@@ -179,14 +197,9 @@ fn save_token(provider: &str, token: OAuthToken) -> anyhow::Result<()> {
     }
     config.save()?;
 
-    println!();
-    println!(
-        "  Saved OAuth login for {provider} to {}",
-        oauth::OAuthStore::path().display()
-    );
-    println!("  Active provider set to: {provider}");
-    println!();
-    Ok(())
+    Ok(format!(
+        "Signed in to {provider} — active provider set to {provider}"
+    ))
 }
 
 async fn respond(socket: &mut TcpStream, status: u16, message: &str) -> anyhow::Result<()> {

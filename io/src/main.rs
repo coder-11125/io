@@ -95,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Session { action }) => handle_session(action).await?,
         Some(Commands::Config { action }) => config_cmd::handle_config(action)?,
         Some(Commands::Init) => config_cmd::handle_init()?,
-        Some(Commands::Login { provider }) => login::run(&provider).await?,
+        Some(Commands::Login { provider }) => println!("{}", login::run(&provider).await?),
         Some(Commands::Model {
             action: ModelAction::Refresh,
         }) => println!("{}", model::refresh_context_window().await?),

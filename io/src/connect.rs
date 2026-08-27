@@ -1,7 +1,4 @@
-use std::io::Write;
-use tokio::io::{AsyncBufReadExt, BufReader};
-
-type Lines = tokio::io::Lines<BufReader<tokio::io::Stdin>>;
+use io_tui::{modal, picker};
 
 pub(crate) struct Provider {
     pub(crate) id: &'static str,
@@ -84,19 +81,16 @@ fn is_env_var_name(s: &str) -> bool {
 }
 
 /// Ask whether to authenticate with an API key or an OAuth login.
-async fn ask_auth_oauth(lines: &mut Lines) -> anyhow::Result<bool> {
-    let answer = ask(
-        lines,
-        "Authentication (api key / oauth login) [api key]",
-        "api key",
-    )
-    .await?;
-    Ok(answer.trim().eq_ignore_ascii_case("oauth") || answer.trim().eq_ignore_ascii_case("login"))
+fn ask_auth_oauth() -> anyhow::Result<bool> {
+    Ok(picker::pick_no_esc(&["API key", "OAuth login"], Some(0))? == 1)
 }
 
-pub async fn run() -> anyhow::Result<()> {
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let lines = &mut lines;
+/// Prompt for an API key or the name of an env var that holds it.
+fn ask_key(default_env: &str) -> anyhow::Result<String> {
+    modal::text_prompt(&["API key or env var name:"], default_env, false)
+}
+
+pub async fn run() -> anyhow::Result<String> {
     let idx = select_provider()?;
     let p = &PROVIDERS[idx];
 
@@ -105,15 +99,13 @@ pub async fn run() -> anyhow::Result<()> {
 
     match p.id {
         "openai" => {
-            if ask_auth_oauth(lines).await? {
+            if ask_auth_oauth()? {
                 crate::login::run(p.id).await?;
                 let token = io_runtime::oauth::oauth_access_token(p.id).await?;
-                let model = pick_model(
-                    lines,
-                    fetch_openai_models("https://api.openai.com/v1", &token).await,
-                    "gpt-4o",
-                )
-                .await?;
+                let models = fetch_with_spinner("Fetching available models…", async move {
+                    fetch_openai_models("https://api.openai.com/v1", &token).await
+                })?;
+                let model = pick_model(models, "gpt-4o")?;
                 config.provider.openai = Some(io_runtime::config::OpenAIConfig {
                     model,
                     base_url: "https://api.openai.com/v1".to_string(),
@@ -125,20 +117,13 @@ pub async fn run() -> anyhow::Result<()> {
                     cost_output_per_1k: None,
                 });
             } else {
-                let key_input = ask(
-                    lines,
-                    &format!("API key or env var name [{}]", p.default_key_env),
-                    p.default_key_env,
-                )
-                .await?;
+                let key_input = ask_key(p.default_key_env)?;
                 let (api_key_env, api_key_inline) = split_key_input(&key_input, p.id, &mut keys);
                 let resolved = resolve_key(&api_key_env, &keys, p.id);
-                let model = pick_model(
-                    lines,
-                    fetch_openai_models("https://api.openai.com/v1", &resolved).await,
-                    "gpt-4o",
-                )
-                .await?;
+                let models = fetch_with_spinner("Fetching available models…", async move {
+                    fetch_openai_models("https://api.openai.com/v1", &resolved).await
+                })?;
+                let model = pick_model(models, "gpt-4o")?;
                 config.provider.openai = Some(io_runtime::config::OpenAIConfig {
                     model,
                     base_url: "https://api.openai.com/v1".to_string(),
@@ -152,15 +137,13 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
         "anthropic" => {
-            if ask_auth_oauth(lines).await? {
+            if ask_auth_oauth()? {
                 crate::login::run(p.id).await?;
                 let token = io_runtime::oauth::oauth_access_token(p.id).await?;
-                let model = pick_model(
-                    lines,
-                    fetch_anthropic_models(&token, true).await,
-                    "claude-sonnet-4-20250514",
-                )
-                .await?;
+                let models = fetch_with_spinner("Fetching available models…", async move {
+                    fetch_anthropic_models(&token, true).await
+                })?;
+                let model = pick_model(models, "claude-sonnet-4-20250514")?;
                 config.provider.anthropic = Some(io_runtime::config::AnthropicConfig {
                     model,
                     base_url: "https://api.anthropic.com/v1".to_string(),
@@ -172,20 +155,13 @@ pub async fn run() -> anyhow::Result<()> {
                     cost_output_per_1k: None,
                 });
             } else {
-                let key_input = ask(
-                    lines,
-                    &format!("API key or env var name [{}]", p.default_key_env),
-                    p.default_key_env,
-                )
-                .await?;
+                let key_input = ask_key(p.default_key_env)?;
                 let (api_key_env, _) = split_key_input(&key_input, p.id, &mut keys);
                 let resolved = resolve_key(&api_key_env, &keys, p.id);
-                let model = pick_model(
-                    lines,
-                    fetch_anthropic_models(&resolved, false).await,
-                    "claude-sonnet-4-20250514",
-                )
-                .await?;
+                let models = fetch_with_spinner("Fetching available models…", async move {
+                    fetch_anthropic_models(&resolved, false).await
+                })?;
+                let model = pick_model(models, "claude-sonnet-4-20250514")?;
                 config.provider.anthropic = Some(io_runtime::config::AnthropicConfig {
                     model,
                     base_url: "https://api.anthropic.com/v1".to_string(),
@@ -199,20 +175,13 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
         "gemini" => {
-            let key_input = ask(
-                lines,
-                &format!("API key or env var name [{}]", p.default_key_env),
-                p.default_key_env,
-            )
-            .await?;
+            let key_input = ask_key(p.default_key_env)?;
             let (api_key_env, _) = split_key_input(&key_input, p.id, &mut keys);
             let resolved = resolve_key(&api_key_env, &keys, p.id);
-            let model = pick_model(
-                lines,
-                fetch_gemini_models(&resolved).await,
-                "gemini-2.5-pro",
-            )
-            .await?;
+            let models = fetch_with_spinner("Fetching available models…", async move {
+                fetch_gemini_models(&resolved).await
+            })?;
+            let model = pick_model(models, "gemini-2.5-pro")?;
             config.provider.gemini = Some(io_runtime::config::GeminiConfig {
                 model,
                 base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
@@ -224,20 +193,13 @@ pub async fn run() -> anyhow::Result<()> {
             });
         }
         "groq" => {
-            let key_input = ask(
-                lines,
-                &format!("API key or env var name [{}]", p.default_key_env),
-                p.default_key_env,
-            )
-            .await?;
+            let key_input = ask_key(p.default_key_env)?;
             let (api_key_env, _) = split_key_input(&key_input, p.id, &mut keys);
             let resolved = resolve_key(&api_key_env, &keys, p.id);
-            let model = pick_model(
-                lines,
-                fetch_openai_models("https://api.groq.com/openai/v1", &resolved).await,
-                "llama-3.3-70b-versatile",
-            )
-            .await?;
+            let models = fetch_with_spinner("Fetching available models…", async move {
+                fetch_openai_models("https://api.groq.com/openai/v1", &resolved).await
+            })?;
+            let model = pick_model(models, "llama-3.3-70b-versatile")?;
             config.provider.groq = Some(io_runtime::config::GroqConfig {
                 model,
                 api_key_env,
@@ -248,14 +210,12 @@ pub async fn run() -> anyhow::Result<()> {
             });
         }
         "ollama" => {
-            let endpoint = ask(
-                lines,
-                "Endpoint [http://localhost:11434/v1]",
-                "http://localhost:11434/v1",
-            )
-            .await?;
-            let model =
-                pick_model(lines, fetch_openai_models(&endpoint, "").await, "llama3.2").await?;
+            let endpoint = modal::text_prompt(&["Endpoint:"], "http://localhost:11434/v1", false)?;
+            let ep = endpoint.clone();
+            let models = fetch_with_spinner("Fetching available models…", async move {
+                fetch_openai_models(&ep, "").await
+            })?;
+            let model = pick_model(models, "llama3.2")?;
             config.provider.ollama = Some(io_runtime::config::OllamaConfig {
                 model,
                 endpoint: Some(endpoint),
@@ -263,20 +223,14 @@ pub async fn run() -> anyhow::Result<()> {
             });
         }
         "azure" => {
-            let endpoint = ask(
-                lines,
-                "Azure endpoint (https://<resource>.openai.azure.com)",
+            let endpoint = modal::text_prompt(
+                &["Azure endpoint (https://<resource>.openai.azure.com):"],
                 "",
-            )
-            .await?;
-            let key_input = ask(
-                lines,
-                &format!("API key or env var name [{}]", p.default_key_env),
-                p.default_key_env,
-            )
-            .await?;
+                false,
+            )?;
+            let key_input = ask_key(p.default_key_env)?;
             let (api_key_env, _) = split_key_input(&key_input, p.id, &mut keys);
-            let model = ask(lines, "Deployment name [gpt-4o]", "gpt-4o").await?;
+            let model = modal::text_prompt(&["Deployment name:"], "gpt-4o", false)?;
             config.provider.azure = Some(io_runtime::config::AzureConfig {
                 deployment: model,
                 api_version: "2024-12-01-preview".to_string(),
@@ -293,13 +247,12 @@ pub async fn run() -> anyhow::Result<()> {
             });
         }
         "bedrock" => {
-            let region = ask(lines, "AWS region [us-east-1]", "us-east-1").await?;
-            let model = ask(
-                lines,
-                "Model ID [anthropic.claude-3-5-sonnet-20241022-v2:0]",
+            let region = modal::text_prompt(&["AWS region:"], "us-east-1", false)?;
+            let model = modal::text_prompt(
+                &["Model ID:"],
                 "anthropic.claude-3-5-sonnet-20241022-v2:0",
-            )
-            .await?;
+                false,
+            )?;
             config.provider.bedrock = Some(io_runtime::config::BedrockConfig {
                 model,
                 region: Some(region),
@@ -309,20 +262,13 @@ pub async fn run() -> anyhow::Result<()> {
             });
         }
         "mistral" => {
-            let key_input = ask(
-                lines,
-                &format!("API key or env var name [{}]", p.default_key_env),
-                p.default_key_env,
-            )
-            .await?;
+            let key_input = ask_key(p.default_key_env)?;
             let (api_key_env, _) = split_key_input(&key_input, p.id, &mut keys);
             let resolved = resolve_key(&api_key_env, &keys, p.id);
-            let model = pick_model(
-                lines,
-                fetch_openai_models("https://api.mistral.ai/v1", &resolved).await,
-                "mistral-large-latest",
-            )
-            .await?;
+            let models = fetch_with_spinner("Fetching available models…", async move {
+                fetch_openai_models("https://api.mistral.ai/v1", &resolved).await
+            })?;
+            let model = pick_model(models, "mistral-large-latest")?;
             config.provider.mistral = Some(io_runtime::config::MistralConfig {
                 model,
                 api_key_env,
@@ -333,20 +279,13 @@ pub async fn run() -> anyhow::Result<()> {
             });
         }
         "deepseek" => {
-            let key_input = ask(
-                lines,
-                &format!("API key or env var name [{}]", p.default_key_env),
-                p.default_key_env,
-            )
-            .await?;
+            let key_input = ask_key(p.default_key_env)?;
             let (api_key_env, _) = split_key_input(&key_input, p.id, &mut keys);
             let resolved = resolve_key(&api_key_env, &keys, p.id);
-            let model = pick_model(
-                lines,
-                fetch_openai_models("https://api.deepseek.com/v1", &resolved).await,
-                "deepseek-chat",
-            )
-            .await?;
+            let models = fetch_with_spinner("Fetching available models…", async move {
+                fetch_openai_models("https://api.deepseek.com/v1", &resolved).await
+            })?;
+            let model = pick_model(models, "deepseek-chat")?;
             config.provider.deepseek = Some(io_runtime::config::DeepSeekConfig {
                 model,
                 api_key_env,
@@ -357,20 +296,13 @@ pub async fn run() -> anyhow::Result<()> {
             });
         }
         "openrouter" => {
-            let key_input = ask(
-                lines,
-                &format!("API key or env var name [{}]", p.default_key_env),
-                p.default_key_env,
-            )
-            .await?;
+            let key_input = ask_key(p.default_key_env)?;
             let (api_key_env, _) = split_key_input(&key_input, p.id, &mut keys);
             let resolved = resolve_key(&api_key_env, &keys, p.id);
-            let model = pick_model(
-                lines,
-                fetch_openai_models("https://openrouter.ai/api/v1", &resolved).await,
-                "anthropic/claude-sonnet-4",
-            )
-            .await?;
+            let models = fetch_with_spinner("Fetching available models…", async move {
+                fetch_openai_models("https://openrouter.ai/api/v1", &resolved).await
+            })?;
+            let model = pick_model(models, "anthropic/claude-sonnet-4")?;
             config.provider.openrouter = Some(io_runtime::config::OpenRouterConfig {
                 model,
                 api_key_env,
@@ -381,20 +313,13 @@ pub async fn run() -> anyhow::Result<()> {
             });
         }
         "xai" => {
-            let key_input = ask(
-                lines,
-                &format!("API key or env var name [{}]", p.default_key_env),
-                p.default_key_env,
-            )
-            .await?;
+            let key_input = ask_key(p.default_key_env)?;
             let (api_key_env, _) = split_key_input(&key_input, p.id, &mut keys);
             let resolved = resolve_key(&api_key_env, &keys, p.id);
-            let model = pick_model(
-                lines,
-                fetch_openai_models("https://api.x.ai/v1", &resolved).await,
-                "grok-3-beta",
-            )
-            .await?;
+            let models = fetch_with_spinner("Fetching available models…", async move {
+                fetch_openai_models("https://api.x.ai/v1", &resolved).await
+            })?;
+            let model = pick_model(models, "grok-3-beta")?;
             config.provider.xai = Some(io_runtime::config::XAIConfig {
                 model,
                 api_key_env,
@@ -405,20 +330,13 @@ pub async fn run() -> anyhow::Result<()> {
             });
         }
         "opencode_go" => {
-            let key_input = ask(
-                lines,
-                &format!("API key or env var name [{}]", p.default_key_env),
-                p.default_key_env,
-            )
-            .await?;
+            let key_input = ask_key(p.default_key_env)?;
             let (api_key_env, _) = split_key_input(&key_input, p.id, &mut keys);
             let resolved = resolve_key(&api_key_env, &keys, p.id);
-            let model = pick_model(
-                lines,
-                fetch_openai_models("https://opencode.ai/zen/go/v1", &resolved).await,
-                "deepseek-v3",
-            )
-            .await?;
+            let models = fetch_with_spinner("Fetching available models…", async move {
+                fetch_openai_models("https://opencode.ai/zen/go/v1", &resolved).await
+            })?;
+            let model = pick_model(models, "deepseek-v3")?;
             config.provider.opencode_go = Some(io_runtime::config::OpenCodeGoConfig {
                 model,
                 api_key_env,
@@ -429,20 +347,13 @@ pub async fn run() -> anyhow::Result<()> {
             });
         }
         "opencode_zen" => {
-            let key_input = ask(
-                lines,
-                &format!("API key or env var name [{}]", p.default_key_env),
-                p.default_key_env,
-            )
-            .await?;
+            let key_input = ask_key(p.default_key_env)?;
             let (api_key_env, _) = split_key_input(&key_input, p.id, &mut keys);
             let resolved = resolve_key(&api_key_env, &keys, p.id);
-            let model = pick_model(
-                lines,
-                fetch_openai_models("https://opencode.ai/zen/v1", &resolved).await,
-                "opencode/claude-sonnet-4",
-            )
-            .await?;
+            let models = fetch_with_spinner("Fetching available models…", async move {
+                fetch_openai_models("https://opencode.ai/zen/v1", &resolved).await
+            })?;
+            let model = pick_model(models, "opencode/claude-sonnet-4")?;
             config.provider.opencode_zen = Some(io_runtime::config::OpenCodeZenConfig {
                 model,
                 api_key_env,
@@ -459,24 +370,31 @@ pub async fn run() -> anyhow::Result<()> {
     config.save()?;
     keys.save()?;
 
-    println!();
-    println!("Saved. Active provider: {}", p.id);
-    println!();
-
-    Ok(())
+    Ok(format!("Saved. Active provider: {}", p.id))
 }
 
 // ── interactive provider picker ───────────────────────────────────────────────
 
 fn select_provider() -> anyhow::Result<usize> {
-    println!();
-    println!("  Select a provider:");
-    println!();
     let labels: Vec<&str> = PROVIDERS.iter().map(|p| p.label).collect();
-    io_tui::picker::pick(&labels, None)
+    io_tui::picker::pick_no_esc(&labels, None)
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
+
+/// Fetch `fut` in the background while a spinner popup shows `label`. Esc
+/// cancels and propagates [`picker::Dismissed`], aborting the whole /connect
+/// flow, matching how any other cancelled popup in this flow behaves.
+fn fetch_with_spinner<F>(label: &str, fut: F) -> anyhow::Result<Vec<String>>
+where
+    F: std::future::Future<Output = Vec<String>> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        let _ = tx.send(fut.await);
+    });
+    modal::wait_for(&[label], rx)
+}
 
 fn split_key_input(
     key_input: &str,
@@ -505,35 +423,22 @@ fn resolve_key(
     }
 }
 
-async fn pick_model(
-    lines: &mut Lines,
-    models: Vec<String>,
-    fallback: &str,
-) -> anyhow::Result<String> {
+/// Let the user pick a fetched model by arrow key, or type a custom one when
+/// the list is empty or doesn't contain what they want.
+fn pick_model(models: Vec<String>, fallback: &str) -> anyhow::Result<String> {
+    const CUSTOM: &str = "Enter a custom model name…";
+
     if models.is_empty() {
-        return ask(lines, &format!("Model [{fallback}]"), fallback).await;
+        return modal::text_prompt(&["Model name:"], fallback, false);
     }
 
-    println!();
-    println!("Available models:");
-    for (i, m) in models.iter().enumerate() {
-        println!("  {:>3}.  {}", i + 1, m);
-    }
-    println!();
-
-    let answer = ask(lines, "Model number or name [1]", "1").await?;
-
-    if let Ok(n) = answer.trim().parse::<usize>() {
-        return Ok(models
-            .get(n.saturating_sub(1))
-            .cloned()
-            .unwrap_or_else(|| fallback.to_string()));
-    }
-
-    if answer.is_empty() {
-        Ok(models[0].clone())
+    let mut items: Vec<(&str, &str)> = models.iter().map(|m| (m.as_str(), "")).collect();
+    items.push((CUSTOM, ""));
+    let idx = picker::pick_with_hint_no_esc(&items, None)?;
+    if idx == models.len() {
+        modal::text_prompt(&["Model name:"], fallback, false)
     } else {
-        Ok(answer)
+        Ok(models[idx].clone())
     }
 }
 
@@ -636,16 +541,4 @@ pub(crate) async fn fetch_gemini_models(api_key: &str) -> Vec<String> {
         .unwrap_or_default();
     ids.sort();
     ids
-}
-
-async fn ask(lines: &mut Lines, question: &str, default: &str) -> anyhow::Result<String> {
-    print!("{question}: ");
-    std::io::stdout().flush()?;
-    let line = lines.next_line().await?.unwrap_or_default();
-    let trimmed = line.trim().to_string();
-    if trimmed.is_empty() {
-        Ok(default.to_string())
-    } else {
-        Ok(trimmed)
-    }
 }

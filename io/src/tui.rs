@@ -21,25 +21,24 @@ enum SessionChoice {
     Existing(SessionId),
 }
 
-/// Run an interactive flow with the TUI suspended: leave the alternate screen
-/// and disable raw mode so line-based prompts (API keys, pasted OAuth codes)
-/// and browser URLs behave normally, then re-enter the TUI and clear the stale
-/// alternate-screen content. The flow's result is preserved either way.
-async fn run_suspended<T>(
+/// Run a flow with mouse capture off. `/connect` and `/login` spend their
+/// whole flow in text-entry popups where mouse tracking never contributes
+/// anything — and on terminals that report mouse motion continuously, an
+/// in-flight mouse-motion escape sequence can race a bare Esc keypress,
+/// making Esc look unresponsive until the ambiguous bytes drain. No other
+/// terminal state (raw mode, alternate screen) is touched.
+async fn without_mouse_capture<T>(
     flow: impl std::future::Future<Output = anyhow::Result<T>>,
 ) -> anyhow::Result<T> {
-    exit_tui()?;
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     let result = flow.await;
-    enter_tui()?;
-    crossterm::execute!(
-        std::io::stdout(),
-        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
-    )?;
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     result
 }
 
 /// OAuth sign-in flow for `/login`: pick a provider, then run its login flow.
-async fn login_flow() -> anyhow::Result<()> {
+/// Renders entirely as in-TUI popups — never leaves the alternate screen.
+async fn login_flow() -> anyhow::Result<String> {
     let providers = [
         (
             "openai",
@@ -51,7 +50,7 @@ async fn login_flow() -> anyhow::Result<()> {
         ),
     ];
     let labels: Vec<&str> = providers.iter().map(|(_, l)| *l).collect();
-    let idx = picker::pick(&labels, None)?;
+    let idx = picker::pick_no_esc(&labels, None)?;
     login::run(providers[idx].0).await
 }
 
@@ -521,12 +520,23 @@ pub async fn run_interactive(
                 continue;
             }
             "/connect" => {
-                match run_suspended(connect::run()).await {
-                    Ok(()) => {
+                match without_mouse_capture(connect::run()).await {
+                    Ok(msg) => {
                         let sid = agent.session_id().await;
                         match build_agent(SessionChoice::Existing(sid), &current_agent, None).await
                         {
-                            Ok(new_agent) => agent = new_agent,
+                            Ok(new_agent) => {
+                                agent = new_agent;
+                                let _ = draw_prompt_bar(
+                                    &msg,
+                                    current_agent.name,
+                                    agent.provider_id,
+                                    &agent.model_id,
+                                    last_input_tokens,
+                                    agent.context_window(),
+                                    &theme,
+                                );
+                            }
                             Err(e) => {
                                 let _ = draw_prompt_bar(
                                     &format!("error reloading provider: {e}"),
@@ -559,12 +569,23 @@ pub async fn run_interactive(
                 continue;
             }
             "/login" => {
-                match run_suspended(login_flow()).await {
-                    Ok(()) => {
+                match without_mouse_capture(login_flow()).await {
+                    Ok(msg) => {
                         let sid = agent.session_id().await;
                         match build_agent(SessionChoice::Existing(sid), &current_agent, None).await
                         {
-                            Ok(new_agent) => agent = new_agent,
+                            Ok(new_agent) => {
+                                agent = new_agent;
+                                let _ = draw_prompt_bar(
+                                    &msg,
+                                    current_agent.name,
+                                    agent.provider_id,
+                                    &agent.model_id,
+                                    last_input_tokens,
+                                    agent.context_window(),
+                                    &theme,
+                                );
+                            }
                             Err(e) => {
                                 let _ = draw_prompt_bar(
                                     &format!("error reloading provider: {e}"),
