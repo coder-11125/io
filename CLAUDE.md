@@ -241,6 +241,14 @@ sees full tool traffic; across turns it relies on its own prose.
 tool calls) to the session before surfacing the error; tool calls parsed
 from a truncated stream are not executed.
 
+**Re-compaction** (`compact::run` in `compact.rs`, called from both
+auto-compact and manual `/compact`) folds any existing `session.summary`
+into the summarization prompt as a "prior summary" block, with an explicit
+instruction to merge rather than replace it, before overwriting `summary`
+with the model's response. Without this, a session compacted a second time
+would silently lose everything the first summary captured, since the new
+summary would only cover turns since the last compaction.
+
 **Agent Loop**:
 1. Build message history from session (system prompt, then optional project-context synthetic message pair, then prior turns, then current user input)
 2. Call LLM with tools
@@ -689,12 +697,14 @@ Message history is built inline in `Agent::run_turn_inner`:
 
 ## Testing
 
-The project has 149 unit tests (144 in `io-runtime`, 5 in `io`) plus 9
+The project has 195 unit tests (186 in `io-runtime`, 9 in `io`) plus 12
 integration tests (`io-runtime/tests/agent_loop.rs` — full agent-loop runs
 against a scripted mock provider, covering tool execution, permission
 prompting/denial, streaming events, usage tracking, session resumption,
-sub-agent permission inheritance, and partial-progress persistence on
-mid-turn provider failure). Run with `cargo test`.
+sub-agent permission inheritance, partial-progress persistence on
+mid-turn provider failure, and auto-compact triggering — including a
+second compaction pass folding the prior summary into the new one).
+Run with `cargo test`.
 
 | Module | Tests |
 |---|---|
@@ -805,6 +815,12 @@ RUST_LOG=io_runtime=trace cargo run --bin io
 
 MIT License - See LICENSE file for details.
 
+## Maintaning the codebase
+
+When maintaining the codebase, always:
+1. Never make surgical edits; always read the whole file and then apply changes
+2. Never follow conventional commits; always read past Git history and find a pattern to follow while committing
+3. Always run the CI suite before reporting that the task is done
 ## Contributing
 
 When contributing to io:

@@ -311,7 +311,7 @@ io/
 ├── io-runtime/                  # Core engine (library crate)
 │   ├── Cargo.toml
 │   ├── tests/
-│   │   └── agent_loop.rs        # 11 integration tests against a scripted mock provider
+│   │   └── agent_loop.rs        # 12 integration tests against a scripted mock provider
 │   └── src/
 │       ├── lib.rs               # Crate root — re-exports public API + load_project_context()
 │       ├── agent.rs             # Agent loop: LLM completion + tool execution (sync & streaming)
@@ -409,7 +409,7 @@ cargo build
 cargo run -- "your prompt"
 cargo run --
 
-# Run tests (149 unit tests + 9 integration tests)
+# Run tests (195 unit tests + 12 integration tests)
 cargo test
 
 # Add a new provider
