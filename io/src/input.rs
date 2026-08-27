@@ -1076,6 +1076,32 @@ pub fn tui_read_line(
 
 // ── Splash readline ────────────────────────────────────────────────────────────
 
+/// Redraw the splash input after `buf` changed. Cheap single-line redraw in
+/// the common case; falls back to a full `draw_splash` (same as on terminal
+/// resize) when `buf`'s length crosses a width the current box doesn't fit,
+/// so the box grows/shrinks with the input instead of truncating it.
+fn sync_splash_input(
+    layout: &mut io_tui::render::SplashLayout,
+    buf: &str,
+    agent_name: &str,
+    agent: &io_runtime::Agent,
+    theme: &io_tui::render::Theme,
+) -> std::io::Result<()> {
+    let (w, _) = crossterm::terminal::size()?;
+    if io_tui::render::splash_box_width(buf, w) != layout.box_w {
+        *layout = io_tui::render::draw_splash(
+            buf,
+            agent_name,
+            agent.provider_id,
+            &agent.model_id,
+            theme,
+        )?;
+    } else {
+        io_tui::render::splash_update_input(layout, buf, theme)?;
+    }
+    Ok(())
+}
+
 /// Read the first message from the centered splash screen.
 /// Returns `None` on Ctrl+D (exit), `Some(text)` on Enter with non-empty input.
 pub fn splash_read_line(
@@ -1159,7 +1185,13 @@ pub fn splash_read_line(
                         slash_selected = None;
                         clear_popup(&layout, popup_rows)?;
                         popup_rows = 0;
-                        io_tui::render::splash_update_input(&layout, &buf, theme)?;
+                        sync_splash_input(
+                            &mut layout,
+                            &buf,
+                            splash_name(*tab_current),
+                            agent,
+                            theme,
+                        )?;
                         let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf, cursor);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
                     }
@@ -1181,7 +1213,13 @@ pub fn splash_read_line(
                         slash_selected = None;
                         clear_popup(&layout, popup_rows)?;
                         popup_rows = 0;
-                        io_tui::render::splash_update_input(&layout, &buf, theme)?;
+                        sync_splash_input(
+                            &mut layout,
+                            &buf,
+                            splash_name(*tab_current),
+                            agent,
+                            theme,
+                        )?;
                         let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf, cursor);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
                     }
@@ -1202,6 +1240,13 @@ pub fn splash_read_line(
                         let start = word_back(&buf, cursor);
                         buf.drain(start..cursor);
                         cursor = start;
+                        sync_splash_input(
+                            &mut layout,
+                            &buf,
+                            splash_name(*tab_current),
+                            agent,
+                            theme,
+                        )?;
                         slash_matches = filter_slash_commands(&buf);
                         slash_selected = None;
                         if !slash_matches.is_empty() {
@@ -1214,7 +1259,6 @@ pub fn splash_read_line(
                             clear_popup(&layout, popup_rows)?;
                             popup_rows = 0;
                         }
-                        io_tui::render::splash_update_input(&layout, &buf, theme)?;
                         let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf, cursor);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
                     }
@@ -1224,6 +1268,13 @@ pub fn splash_read_line(
                             buf.remove(prev);
                             cursor = prev;
                         }
+                        sync_splash_input(
+                            &mut layout,
+                            &buf,
+                            splash_name(*tab_current),
+                            agent,
+                            theme,
+                        )?;
                         slash_matches = filter_slash_commands(&buf);
                         slash_selected = None;
                         if !slash_matches.is_empty() {
@@ -1236,7 +1287,6 @@ pub fn splash_read_line(
                             clear_popup(&layout, popup_rows)?;
                             popup_rows = 0;
                         }
-                        io_tui::render::splash_update_input(&layout, &buf, theme)?;
                         let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf, cursor);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
                     }
@@ -1308,6 +1358,13 @@ pub fn splash_read_line(
                         let next =
                             cursor + buf[cursor..].chars().next().map_or(0, |c| c.len_utf8());
                         buf.drain(cursor..next);
+                        sync_splash_input(
+                            &mut layout,
+                            &buf,
+                            splash_name(*tab_current),
+                            agent,
+                            theme,
+                        )?;
                         slash_matches = filter_slash_commands(&buf);
                         slash_selected = None;
                         if !slash_matches.is_empty() {
@@ -1320,7 +1377,6 @@ pub fn splash_read_line(
                             clear_popup(&layout, popup_rows)?;
                             popup_rows = 0;
                         }
-                        io_tui::render::splash_update_input(&layout, &buf, theme)?;
                         let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf, cursor);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
                     }
@@ -1338,6 +1394,13 @@ pub fn splash_read_line(
                     (KeyCode::Char(c), _) => {
                         buf.insert(cursor, c);
                         cursor += c.len_utf8();
+                        sync_splash_input(
+                            &mut layout,
+                            &buf,
+                            splash_name(*tab_current),
+                            agent,
+                            theme,
+                        )?;
                         slash_matches = filter_slash_commands(&buf);
                         slash_selected = None;
                         if !slash_matches.is_empty() {
@@ -1350,7 +1413,6 @@ pub fn splash_read_line(
                             clear_popup(&layout, popup_rows)?;
                             popup_rows = 0;
                         }
-                        io_tui::render::splash_update_input(&layout, &buf, theme)?;
                         let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf, cursor);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
                     }
@@ -1361,6 +1423,7 @@ pub fn splash_read_line(
                 let clean: String = text.chars().filter(|&c| c != '\r' && c != '\n').collect();
                 buf.insert_str(cursor, &clean);
                 cursor += clean.len();
+                sync_splash_input(&mut layout, &buf, splash_name(*tab_current), agent, theme)?;
                 slash_matches = filter_slash_commands(&buf);
                 slash_selected = None;
                 if !slash_matches.is_empty() {
@@ -1370,7 +1433,6 @@ pub fn splash_read_line(
                     clear_popup(&layout, popup_rows)?;
                     popup_rows = 0;
                 }
-                io_tui::render::splash_update_input(&layout, &buf, theme)?;
                 let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf, cursor);
                 execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
             }

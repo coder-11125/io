@@ -636,8 +636,13 @@ The interactive REPL uses an alternate-screen TUI with:
 
 - **Splash screen**: Centered logo, input box with placeholder, agent/model/provider
   status line, commands reference, cwd/version footer. Agent cycling with Tab.
-  Long input is truncated with `…` so text never overflows the box border;
-  `splash_cursor` accounts for the truncation offset.
+  The input box smart-resizes: `splash_box_width` grows it with the typed
+  input (up to the terminal width, minus margin) instead of truncating —
+  `input.rs`'s `sync_splash_input` does a full `draw_splash` redraw whenever
+  the required width crosses the current box width, otherwise a cheap
+  single-line `splash_update_input`. Only once content still doesn't fit at
+  the terminal-width cap does it fall back to `…` truncation;
+  `splash_cursor` accounts for that truncation offset.
 - **Fixed prompt bar** (bottom 3 rows): Thin separator, `▌`-accented input line,
   status row with `agent · model · provider` and context usage info (`X% used · Y rem · Z ctx`).
 - **Scrollback**: Mouse scroll-wheel navigates session history; any key returns to live.
@@ -712,7 +717,7 @@ Message history is built inline in `Agent::run_turn_inner`:
 
 ## Testing
 
-The project has 200 unit tests (191 in `io-runtime`, 9 in `io`) plus 13
+The project has 204 unit tests (191 in `io-runtime`, 9 in `io`, 4 in `io-tui`) plus 13
 integration tests (`io-runtime/tests/agent_loop.rs` — full agent-loop runs
 against a scripted mock provider, covering tool execution, permission
 prompting/denial, streaming events, usage tracking, session resumption,
@@ -736,6 +741,7 @@ that restores a file and truncates the session). Run with `cargo test`.
 | `config.rs` | default config, roundtrip serialization |
 | `pricing.rs` | cost calculation, known models, free/subscription/passthrough providers |
 | `io/src/stream.rs` | ThinkParser: plain text, think blocks, tags split across deltas, unterminated blocks, multibyte boundaries |
+| `io-tui/src/render.rs` | `splash_box_width`: default width for short input, growth for long input, clamping at the terminal-width cap, narrow-terminal floor |
 
 ### CI
 

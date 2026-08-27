@@ -936,6 +936,16 @@ const IO_LOGO: &[&str] = &[
     "████     ████  ",
 ];
 
+/// Width the splash box should be for `buf` at the current terminal width:
+/// starts at the existing default/minimum, grows to fit longer input, capped
+/// so it never crowds the terminal edges.
+pub fn splash_box_width(buf: &str, term_w: u16) -> u16 {
+    let default_w = (term_w * 2 / 3).clamp(52, 90);
+    let max_w = term_w.saturating_sub(6).max(default_w);
+    let needed_w = buf.chars().count() as u16 + 4; // 2 border chars + 2-space prefix
+    needed_w.clamp(default_w, max_w)
+}
+
 /// Geometry returned by `draw_splash` and consumed by the partial-update helpers.
 #[derive(Clone)]
 pub struct SplashLayout {
@@ -1032,7 +1042,7 @@ pub fn draw_splash(
     let logo_w = IO_LOGO.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
     let logo_h = IO_LOGO.len() as u16;
 
-    let box_w = (w * 2 / 3).clamp(52, 90);
+    let box_w = splash_box_width(buf, w);
     let inner_w = box_w.saturating_sub(2) as usize;
 
     let box_small = 4u16; // ╭╮ + input + status + ╰╯
@@ -1297,4 +1307,35 @@ fn draw_splash_status_at(
         Print(provider_id),
         ResetColor,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::splash_box_width;
+
+    #[test]
+    fn short_input_stays_at_default_width() {
+        assert_eq!(splash_box_width("", 100), 66);
+        assert_eq!(splash_box_width("hello", 100), 66);
+    }
+
+    #[test]
+    fn long_input_grows_the_box() {
+        let long = "x".repeat(80);
+        let grown = splash_box_width(&long, 100);
+        assert!(grown > 66, "box should grow past the default width");
+        assert_eq!(grown, 84); // 80 chars + 4 (borders + prefix)
+    }
+
+    #[test]
+    fn very_long_input_clamps_at_the_terminal_width_cap() {
+        let huge = "x".repeat(500);
+        assert_eq!(splash_box_width(&huge, 100), 94); // 100 - 6
+    }
+
+    #[test]
+    fn narrow_terminal_never_shrinks_below_default() {
+        // term_w so small that term_w - 6 would undercut the default.
+        assert_eq!(splash_box_width(&"x".repeat(500), 40), 52);
+    }
 }

@@ -153,9 +153,10 @@ Type `@path/to/file` to expand file or directory contents inline.
 The TUI features a splash screen with centered logo and command reference,
 a fixed prompt bar at the bottom showing agent/model/provider and context usage,
 mouse scrollback through session history, and streaming tool call visualization
-with syntax-colored diffs. Long splash input is automatically truncated with `…`
-so it never overflows the input box border. Thought blocks are rendered in the
-active theme's accent and muted colors.
+with syntax-colored diffs. The splash input box grows to fit longer prompts
+(up to the terminal width) instead of truncating; only content that still
+doesn't fit at that width falls back to `…` truncation. Thought blocks are
+rendered in the active theme's accent and muted colors.
 
 ### Single-shot
 
@@ -412,7 +413,7 @@ cargo build
 cargo run -- "your prompt"
 cargo run --
 
-# Run tests (200 unit tests + 13 integration tests)
+# Run tests (204 unit tests + 13 integration tests)
 cargo test
 
 # Add a new provider
