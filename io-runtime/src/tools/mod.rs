@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 pub mod bash;
 pub mod edit;
+pub mod fetch;
 pub mod glob;
 pub mod grep;
 pub mod read;
@@ -13,6 +14,7 @@ pub mod write;
 
 pub use bash::BashTool;
 pub use edit::EditTool;
+pub use fetch::FetchTool;
 pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use read::ReadTool;
@@ -180,7 +182,7 @@ fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 /// Every built-in tool name, in registration order.
-const BUILTIN_TOOLS: &[&str] = &["read", "bash", "glob", "grep", "write", "edit"];
+const BUILTIN_TOOLS: &[&str] = &["read", "bash", "glob", "grep", "write", "edit", "fetch"];
 
 /// Construct a built-in tool by name — the single source of truth for the
 /// name → implementation mapping used by both registry builders.
@@ -192,6 +194,7 @@ fn tool_by_name(name: &str) -> Option<Box<dyn Tool>> {
         "bash" => Some(Box::new(BashTool::new())),
         "glob" => Some(Box::new(GlobTool)),
         "grep" => Some(Box::new(GrepTool)),
+        "fetch" => Some(Box::new(FetchTool)),
         _ => None,
     }
 }

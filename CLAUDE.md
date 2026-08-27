@@ -8,7 +8,7 @@ This document provides comprehensive guidance for AI agents and developers worki
 
 ### Key Features
 - Multi-provider support (13 providers: Anthropic, OpenAI, Gemini, Groq, Ollama, Azure, Bedrock, Mistral, DeepSeek, OpenRouter, xAI, OpenCode Go, OpenCode Zen)
-- 7 built-in tools: read, write, edit, bash, glob, grep, spawn_agent (sub-agent delegation)
+- 8 built-in tools: read, write, edit, bash, glob, grep, fetch (HTTP GET), spawn_agent (sub-agent delegation)
 - Built-in agent roles (`io-agents` crate): full agents (build, plan, debug, refactor) and restricted sub-agents (explore, review, test, security, docs, git, …)
 - Full-screen TUI and single-shot modes
 - Permission sandboxing (allow/deny/prompt modes)
@@ -79,6 +79,7 @@ io/
 │           ├── bash.rs
 │           ├── glob.rs
 │           ├── grep.rs
+│           ├── fetch.rs       # HTTP(S) GET, blocks localhost/private/link-local hosts
 │           └── spawn.rs       # spawn_agent — delegate to a restricted sub-agent
 └── io-agents/                 # Built-in agent definitions (library crate)
     └── src/
@@ -359,6 +360,14 @@ pub trait Tool: Send + Sync {
   running command via the process group.
 - `GlobTool` - File pattern matching
 - `GrepTool` - Search file contents
+- `FetchTool` - HTTP(S) GET-only; returns the response body as text (capped
+  at 100 KB, truncated beyond that). Blocks localhost/private/link-local
+  hosts and cloud-metadata IPs by hostname/literal-IP string check (not full
+  SSRF protection — a public hostname resolving to a private address at
+  request time is not caught); the same check is re-applied to every
+  redirect hop. Permission-wise it's treated exactly like the `curl`/`wget`
+  network-fetch lenience: gated by `permissions.allow_network_fetch`, only
+  auto-runs in `agent` mode with that flag set, otherwise always prompts
 - `SpawnAgentTool` - Delegate a scoped task to a restricted sub-agent
   (registered in `build_agent` in the CLI, not in `default_registry()`;
   sub-agents inherit the parent's `PermissionChecker` and cannot prompt,
@@ -416,8 +425,9 @@ Mode is configured via `permissions.default` (a string):
   `allowed_commands`/`denied_commands` always win. `spawn_agent` is delegated
   to the agent (sub-agents inherit the same checker, run restricted, and fail
   closed — no escalation). With `permissions.allow_network_fetch = true`,
-  read-only fetches (`curl URL`, `wget -O- URL`) also auto-run; file-writing,
-  upload, and custom-method network commands still prompt.
+  read-only fetches (`curl URL`, `wget -O- URL`) and the `fetch` tool also
+  auto-run; file-writing, upload, and custom-method network commands still
+  prompt.
 - `prompt` — strict: only read-only commands auto-run; everything else asks
 - `deny` — everything denied
 
@@ -717,7 +727,7 @@ Message history is built inline in `Agent::run_turn_inner`:
 
 ## Testing
 
-The project has 204 unit tests (191 in `io-runtime`, 9 in `io`, 4 in `io-tui`) plus 13
+The project has 212 unit tests (199 in `io-runtime`, 9 in `io`, 4 in `io-tui`) plus 13
 integration tests (`io-runtime/tests/agent_loop.rs` — full agent-loop runs
 against a scripted mock provider, covering tool execution, permission
 prompting/denial, streaming events, usage tracking, session resumption,
@@ -736,7 +746,8 @@ that restores a file and truncates the session). Run with `cargo test`.
 | `tools/bash.rs` | missing arg, stdout, nonzero exit, timeout |
 | `tools/glob.rs` | missing arg, finds files, no matches, invalid pattern |
 | `tools/grep.rs` | missing arg, invalid regex, matches with line numbers, no matches |
-| `sandbox.rs` | allow/deny/prompt modes, denylist, allowlist requires every command head, env-assignment skipping, safe-command auto-allow, decide_tool prompting, session approvals |
+| `tools/fetch.rs` | missing url, invalid URL, unsupported scheme, blocked localhost/private/link-local/metadata hosts, response truncation |
+| `sandbox.rs` | allow/deny/prompt modes, denylist, allowlist requires every command head, env-assignment skipping, safe-command auto-allow, decide_tool prompting, session approvals, fetch-tool network lenience |
 | `provider/mod.rs` | retry classification by HTTP status, unknown-provider rejection, compat provider resolution, context-window tuning |
 | `config.rs` | default config, roundtrip serialization |
 | `pricing.rs` | cost calculation, known models, free/subscription/passthrough providers |

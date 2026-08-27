@@ -68,10 +68,11 @@ pub struct PermissionChecker {
     /// user's allow/deny lists always win over the agent's discretion.
     agent_decides: bool,
     /// Opt-in lenience (config `permissions.allow_network_fetch`): in `agent`
-    /// mode, read-only network fetches (`curl` to stdout, `wget -O-`) run
-    /// without prompting. Anything that writes a file, uploads data, or uses a
-    /// non-GET method still prompts, as does any other network command.
-    /// Defaults to false so network egress stays gated unless the user opts in.
+    /// mode, read-only network fetches (`curl` to stdout, `wget -O-`) and the
+    /// `fetch` tool run without prompting. Anything that writes a file,
+    /// uploads data, or uses a non-GET method still prompts, as does any
+    /// other network command. Defaults to false so network egress stays
+    /// gated unless the user opts in.
     allow_network_fetch: bool,
     allowlist: HashSet<String>,
     denylist: HashSet<String>,
@@ -215,6 +216,14 @@ impl PermissionChecker {
                         return self.check_command(cmd);
                     }
                 }
+                // The `fetch` tool is GET-only by construction (no method to
+                // override, unlike bash), so the same opt-in lenience that
+                // covers `curl`/`wget` applies directly: agent mode only,
+                // gated by the same `allow_network_fetch` flag. Strict prompt
+                // mode always asks, matching every other network operation.
+                if tool_name == "fetch" && self.agent_decides && self.allow_network_fetch {
+                    return PermissionLevel::Allow;
+                }
                 PermissionLevel::Prompt
             }
         }
@@ -343,8 +352,8 @@ impl PermissionChecker {
 
     /// Opt into read-only network-fetch lenience for `agent` mode
     /// (`permissions.allow_network_fetch = true`). Only GET-style fetches that
-    /// write to stdout (`curl URL`, `wget -O- URL`) auto-run; file-writing,
-    /// upload, and custom-method variants still prompt.
+    /// write to stdout (`curl URL`, `wget -O- URL`) or use the `fetch` tool
+    /// auto-run; file-writing, upload, and custom-method variants still prompt.
     pub fn with_network_fetch(mut self, enabled: bool) -> Self {
         self.allow_network_fetch = enabled;
         self
@@ -795,6 +804,40 @@ mod tests {
         assert_eq!(
             checker.check_command("curl -s https://example.com"),
             PermissionLevel::Prompt
+        );
+    }
+
+    #[test]
+    fn fetch_tool_follows_the_same_network_fetch_knob_as_curl() {
+        let fetch_input = serde_json::json!({"url": "https://example.com"});
+
+        // Strict prompt mode always asks, regardless of the knob.
+        let checker = PermissionChecker::new("prompt").with_network_fetch(true);
+        assert_eq!(
+            checker.decide_tool("fetch", &fetch_input),
+            PermissionLevel::Prompt
+        );
+
+        // Agent mode with the knob off still prompts.
+        let checker = PermissionChecker::new("agent");
+        assert_eq!(
+            checker.decide_tool("fetch", &fetch_input),
+            PermissionLevel::Prompt
+        );
+
+        // Agent mode with the knob on auto-allows.
+        let checker = PermissionChecker::new("agent").with_network_fetch(true);
+        assert_eq!(
+            checker.decide_tool("fetch", &fetch_input),
+            PermissionLevel::Allow
+        );
+
+        // Denylist still wins even with the knob on.
+        let mut checker = PermissionChecker::new("agent").with_network_fetch(true);
+        checker.add_deny("fetch".to_string());
+        assert_eq!(
+            checker.decide_tool("fetch", &fetch_input),
+            PermissionLevel::Deny
         );
     }
 

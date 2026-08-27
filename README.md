@@ -20,7 +20,7 @@
 ## Features
 
 - **Multi-provider** — 13 LLM providers supported (Anthropic, OpenAI, Gemini, Groq, DeepSeek, Mistral, Ollama, Azure, Bedrock, OpenRouter, xAI, OpenCode Go, OpenCode Zen)
-- **7 built-in tools** — `read`, `write`, `edit`, `bash`, `glob`, `grep`, `spawn_agent` for full codebase interaction
+- **8 built-in tools** — `read`, `write`, `edit`, `bash`, `glob`, `grep`, `fetch`, `spawn_agent` for full codebase interaction
 - **Cost tracking** — Built-in API cost calculation with `/cost` command for supported providers
 - **Interactive & single-shot modes** — Full-screen REPL with splash screen, prompt bar, and scrollback
 - **Color themes** — 12 built-in themes (dark/light) with live `/theme` switcher
@@ -79,8 +79,9 @@ io config set permissions.default deny      # deny everything
 io config set permissions.allowed_commands '["ls", "git", "cargo", "curl"]'
 io config set permissions.denied_commands '["rm", "sudo"]'
 
-# Opt into read-only network fetches in agent mode (curl to stdout, wget -O-).
-# File-writing, upload, and custom-method network commands still prompt.
+# Opt into read-only network fetches in agent mode (curl to stdout, wget -O-,
+# and the fetch tool). File-writing, upload, and custom-method network
+# commands still prompt.
 io config set permissions.allow_network_fetch true
 ```
 
@@ -326,7 +327,7 @@ io/
 │       ├── sandbox.rs           # Permission checker (allow/deny/prompt modes)
 │       ├── command_safety.rs    # Semantic command classifier (Safe/Caution/Destructive)
 │       ├── pricing.rs           # Per-token cost calculation for supported providers
-│       ├── tools/               # Built-in tools (7 tools, each with unit tests)
+│       ├── tools/               # Built-in tools (8 tools, each with unit tests)
 │       │   ├── mod.rs           # Tool trait, ToolRegistry, default_registry()
 │       │   ├── read.rs          # Read files with offset/limit
 │       │   ├── write.rs         # Write/create files, returns unified diff
@@ -334,6 +335,7 @@ io/
 │       │   ├── bash.rs          # Execute shell commands with timeout & workdir
 │       │   ├── glob.rs          # Find files by glob pattern (sorted by mtime)
 │       │   ├── grep.rs          # Search file contents with regex
+│       │   ├── fetch.rs         # HTTP(S) GET, blocks localhost/private/link-local hosts
 │       │   └── spawn.rs         # spawn_agent — delegate to a restricted sub-agent
 │       │
 │       └── provider/            # LLM provider implementations
@@ -400,6 +402,7 @@ Agent.run_turn() / run_turn_streaming()
 | **`bash`** | Execute shell commands with configurable `timeout` (ms) and `workdir` |
 | **`glob`** | Find files by glob pattern, sorted by modification time (newest first) |
 | **`grep`** | Search file contents with regex, optional file type filtering via `include` glob |
+| **`fetch`** | Fetch a URL via HTTP(S) GET, returning the response body as text (truncated past 100 KB). Blocks localhost/private/link-local hosts |
 
 All tools implement the `Tool` trait with a JSON input schema exposed to the LLM, allowing autonomous discovery and use of parameters.
 
@@ -413,7 +416,7 @@ cargo build
 cargo run -- "your prompt"
 cargo run --
 
-# Run tests (204 unit tests + 13 integration tests)
+# Run tests (212 unit tests + 13 integration tests)
 cargo test
 
 # Add a new provider
