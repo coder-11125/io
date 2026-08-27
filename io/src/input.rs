@@ -12,6 +12,10 @@ pub const MAX_AT_FILE_BYTES: usize = 100 * 1024;
 /// Maximum number of popup rows to show above the prompt bar.
 pub const MAX_POPUP_ROWS: u16 = 10;
 
+/// Two bare Esc presses within this window (idle prompt or splash, no popup
+/// open) dispatch the same rewind flow as typing `/rewind`.
+const DOUBLE_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
 // ── @file resolution ───────────────────────────────────────────────────────────
 
 pub fn resolve_at_mentions(input: &str) -> String {
@@ -487,7 +491,6 @@ pub fn tui_read_line(
     let mut popup_rows: u16 = 0;
     let mut scroll_offset: usize = 0;
     let mut last_esc: Option<std::time::Instant> = None;
-    const DOUBLE_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
     let bar = |input: &str,
                cursor_byte: usize,
@@ -1097,6 +1100,7 @@ pub fn splash_read_line(
     let mut slash_matches: Vec<usize> = Vec::new();
     let mut slash_selected: Option<usize> = None;
     let mut popup_rows: u16 = 0;
+    let mut last_esc: Option<std::time::Instant> = None;
 
     let splash_name =
         |tc: usize| -> &str { full_agents.get(tc).map(|a| a.name).unwrap_or("build") };
@@ -1180,6 +1184,19 @@ pub fn splash_read_line(
                         io_tui::render::splash_update_input(&layout, &buf, theme)?;
                         let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf, cursor);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
+                    }
+                    // Esc pressed twice within DOUBLE_ESC_WINDOW with no popup
+                    // open dispatches the same rewind flow as typing /rewind.
+                    (KeyCode::Esc, _) => {
+                        let now = std::time::Instant::now();
+                        let is_double =
+                            last_esc.is_some_and(|t| now.duration_since(t) < DOUBLE_ESC_WINDOW);
+                        last_esc = Some(now);
+                        if is_double {
+                            clear_popup(&layout, popup_rows)?;
+                            execute!(std::io::stdout(), DisableBracketedPaste, cursor::Hide)?;
+                            return Ok(Some("/rewind".to_string()));
+                        }
                     }
                     (KeyCode::Backspace, KeyModifiers::ALT) if cursor > 0 => {
                         let start = word_back(&buf, cursor);
