@@ -52,6 +52,12 @@ impl Tool for WriteTool {
             return ToolOutput::err(format!("failed to write {path}: {e}"));
         }
 
+        let prior_content = if is_new {
+            None
+        } else {
+            Some(old_content.clone())
+        };
+
         if is_new {
             // Return a synthetic "all additions" diff
             let mut out = format!(
@@ -63,10 +69,10 @@ impl Tool for WriteTool {
                 out.push_str(line);
                 out.push('\n');
             }
-            return ToolOutput::ok(out);
+            return ToolOutput::ok(out).with_snapshot(path, prior_content);
         }
 
-        ToolOutput::ok(make_diff(&old_content, &content, &path))
+        ToolOutput::ok(make_diff(&old_content, &content, &path)).with_snapshot(path, prior_content)
     }
 }
 
@@ -155,6 +161,11 @@ mod tests {
         assert!(out.success, "{}", out.data);
         assert_eq!(written.as_deref(), Some("hello world"));
         assert!(out.data.contains("+hello world"));
+        let snapshot = out.pre_edit_snapshot.expect("snapshot should be captured");
+        assert_eq!(
+            snapshot.prior_content, None,
+            "new file should snapshot as nonexistent"
+        );
     }
 
     #[tokio::test]
@@ -173,5 +184,25 @@ mod tests {
         assert_eq!(written.as_deref(), Some("new content\n"));
         assert!(out.data.contains("-old content"));
         assert!(out.data.contains("+new content"));
+        let snapshot = out.pre_edit_snapshot.expect("snapshot should be captured");
+        assert_eq!(snapshot.prior_content.as_deref(), Some("old content\n"));
+    }
+
+    #[tokio::test]
+    async fn oversized_prior_content_is_not_snapshotted() {
+        let path = temp_path("huge.txt");
+        std::fs::write(&path, "x".repeat(super::super::MAX_SNAPSHOT_BYTES + 1)).unwrap();
+        let out = WriteTool
+            .execute(input(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "content": "new content\n"
+            })))
+            .await;
+        std::fs::remove_file(&path).ok();
+        assert!(out.success, "{}", out.data);
+        assert!(
+            out.pre_edit_snapshot.is_none(),
+            "oversized prior content should be skipped"
+        );
     }
 }

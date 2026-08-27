@@ -22,6 +22,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Fetch real context window, pricing, and tool support from the provider catalog",
     ),
     ("/compact", "Summarize and compress conversation history"),
+    (
+        "/rewind",
+        "Restore files to an earlier point in the chat (or press Esc twice)",
+    ),
     ("/exit", "Exit"),
     ("/quit", "Exit"),
     ("/q", "Exit"),

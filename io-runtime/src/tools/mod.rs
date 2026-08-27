@@ -25,12 +25,28 @@ pub struct ToolInput {
     pub args: HashMap<String, serde_json::Value>,
 }
 
+/// A file's content immediately before a `write`/`edit` tool call changed it,
+/// captured so a later rewind can restore it. `prior_content: None` means the
+/// file did not exist before the call (rewind should delete it, not write it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSnapshot {
+    pub path: String,
+    pub prior_content: Option<String>,
+}
+
+/// Files larger than this are not snapshotted — the write/edit still
+/// succeeds, it just won't be revertible by a later rewind, to keep the
+/// session's persisted JSON blob from growing unbounded.
+pub const MAX_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolOutput {
     pub success: bool,
     pub data: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_edit_snapshot: Option<FileSnapshot>,
 }
 
 impl ToolOutput {
@@ -39,6 +55,7 @@ impl ToolOutput {
             success: true,
             data: data.into(),
             error: None,
+            pre_edit_snapshot: None,
         }
     }
 
@@ -48,7 +65,24 @@ impl ToolOutput {
             success: false,
             data: msg.clone(),
             error: Some(msg),
+            pre_edit_snapshot: None,
         }
+    }
+
+    /// Attach a pre-edit file snapshot for later rewind, if it wasn't skipped
+    /// for exceeding `MAX_SNAPSHOT_BYTES`.
+    pub fn with_snapshot(mut self, path: String, prior_content: Option<String>) -> Self {
+        let too_large = prior_content
+            .as_ref()
+            .map(|c| c.len() > MAX_SNAPSHOT_BYTES)
+            .unwrap_or(false);
+        if !too_large {
+            self.pre_edit_snapshot = Some(FileSnapshot {
+                path,
+                prior_content,
+            });
+        }
+        self
     }
 }
 

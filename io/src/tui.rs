@@ -351,6 +351,7 @@ pub async fn run_interactive(
                     "  /cost          Show API cost summary for current session",
                     "  /context       Fetch real context window, pricing, and tool support",
                     "  /compact       Summarize and compress conversation history",
+                    "  /rewind        Restore files to an earlier point in the chat (or Esc Esc)",
                     "  !<cmd>         Run a shell command",
                 ];
                 let (_, h) = crossterm::terminal::size()?;
@@ -474,6 +475,120 @@ pub async fn run_interactive(
                             &theme,
                         );
                     }
+                }
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            "/rewind" => {
+                let turns = agent.session_turns().await;
+                if turns.is_empty() {
+                    let _ = draw_prompt_bar(
+                        "Nothing to rewind — session has no turns.",
+                        current_agent.name,
+                        agent.provider_id,
+                        &agent.model_id,
+                        last_input_tokens,
+                        agent.context_window(),
+                        &theme,
+                    );
+                    if from_splash {
+                        is_splash = true;
+                    }
+                    continue;
+                }
+
+                let labels: Vec<(String, String)> = turns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let msg: String = t.user_message.chars().take(60).collect();
+                        let msg = msg.replace('\n', " ");
+                        (
+                            format!("{}. {msg}", i + 1),
+                            format!("{} tool call(s)", t.tool_calls.len()),
+                        )
+                    })
+                    .collect();
+                let items: Vec<(&str, &str)> = labels
+                    .iter()
+                    .map(|(l, h)| (l.as_str(), h.as_str()))
+                    .collect();
+
+                println!();
+                match picker::pick_with_hint(&items, None) {
+                    Ok(turn_index) => {
+                        let confirm_label = format!(
+                            "Rewind — discard {} turn(s), restore file(s) written since",
+                            turns.len() - turn_index
+                        );
+                        println!();
+                        match picker::pick(&["Cancel", &confirm_label], None) {
+                            Ok(1) => match agent.rewind_to(turn_index).await {
+                                Ok(result) => {
+                                    let msg = if result.files_skipped.is_empty() {
+                                        format!(
+                                            "Rewound {} turn(s), restored {} file(s).",
+                                            result.turns_dropped,
+                                            result.files_restored.len()
+                                        )
+                                    } else {
+                                        format!(
+                                            "Rewound {} turn(s), restored {} file(s) — {} file(s) had no snapshot and were left unchanged.",
+                                            result.turns_dropped,
+                                            result.files_restored.len(),
+                                            result.files_skipped.len()
+                                        )
+                                    };
+                                    let _ = draw_prompt_bar(
+                                        &msg,
+                                        current_agent.name,
+                                        agent.provider_id,
+                                        &agent.model_id,
+                                        last_input_tokens,
+                                        agent.context_window(),
+                                        &theme,
+                                    );
+                                }
+                                Err(e) => {
+                                    let _ = draw_prompt_bar(
+                                        &format!("error: {e}"),
+                                        current_agent.name,
+                                        agent.provider_id,
+                                        &agent.model_id,
+                                        last_input_tokens,
+                                        agent.context_window(),
+                                        &theme,
+                                    );
+                                }
+                            },
+                            Err(e) if !e.is::<picker::Dismissed>() => {
+                                let _ = draw_prompt_bar(
+                                    &format!("error: {e}"),
+                                    current_agent.name,
+                                    agent.provider_id,
+                                    &agent.model_id,
+                                    last_input_tokens,
+                                    agent.context_window(),
+                                    &theme,
+                                );
+                            }
+                            _ => {}
+                        }
+                    }
+                    Err(e) if !e.is::<picker::Dismissed>() => {
+                        let _ = draw_prompt_bar(
+                            &format!("error: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
+                    _ => {}
                 }
                 if from_splash {
                     is_splash = true;

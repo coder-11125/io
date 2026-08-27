@@ -486,6 +486,8 @@ pub fn tui_read_line(
     let mut slash_selected: Option<usize> = None;
     let mut popup_rows: u16 = 0;
     let mut scroll_offset: usize = 0;
+    let mut last_esc: Option<std::time::Instant> = None;
+    const DOUBLE_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
     let bar = |input: &str,
                cursor_byte: usize,
@@ -784,6 +786,21 @@ pub fn tui_read_line(
                         popup_rows = 0;
                         current_prompt_height =
                             bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                    }
+
+                    // Esc pressed twice within DOUBLE_ESC_WINDOW with no popup
+                    // open dispatches the same rewind flow as typing /rewind.
+                    (KeyCode::Esc, _) => {
+                        let now = std::time::Instant::now();
+                        let is_double =
+                            last_esc.is_some_and(|t| now.duration_since(t) < DOUBLE_ESC_WINDOW);
+                        last_esc = Some(now);
+                        if is_double {
+                            clear_rows_above(popup_rows)?;
+                            crossterm::execute!(std::io::stdout(), DisableBracketedPaste)?;
+                            crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide)?;
+                            return Ok(Some("/rewind".to_string()));
+                        }
                     }
 
                     (KeyCode::Down, _) => {

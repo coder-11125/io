@@ -26,6 +26,7 @@
 - **Color themes** — 12 built-in themes (dark/light) with live `/theme` switcher
 - **Permission sandbox** — Allow/deny/prompt modes with granular bash command control and security-hardened command validation
 - **Session persistence** — SQLite-backed conversation history, resume anytime
+- **Smart rewind** — `/rewind` (or press Esc twice) restores files to an earlier point in the chat and truncates the session to match
 - **Streaming responses** — Real-time token-by-token streaming with live indicator
 - **Fast & lightweight** — Built in Rust, minimal dependencies, no Node.js or Python required
 - **Provider switching** — Change providers on the fly with `/connect` and `/model`
@@ -142,6 +143,7 @@ Launches an interactive session with a streaming agent loop. Commands:
 | `/theme` | Switch UI color theme (12 themes) |
 | `/cost` | Show API cost summary for the current session |
 | `/compact` | Summarize and compress conversation history |
+| `/rewind` (or press Esc twice) | Restore files to an earlier point in the chat |
 | `/exit`, `/quit`, `/q` | Exit the session |
 | `!<cmd>` | Run a shell command directly |
 
@@ -311,11 +313,12 @@ io/
 ├── io-runtime/                  # Core engine (library crate)
 │   ├── Cargo.toml
 │   ├── tests/
-│   │   └── agent_loop.rs        # 12 integration tests against a scripted mock provider
+│   │   └── agent_loop.rs        # 13 integration tests against a scripted mock provider
 │   └── src/
 │       ├── lib.rs               # Crate root — re-exports public API + load_project_context()
 │       ├── agent.rs             # Agent loop: LLM completion + tool execution (sync & streaming)
 │       ├── compact.rs           # /compact + auto-compact summarization
+│       ├── rewind.rs            # /rewind — restore files to an earlier point in the chat
 │       ├── config.rs            # Config/schema (TOML), KeyStore, provider config structs
 │       ├── types.rs             # Core data types — Session, Turn, ToolCallRecord, TurnUsage
 │       ├── memory.rs            # SQLite-backed session persistence (CRUD)
@@ -409,7 +412,7 @@ cargo build
 cargo run -- "your prompt"
 cargo run --
 
-# Run tests (195 unit tests + 12 integration tests)
+# Run tests (200 unit tests + 13 integration tests)
 cargo test
 
 # Add a new provider

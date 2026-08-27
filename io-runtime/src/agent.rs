@@ -430,11 +430,11 @@ impl Agent {
                         .and_then(|v| v.as_str())
                         .map(|cmd| written_this_turn.iter().any(|p| cmd.contains(p.as_str())))
                         .unwrap_or(false);
-                let (output, success) = match self
+                let (output, success, pre_edit_snapshot) = match self
                     .resolve_permission(name, input, token_tx, force_prompt)
                     .await
                 {
-                    Err(denial) => (denial, false),
+                    Err(denial) => (denial, false, None),
                     Ok(()) => self.execute_tool(name, input).await,
                 };
                 if success && (name == "write" || name == "edit") {
@@ -460,6 +460,7 @@ impl Agent {
                     output: output.clone(),
                     success,
                     duration_ms: duration,
+                    pre_edit_snapshot,
                 };
                 append_audit_log(&record);
                 all_tool_calls.push(record);
@@ -626,7 +627,11 @@ impl Agent {
         }
     }
 
-    async fn execute_tool(&self, name: &str, input: &serde_json::Value) -> (String, bool) {
+    async fn execute_tool(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+    ) -> (String, bool, Option<crate::tools::FileSnapshot>) {
         let tool_input = ToolInput {
             name: name.to_string(),
             args: input
@@ -641,14 +646,29 @@ impl Agent {
         {
             Some(fut) => {
                 let out = fut.await;
-                (out.data, out.success)
+                (out.data, out.success, out.pre_edit_snapshot)
             }
-            None => (format!("unknown tool: {name}"), false),
+            None => (format!("unknown tool: {name}"), false, None),
         }
     }
 
     pub async fn compact(&self) -> anyhow::Result<crate::compact::CompactResult> {
         crate::compact::run(&self.session, &self.provider, &self.memory).await
+    }
+
+    /// Turns in the current session, for a caller (e.g. the `/rewind` picker)
+    /// to list as candidate rewind points.
+    pub async fn session_turns(&self) -> Vec<Turn> {
+        self.session.lock().await.turns.clone()
+    }
+
+    /// Restore files to their state right before `turn_index`, and drop that
+    /// turn and every turn after it from the session.
+    pub async fn rewind_to(
+        &self,
+        turn_index: usize,
+    ) -> anyhow::Result<crate::rewind::RewindResult> {
+        crate::rewind::run(&self.session, &self.memory, turn_index).await
     }
 }
 

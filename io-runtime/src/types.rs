@@ -69,6 +69,11 @@ pub struct ToolCallRecord {
     pub output: String,
     pub success: bool,
     pub duration_ms: u64,
+    /// The file's content immediately before this call changed it, when
+    /// `tool_name` is `write`/`edit` — used by `rewind::run` to restore
+    /// files when the user reverts to an earlier point in the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_edit_snapshot: Option<crate::tools::FileSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

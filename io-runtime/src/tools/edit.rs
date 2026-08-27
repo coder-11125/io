@@ -60,6 +60,7 @@ impl Tool for EditTool {
         }
 
         ToolOutput::ok(make_diff(&old_content, &new_content, &path))
+            .with_snapshot(path, Some(old_content))
     }
 }
 
@@ -138,5 +139,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert!(out.success, "{}", out.data);
         assert_eq!(result.as_deref(), Some("baz bar foo\n"));
+        let snapshot = out.pre_edit_snapshot.expect("snapshot should be captured");
+        assert_eq!(snapshot.prior_content.as_deref(), Some("foo bar foo\n"));
     }
 }

@@ -679,3 +679,52 @@ async fn auto_compact_second_pass_folds_in_prior_summary() {
     let session = store.load_session(agent.session_id().await).unwrap();
     assert_eq!(session.summary.as_deref(), Some("summary of round two"));
 }
+
+#[tokio::test]
+async fn rewind_restores_file_and_truncates_session() {
+    let file = temp_path("io-test-rewind", ".txt");
+    let path_str = file.to_str().unwrap().to_string();
+
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "write",
+            serde_json::json!({"path": path_str, "content": "version one"}),
+        ),
+        text_response("wrote it"),
+        tool_response(
+            "edit",
+            serde_json::json!({"path": path_str, "old_string": "one", "new_string": "two"}),
+        ),
+        text_response("edited it"),
+    ]);
+    let db = temp_path("io-test", ".db");
+    let agent = make_agent_at(
+        provider.clone(),
+        PermissionChecker::new("allow"),
+        db.clone(),
+        None,
+    );
+
+    agent.run_turn("write the file").await.unwrap();
+    agent.run_turn("edit the file").await.unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "version two");
+
+    let result = agent.rewind_to(1).await.unwrap();
+
+    assert_eq!(result.turns_dropped, 1);
+    assert_eq!(result.files_restored, vec![path_str]);
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "version one",
+        "file should be restored to its state before the reverted edit"
+    );
+    std::fs::remove_file(&file).ok();
+
+    let store = SessionStore::with_path(db).unwrap();
+    let session = store.load_session(agent.session_id().await).unwrap();
+    assert_eq!(
+        session.turns.len(),
+        1,
+        "rewound turn should be dropped from the session"
+    );
+}

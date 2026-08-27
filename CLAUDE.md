@@ -53,6 +53,7 @@ io/
 │       ├── lib.rs             # Public API re-exports + load_project_context()
 │       ├── agent.rs           # Agent loop (LLM + tool execution)
 │       ├── compact.rs         # /compact + auto-compact summarization
+│       ├── rewind.rs          # /rewind — restore files to an earlier point in the chat
 │       ├── config.rs          # Configuration schema, loading, provider lookups
 │       ├── pricing.rs         # Per-model cost tables
 │       ├── types.rs           # Core data types (Session, Turn, etc.)
@@ -249,6 +250,16 @@ with the model's response. Without this, a session compacted a second time
 would silently lose everything the first summary captured, since the new
 summary would only cover turns since the last compaction.
 
+**Rewind** (`rewind::run` in `rewind.rs`, exposed as `Agent::rewind_to()`;
+triggered by `/rewind` or pressing Esc twice within 500 ms at the idle
+prompt) restores files to their state right before a chosen turn, then
+truncates the session's turns to match. It walks the reverted turns in
+order and, per file path, restores from the *first* `pre_edit_snapshot`
+seen — the state right before the reverted range began — deleting files
+that didn't exist yet. Only `write`/`edit` calls are tracked; `bash` has no
+file-snapshotting and is out of scope, so file changes made via `bash` are
+left as-is by a rewind.
+
 **Agent Loop**:
 1. Build message history from session (system prompt, then optional project-context synthetic message pair, then prior turns, then current user input)
 2. Call LLM with tools
@@ -333,8 +344,12 @@ pub trait Tool: Send + Sync {
 
 **Built-in Tools**:
 - `ReadTool` - Read file contents
-- `WriteTool` - Write/create files
-- `EditTool` - String replacement in files
+- `WriteTool` - Write/create files. Captures the file's pre-write content (or
+  its absence, for a new file) as a `FileSnapshot` on `ToolOutput`, skipping
+  files over `MAX_SNAPSHOT_BYTES` (2 MB) so `/rewind` doesn't bloat the
+  session's persisted JSON blob
+- `EditTool` - String replacement in files. Captures the same pre-edit
+  `FileSnapshot` as `WriteTool`
 - `BashTool` - Execute shell commands with resource limits (512 MB VM, 60 s CPU,
   200 MB file size) applied at spawn. Foreground runs support a timeout (ms)
   that kills the **whole process group** (no orphaned grandchildren) and
@@ -578,7 +593,7 @@ struct Cli {
   `session.max_turns`, `session.max_tokens`, `permissions.default`, `theme`
 - `io init` - Initialize project-level config
 
-**TUI slash commands**: `/help`, `/new`, `/agent`, `/connect`, `/model`, `/theme`, `/cost`, `/compact`, `/exit` (also `/quit`, `/q`).
+**TUI slash commands**: `/help`, `/new`, `/agent`, `/connect`, `/model`, `/theme`, `/cost`, `/compact`, `/rewind` (also triggered by pressing Esc twice within 500 ms at the idle prompt), `/exit` (also `/quit`, `/q`).
 Switching agent, provider, or model mid-conversation keeps the current session
 (`SessionChoice::Existing` in `build_agent`) — history is preserved.
 
@@ -697,21 +712,22 @@ Message history is built inline in `Agent::run_turn_inner`:
 
 ## Testing
 
-The project has 195 unit tests (186 in `io-runtime`, 9 in `io`) plus 12
+The project has 200 unit tests (191 in `io-runtime`, 9 in `io`) plus 13
 integration tests (`io-runtime/tests/agent_loop.rs` — full agent-loop runs
 against a scripted mock provider, covering tool execution, permission
 prompting/denial, streaming events, usage tracking, session resumption,
 sub-agent permission inheritance, partial-progress persistence on
-mid-turn provider failure, and auto-compact triggering — including a
-second compaction pass folding the prior summary into the new one).
-Run with `cargo test`.
+mid-turn provider failure, auto-compact triggering — including a second
+compaction pass folding the prior summary into the new one — and a rewind
+that restores a file and truncates the session). Run with `cargo test`.
 
 | Module | Tests |
 |---|---|
 | `command_safety.rs` | Safe/Caution/Destructive classification for rm, find, git, cargo, sed, chmod, mkfs.*; ecosystem-agnostic build tools (npm, yarn, pnpm, bun, go, pip, mvn, gradle, dotnet, …); compound pipeline worst-case; expansion-free guard |
 | `tools/read.rs` | missing arg, nonexistent file, content, offset, limit |
-| `tools/write.rs` | missing args, create new file, overwrite + diff |
-| `tools/edit.rs` | missing args, nonexistent file, not found, replace first |
+| `tools/write.rs` | missing args, create new file, overwrite + diff, pre-edit snapshot capture (new/overwrite/oversized) |
+| `tools/edit.rs` | missing args, nonexistent file, not found, replace first, pre-edit snapshot capture |
+| `rewind.rs` | restore to an earlier turn, delete a file that didn't exist before the reverted range, report a file with no snapshot as skipped, out-of-range turn index |
 | `tools/bash.rs` | missing arg, stdout, nonzero exit, timeout |
 | `tools/glob.rs` | missing arg, finds files, no matches, invalid pattern |
 | `tools/grep.rs` | missing arg, invalid regex, matches with line numbers, no matches |
