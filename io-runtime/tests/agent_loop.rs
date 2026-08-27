@@ -635,3 +635,47 @@ async fn auto_compact_does_not_trigger_below_80_percent_threshold() {
     );
     assert!(session.summary.is_none());
 }
+
+#[tokio::test]
+async fn auto_compact_second_pass_folds_in_prior_summary() {
+    let provider = MockProvider::new(vec![
+        // First turn crosses the threshold and triggers compaction.
+        text_response_with_usage("first task done", 900, 10),
+        text_response_with_usage("summary of round one", 50, 20),
+        // Second turn also crosses the threshold, triggering a second compaction.
+        text_response_with_usage("second task done", 900, 10),
+        text_response_with_usage("summary of round two", 50, 20),
+    ]);
+    provider.set_context_window(1000);
+    let db = temp_path("io-test", ".db");
+    let agent = make_auto_compact_agent(
+        provider.clone(),
+        PermissionChecker::new("allow"),
+        db.clone(),
+    );
+
+    agent.run_turn("do the first task").await.unwrap();
+    agent.run_turn("do the second task").await.unwrap();
+
+    // The prompt for the second compaction call must include the first
+    // compaction's summary, so nothing from before it is lost.
+    let requests = provider.recorded_requests();
+    let second_compact_request = &requests[3];
+    let prompt_text: String = second_compact_request
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        prompt_text.contains("summary of round one"),
+        "second compaction's summarization prompt should carry forward the prior summary"
+    );
+
+    let store = SessionStore::with_path(db).unwrap();
+    let session = store.load_session(agent.session_id().await).unwrap();
+    assert_eq!(session.summary.as_deref(), Some("summary of round two"));
+}

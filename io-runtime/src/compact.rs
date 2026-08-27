@@ -15,15 +15,15 @@ pub async fn run(
     provider: &Arc<dyn CompletionModel>,
     memory: &Arc<SessionStore>,
 ) -> anyhow::Result<CompactResult> {
-    let turns = {
+    let (turns, existing_summary) = {
         let s = session.lock().await;
-        s.turns.clone()
+        (s.turns.clone(), s.summary.clone())
     };
 
     if turns.is_empty() {
         return Ok(CompactResult {
             turns_compacted: 0,
-            summary: String::new(),
+            summary: existing_summary.unwrap_or_default(),
         });
     }
 
@@ -54,10 +54,29 @@ pub async fn run(
         history.push('\n');
     }
 
+    let prior_summary_block = existing_summary
+        .as_ref()
+        .map(|s| {
+            format!(
+                "--- PRIOR SUMMARY (covers earlier turns no longer in context) ---\n\
+                {s}\n--- END PRIOR SUMMARY ---\n\n"
+            )
+        })
+        .unwrap_or_default();
+
+    let merge_instruction = if existing_summary.is_some() {
+        "A PRIOR SUMMARY is included above. Merge it with the new conversation below into a \
+        single unified summary — carry forward everything from the prior summary that is still \
+        relevant; do not drop information just because it isn't repeated below.\n\n"
+    } else {
+        ""
+    };
+
     let prompt = format!(
         "You are summarizing a coding session between a user and an AI assistant.\n\
         Produce a dense, structured summary that preserves ALL context a reader \
         would need to continue this work without having seen the original conversation.\n\n\
+        {prior_summary_block}\
         Include:\n\
         - The overall goal / task being worked on\n\
         - Every file read, created, or modified (with key details)\n\
@@ -65,8 +84,9 @@ pub async fn run(
         - Any errors encountered and how they were resolved\n\
         - Current state: what is done and what still needs to be done\n\
         - Any important technical details (function names, types, config values, etc.)\n\n\
+        {merge_instruction}\
         Be comprehensive. Omit nothing important. Use concise prose or bullet points.\n\n\
-        --- CONVERSATION ---\n{history}\n--- END ---\n\nSummary:"
+        --- CONVERSATION (turns since the prior summary) ---\n{history}\n--- END ---\n\nSummary:"
     );
 
     let request = CompletionRequest {
