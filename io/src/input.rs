@@ -515,6 +515,57 @@ fn clipboard_image_mention() -> Option<String> {
 /// Read a line of input in TUI mode. Supports /slash completions, @file mentions,
 /// paste blocks, cursor movement, and Tab agent cycling.
 #[allow(clippy::too_many_arguments)]
+/// Returned by the splash input when the user asked for a new line: the rest of
+/// the string is the text typed so far, to continue in the full prompt.
+pub const CONTINUE_MARKER: &str = "\u{1}continue:";
+
+/// Ctrl+R: incremental search through earlier prompts. Typing narrows the
+/// match, Ctrl+R steps to an older one, Enter takes it, Esc gives up.
+fn history_search(
+    history: &crate::history::History,
+    redraw: &mut dyn FnMut(&str) -> std::io::Result<()>,
+) -> anyhow::Result<Option<String>> {
+    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    let mut query = String::new();
+    let mut found: Option<usize> = None;
+    loop {
+        let shown = found
+            .and_then(|i| history.get(i))
+            .map(|e| e.replace('\n', " ⏎ "))
+            .unwrap_or_default();
+        redraw(&format!("(search: {query}) {shown}"))?;
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
+        if key.kind == KeyEventKind::Release {
+            continue;
+        }
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) | (KeyCode::Char('g' | 'c'), KeyModifiers::CONTROL) => {
+                return Ok(None)
+            }
+            (KeyCode::Enter, _) => {
+                return Ok(found.and_then(|i| history.get(i)).map(str::to_string))
+            }
+            (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                if let Some(i) = history.search_back(&query, found.unwrap_or(history.len())) {
+                    found = Some(i);
+                }
+            }
+            (KeyCode::Backspace, _) => {
+                query.pop();
+                found = history.search_back(&query, history.len());
+            }
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => {
+                query.push(c);
+                found = history.search_back(&query, history.len());
+            }
+            _ => {}
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn tui_read_line(
     full_agents: &[io_agents::AgentConfig],
     tab_current: &mut usize,
@@ -524,14 +575,16 @@ pub fn tui_read_line(
     current_agent_id: &str,
     theme: &io_tui::render::Theme,
     line_buf: &LineBuf,
+    history: &crate::history::History,
+    initial: &str,
 ) -> anyhow::Result<Option<String>> {
     use crossterm::event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
         KeyModifiers, MouseEventKind,
     };
 
-    let mut buf = String::new();
-    let mut cursor: usize = 0;
+    let mut buf = initial.to_string();
+    let mut cursor: usize = buf.len();
     let mut file_all: Option<Vec<String>> = None;
     let mut file_filtered: Vec<String> = vec![];
     let mut file_selected: Option<usize> = None;
@@ -568,9 +621,15 @@ pub fn tui_read_line(
     };
 
     let mut paste_block: Option<PasteBlock> = None;
+    let mut browse = crate::history::Browse::default();
+    let mut vim = crate::vim::Vim::new();
+    let vim_on = crate::status::vim_enabled();
+    if vim_on {
+        crate::status::set_vim_label(agent, Some(vim.label()));
+    }
 
     crossterm::execute!(std::io::stdout(), EnableBracketedPaste)?;
-    let mut current_prompt_height = bar("", 0, *tab_current, None)?;
+    let mut current_prompt_height = bar(&buf, cursor, *tab_current, None)?;
     crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
 
     loop {
@@ -675,6 +734,27 @@ pub fn tui_read_line(
                     current_prompt_height = bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
                     crossterm::execute!(std::io::stdout(), crossterm::cursor::Show)?;
                 }
+                // Vim Normal mode: plain keys edit the line instead of typing.
+                if vim_on
+                    && vim.mode == crate::vim::Mode::Normal
+                    && paste_block.is_none()
+                    && file_all.is_none()
+                    && slash_selected.is_none()
+                {
+                    if let (KeyCode::Char(c), m) = (key.code, key.modifiers) {
+                        if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) {
+                            if vim.handle_normal(c, &mut buf, &mut cursor) {
+                                slash_matches.clear();
+                                if vim.mode == crate::vim::Mode::Insert {
+                                    crate::status::set_vim_label(agent, Some(vim.label()));
+                                }
+                                current_prompt_height =
+                                    bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                            }
+                            continue;
+                        }
+                    }
+                }
                 match (key.code, key.modifiers) {
                     (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                         clear_rows_above(popup_rows)?;
@@ -701,6 +781,71 @@ pub fn tui_read_line(
                         }
                         let _ = bar("", 0, *tab_current, None)?;
                         return Ok(Some(String::new()));
+                    }
+
+                    // Alt/Shift+Enter, Ctrl+J, or a trailing backslash: a new line
+                    // in the message instead of sending it.
+                    (KeyCode::Enter, m)
+                        if m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                            && file_all.is_none()
+                            && slash_selected.is_none() =>
+                    {
+                        insert_text(&mut buf, &mut cursor, &mut paste_block, "\n");
+                        slash_matches.clear();
+                        clear_rows_above(popup_rows)?;
+                        popup_rows = 0;
+                        current_prompt_height =
+                            bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                    }
+                    (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+                        insert_text(&mut buf, &mut cursor, &mut paste_block, "\n");
+                        slash_matches.clear();
+                        clear_rows_above(popup_rows)?;
+                        popup_rows = 0;
+                        current_prompt_height =
+                            bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                    }
+                    (KeyCode::Enter, _)
+                        if cursor == buf.len()
+                            && buf.ends_with('\\')
+                            && paste_block.is_none()
+                            && file_all.is_none()
+                            && slash_selected.is_none() =>
+                    {
+                        buf.pop();
+                        buf.push('\n');
+                        cursor = buf.len();
+                        slash_matches.clear();
+                        clear_rows_above(popup_rows)?;
+                        popup_rows = 0;
+                        current_prompt_height =
+                            bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                    }
+
+                    // Ctrl+R: search earlier prompts.
+                    (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                        clear_rows_above(popup_rows)?;
+                        popup_rows = 0;
+                        let found = history_search(history, &mut |text: &str| {
+                            bar(text, text.len(), *tab_current, None).map(|_| ())
+                        })?;
+                        if let Some(entry) = found {
+                            buf = entry;
+                            cursor = buf.len();
+                            paste_block = None;
+                            browse.reset();
+                        }
+                        slash_matches.clear();
+                        current_prompt_height =
+                            bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                    }
+
+                    // Ctrl+O: the full transcript (tool calls and results).
+                    (KeyCode::Char('o'), KeyModifiers::CONTROL) => {
+                        clear_rows_above(popup_rows)?;
+                        crossterm::execute!(std::io::stdout(), DisableBracketedPaste)?;
+                        crossterm::execute!(std::io::stdout(), crossterm::cursor::Hide)?;
+                        return Ok(Some("/transcript".to_string()));
                     }
 
                     (KeyCode::Enter, _) => {
@@ -892,6 +1037,18 @@ pub fn tui_read_line(
                             bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
                     }
 
+                    // Vim mode: Esc leaves Insert for Normal.
+                    (KeyCode::Esc, _)
+                        if vim_on
+                            && vim.mode == crate::vim::Mode::Insert
+                            && paste_block.is_none() =>
+                    {
+                        vim.enter_normal(&buf, &mut cursor);
+                        crate::status::set_vim_label(agent, Some(vim.label()));
+                        current_prompt_height =
+                            bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                    }
+
                     // Esc pressed twice within DOUBLE_ESC_WINDOW with no popup
                     // open dispatches the same rewind flow as typing /rewind.
                     (KeyCode::Esc, _) => {
@@ -933,6 +1090,14 @@ pub fn tui_read_line(
                             popup_rows = draw_slash_popup(&slash_matches, slash_selected, None)?;
                             current_prompt_height =
                                 bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                        } else if browse.active() {
+                            if let Some(entry) = browse.down(history) {
+                                buf = entry;
+                                cursor = buf.len();
+                                paste_block = None;
+                                current_prompt_height =
+                                    bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                            }
                         }
                     }
 
@@ -966,6 +1131,14 @@ pub fn tui_read_line(
                             popup_rows = draw_slash_popup(&slash_matches, slash_selected, None)?;
                             current_prompt_height =
                                 bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                        } else if !buf.contains('\n') || browse.active() {
+                            if let Some(entry) = browse.up(history, &buf) {
+                                buf = entry;
+                                cursor = buf.len();
+                                paste_block = None;
+                                current_prompt_height =
+                                    bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                            }
                         }
                     }
 
@@ -1295,6 +1468,21 @@ pub fn splash_read_line(
                         )?;
                         let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf, cursor);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
+                    }
+                    // A new line: the splash box is one line, so carry what has
+                    // been typed into the full prompt and continue there.
+                    (KeyCode::Enter, m)
+                        if m.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
+                            && slash_selected.is_none() =>
+                    {
+                        clear_popup(&layout, popup_rows)?;
+                        execute!(std::io::stdout(), DisableBracketedPaste, cursor::Hide)?;
+                        return Ok(Some(format!("{CONTINUE_MARKER}{buf}\n")));
+                    }
+                    (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+                        clear_popup(&layout, popup_rows)?;
+                        execute!(std::io::stdout(), DisableBracketedPaste, cursor::Hide)?;
+                        return Ok(Some(format!("{CONTINUE_MARKER}{buf}\n")));
                     }
                     (KeyCode::Enter, _) => {
                         if let Some(s) = slash_selected {
