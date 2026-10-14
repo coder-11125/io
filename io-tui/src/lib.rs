@@ -1,4 +1,5 @@
 pub mod modal;
+pub mod pager;
 pub mod picker;
 pub mod raw;
 pub mod readline;

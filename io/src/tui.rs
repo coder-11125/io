@@ -116,6 +116,7 @@ fn apply_model_spec(config: &mut io_runtime::config::Config, spec: &str) {
 /// `permissions.defaultMode`.
 pub(crate) fn apply_startup_settings(root: &std::path::Path) -> Vec<String> {
     let settings = io_runtime::settings::Settings::load(root);
+    status::set_vim_enabled(settings.editor_mode.as_deref() == Some("vim"));
     if let (Some(mode), false) = (settings.default_mode, crate::run_opts::get().explicit_mode) {
         status::set_initial_mode(mode);
     }
@@ -469,6 +470,11 @@ pub async fn run_interactive(
 
     let mut last_input_tokens: u32 = 0;
     let mut is_splash = true;
+    let mut history = crate::history::History::load();
+    // Messages typed while the model was busy, in the order they were sent.
+    let mut pending_inputs: std::collections::VecDeque<String> = Default::default();
+    // Text carried from the splash box into the full prompt (Alt+Enter).
+    let mut seed = String::new();
     if resuming {
         let turns = agent.session_turns().await;
         if !turns.is_empty() {
@@ -505,7 +511,9 @@ pub async fn run_interactive(
             .unwrap_or(0);
 
         let from_splash = is_splash;
-        let input = if is_splash {
+        let input = if let Some(next) = pending_inputs.pop_front() {
+            next
+        } else if is_splash {
             match splash_read_line(&full_agents, &mut tab_current, &agent, &theme) {
                 Ok(Some(s)) => {
                     is_splash = false;
@@ -513,6 +521,11 @@ pub async fn run_interactive(
                         std::io::stdout(),
                         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
                     )?;
+                    if let Some(typed) = s.strip_prefix(crate::input::CONTINUE_MARKER) {
+                        // Alt+Enter on the splash: keep typing in the full prompt.
+                        seed = typed.to_string();
+                        continue;
+                    }
                     s
                 }
                 Ok(None) => break,
@@ -531,6 +544,8 @@ pub async fn run_interactive(
                 current_agent.id,
                 &theme,
                 &line_buf,
+                &history,
+                &std::mem::take(&mut seed),
             ) {
                 Ok(Some(s)) => s,
                 Ok(None) => break,
@@ -580,6 +595,7 @@ pub async fn run_interactive(
         if input.is_empty() {
             continue;
         }
+        history.push(&input);
 
         match input.as_str() {
             "/exit" | "/quit" | "/q" => break,
@@ -617,6 +633,10 @@ pub async fn run_interactive(
                     "  /review [t]    Review uncommitted changes, a PR number or a branch",
                     "  /commit [note] Commit the current changes in this repo's style",
                     "  /pr [note]     Open a pull request for this branch",
+                    "  /vim           Toggle Vim-style editing in the prompt",
+                    "  Ctrl+R         Search earlier prompts · Up/Down browse them",
+                    "  Alt+Enter      New line (also Shift+Enter, Ctrl+J, or end a line with \\)",
+                    "  Ctrl+O         Show the full transcript with tool calls",
                     "  /init          Have the agent write a CLAUDE.md for this project",
                     "  /memory        Open a memory file (CLAUDE.md) in your editor",
                     "  #<note>        Save a note to memory (a '#', a space, then the note)",
@@ -1406,6 +1426,51 @@ pub async fn run_interactive(
                 }
                 continue;
             }
+            "/vim" => {
+                let on = !status::vim_enabled();
+                status::set_vim_enabled(on);
+                status::set_vim_label(&agent, None);
+                let paths =
+                    io_runtime::settings::SettingsPaths::for_project(&detect_project_root());
+                let saved = io_runtime::settings::set_value(
+                    &paths.user,
+                    "editorMode",
+                    serde_json::json!(if on { "vim" } else { "normal" }),
+                );
+                let msg = match saved {
+                    Ok(()) if on => "Vim mode on — Esc for Normal mode, i to insert",
+                    Ok(()) => "Vim mode off",
+                    Err(_) if on => "Vim mode on (could not save the setting)",
+                    Err(_) => "Vim mode off (could not save the setting)",
+                };
+                let _ = draw_prompt_bar(
+                    msg,
+                    current_agent.name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    last_input_tokens,
+                    agent.context_window(),
+                    &theme,
+                );
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            "/transcript" => {
+                let lines = crate::session_cmd::transcript_lines(&agent.session_turns().await);
+                let _ = io_tui::pager::show(&lines, "transcript");
+                // The pager used the whole screen: bring the REPL back.
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                );
+                let _ = render_scroll_view(&line_buf.lock().unwrap(), 0, &theme, PROMPT_BAR_HEIGHT);
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
             "/memory" => {
                 match memory_cmd::edit_menu(&detect_project_root()) {
                     Ok(Some(msg)) => {
@@ -1661,8 +1726,44 @@ pub async fn run_interactive(
         let stream_scroll = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stream_scroll2 = stream_scroll.clone();
         let line_buf_scroll = line_buf.clone();
+        // Ctrl+B moves a running `bash` command to the background; anything
+        // typed while the model works is queued and sent when it finishes.
+        let background = agent.background_handle();
+        let bar_agent = current_agent.name;
+        let bar_provider = agent.provider_id;
+        let bar_model = agent.model_id.clone();
+        let bar_tokens = last_input_tokens;
+        let bar_window = agent.context_window();
         let key_listener = tokio::task::spawn_blocking(move || {
             use crossterm::event;
+            let mut typed = String::new();
+            let mut queue: Vec<String> = Vec::new();
+            // Show the typed text in the prompt bar without disturbing the
+            // output being streamed above it: hold the terminal for the whole
+            // redraw and put the cursor back afterwards.
+            let show = |typed: &str, queued: usize| {
+                let text = if queued > 0 {
+                    format!("(+{queued} queued) {typed}")
+                } else {
+                    typed.to_string()
+                };
+                let _guard = std::io::stdout().lock();
+                let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::SavePosition);
+                let _ = draw_prompt_bar(
+                    &text,
+                    bar_agent,
+                    bar_provider,
+                    &bar_model,
+                    bar_tokens,
+                    bar_window,
+                    &theme,
+                );
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::cursor::RestorePosition,
+                    crossterm::cursor::Hide
+                );
+            };
             loop {
                 if streaming_done2.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
@@ -1689,6 +1790,36 @@ pub async fn run_interactive(
                             cancel_for_listener.store(true, std::sync::atomic::Ordering::Relaxed);
                             let _ = esc_tx.send(());
                             break;
+                        }
+                        Ok(crossterm::event::Event::Key(k))
+                            if k.kind != crossterm::event::KeyEventKind::Release =>
+                        {
+                            use crossterm::event::{KeyCode, KeyModifiers};
+                            let plain = !k
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+                            match k.code {
+                                KeyCode::Char('b')
+                                    if k.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    if let Some(flag) = &background {
+                                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                                KeyCode::Char(c) if plain => {
+                                    typed.push(c);
+                                    show(&typed, queue.len());
+                                }
+                                KeyCode::Backspace => {
+                                    typed.pop();
+                                    show(&typed, queue.len());
+                                }
+                                KeyCode::Enter if !typed.trim().is_empty() => {
+                                    queue.push(std::mem::take(&mut typed));
+                                    show(&typed, queue.len());
+                                }
+                                _ => {}
+                            }
                         }
                         Ok(crossterm::event::Event::Mouse(m)) => {
                             let cur = stream_scroll2.load(std::sync::atomic::Ordering::Relaxed);
@@ -1721,6 +1852,7 @@ pub async fn run_interactive(
                     }
                 }
             }
+            (queue, typed)
         });
 
         tokio::select! {
@@ -1742,7 +1874,13 @@ pub async fn run_interactive(
             _ = esc_rx => {}
         }
         streaming_done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = key_listener.await;
+        if let Ok((queued, unfinished)) = key_listener.await {
+            // Cancelling (Esc) drops what was queued; otherwise it goes next.
+            if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                pending_inputs.extend(queued);
+            }
+            seed = unfinished;
+        }
 
         // Approving a plan switches modes inside the agent; follow it.
         status::sync_from_agent(&agent);

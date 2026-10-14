@@ -209,12 +209,12 @@ pub fn bug_lines(version: &str, provider: &str, model: &str) -> Vec<String> {
 
 pub fn terminal_setup_lines() -> Vec<String> {
     vec![
-        "Multi-line input: Alt+Enter or Ctrl+J inserts a newline (Shift+Enter too, in terminals".into(),
-        "that report it — kitty, WezTerm, Ghostty, foot, recent iTerm2/Windows Terminal).".into(),
-        "If Shift+Enter submits instead, use Alt+Enter, or map Shift+Enter to send \"\\x1b\\r\":".into(),
-        "  iTerm2:   Settings → Profiles → Keys → add Shift+Return → Send Escape Sequence → [13;2u … or \"\\r\" with Alt".into(),
-        "  VS Code:  keybindings.json: {\"key\":\"shift+enter\",\"command\":\"workbench.action.terminal.sendSequence\",".into(),
-        "            \"args\":{\"text\":\"\\u001b\\r\"},\"when\":\"terminalFocus\"}".into(),
+        "New line in a message: Alt+Enter or Ctrl+J, or end the line with a backslash.".into(),
+        "Shift+Enter also works in terminals that speak the kitty keyboard protocol".into(),
+        "(kitty, WezTerm, Ghostty, foot, iTerm2); in others it sends a plain Enter.".into(),
+        "If Alt+Enter does nothing, make your terminal send Option/Alt as Escape".into(),
+        "(macOS Terminal: Settings → Profiles → Keyboard → \"Use Option as Meta key\";".into(),
+        "iTerm2: Profiles → Keys → \"Left Option key: Esc+\").".into(),
         "Images: Ctrl+V needs pngpaste (macOS), wl-paste (Wayland) or xclip (X11).".into(),
     ]
 }

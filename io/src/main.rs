@@ -9,6 +9,7 @@ mod cost;
 mod doctor;
 mod git_prompts;
 mod headless;
+mod history;
 mod info_cmd;
 mod input;
 mod login;
@@ -24,6 +25,7 @@ mod stream;
 mod style_cmd;
 mod tui;
 mod update;
+mod vim;
 mod worktree;
 
 #[derive(Parser)]

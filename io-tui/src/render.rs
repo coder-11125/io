@@ -353,13 +353,48 @@ pub fn enter_tui() -> std::io::Result<()> {
         crossterm::event::EnableMouseCapture,
         crossterm::cursor::Hide,
     )?;
+    // Terminals with the kitty keyboard protocol can tell Shift+Enter from
+    // Enter once asked to; others ignore the request.
+    if keyboard_protocol_terminal(|k| std::env::var(k).ok()) {
+        let pushed = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PushKeyboardEnhancementFlags(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            )
+        );
+        KEYBOARD_FLAGS_PUSHED.store(pushed.is_ok(), std::sync::atomic::Ordering::Relaxed);
+    }
     set_scroll_region(1, h.saturating_sub(PROMPT_BAR_HEIGHT));
     Ok(())
+}
+
+static KEYBOARD_FLAGS_PUSHED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the terminal is one known to speak the kitty keyboard protocol
+/// (looked up through `env` so it can be tested).
+pub fn keyboard_protocol_terminal(env: impl Fn(&str) -> Option<String>) -> bool {
+    let has = |k: &str| env(k).is_some_and(|v| !v.is_empty());
+    let term = env("TERM").unwrap_or_default();
+    let program = env("TERM_PROGRAM").unwrap_or_default();
+    has("KITTY_WINDOW_ID")
+        || has("WEZTERM_EXECUTABLE")
+        || has("GHOSTTY_RESOURCES_DIR")
+        || term.contains("kitty")
+        || term.contains("foot")
+        || term.contains("ghostty")
+        || matches!(program.as_str(), "ghostty" | "WezTerm" | "iTerm.app")
 }
 
 /// Restore terminal to normal state: leave alternate screen, show cursor,
 /// disable mouse capture, reset scroll region, disable raw mode.
 pub fn exit_tui() -> std::io::Result<()> {
+    if KEYBOARD_FLAGS_PUSHED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::PopKeyboardEnhancementFlags
+        );
+    }
     reset_scroll_region();
     crossterm::execute!(
         std::io::stdout(),
@@ -1528,6 +1563,34 @@ fn draw_splash_status_at(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn only_terminals_known_to_support_the_keyboard_protocol_get_it() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert!(keyboard_protocol_terminal(env(&[("KITTY_WINDOW_ID", "3")])));
+        assert!(keyboard_protocol_terminal(env(&[("TERM", "xterm-kitty")])));
+        assert!(keyboard_protocol_terminal(env(&[(
+            "TERM_PROGRAM",
+            "WezTerm"
+        )])));
+        assert!(!keyboard_protocol_terminal(env(&[(
+            "TERM",
+            "xterm-256color"
+        )])));
+        assert!(!keyboard_protocol_terminal(env(&[(
+            "TERM_PROGRAM",
+            "Apple_Terminal"
+        )])));
+        assert!(!keyboard_protocol_terminal(env(&[("KITTY_WINDOW_ID", "")])));
+        assert!(!keyboard_protocol_terminal(env(&[])));
+    }
+
+    #[test]
     fn status_text_loses_control_characters_and_escape_sequences() {
         assert_eq!(
             sanitize_status("  main \x1b[32m+2\x1b[0m ok\n"),
@@ -1540,7 +1603,8 @@ mod tests {
     }
 
     use super::{
-        get_theme, preview, sanitize_status, splash_box_width, tool_body_lines, tool_detail,
+        get_theme, keyboard_protocol_terminal, preview, sanitize_status, splash_box_width,
+        tool_body_lines, tool_detail,
     };
 
     #[test]

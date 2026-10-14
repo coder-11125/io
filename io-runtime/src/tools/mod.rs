@@ -137,6 +137,11 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, input: ToolInput) -> ToolOutput;
     /// Propagate a cancellation flag to tools that support it (e.g. spawn_agent).
     fn set_cancel(&self, _cancel: Arc<AtomicBool>) {}
+    /// A flag that, when set, asks a running call to continue in the
+    /// background instead of blocking the turn (only `bash` supports it).
+    fn background_handle(&self) -> Option<Arc<AtomicBool>> {
+        None
+    }
 }
 
 /// A tool shared between registries — e.g. an MCP tool backed by one live
@@ -159,6 +164,9 @@ impl Tool for SharedTool {
     }
     fn set_cancel(&self, cancel: Arc<AtomicBool>) {
         self.0.set_cancel(cancel)
+    }
+    fn background_handle(&self) -> Option<Arc<AtomicBool>> {
+        self.0.background_handle()
     }
 }
 
@@ -196,6 +204,11 @@ impl ToolRegistry {
                 input_schema: t.input_schema(),
             })
             .collect()
+    }
+
+    /// The flag that moves a running foreground command to the background.
+    pub fn background_handle(&self) -> Option<Arc<AtomicBool>> {
+        self.tools.values().find_map(|t| t.background_handle())
     }
 
     /// Propagate a cancellation flag to all tools.

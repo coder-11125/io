@@ -232,6 +232,12 @@ impl Agent {
         }
     }
 
+    /// A flag that, once set, moves a running foreground `bash` command to a
+    /// background job (Ctrl+B in the REPL).
+    pub fn background_handle(&self) -> Option<Arc<AtomicBool>> {
+        self.tools.background_handle()
+    }
+
     /// A copy of the current session (for export).
     pub async fn session_snapshot(&self) -> Session {
         self.session.lock().await.clone()

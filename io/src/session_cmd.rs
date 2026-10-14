@@ -128,6 +128,48 @@ fn slug(name: &str) -> String {
     out.trim_end_matches('-').chars().take(40).collect()
 }
 
+/// Every turn in full — prompts, each tool call with its (trimmed) result, and
+/// replies — for the Ctrl+O transcript view.
+pub fn transcript_lines(turns: &[Turn]) -> Vec<String> {
+    const MAX_RESULT_LINES: usize = 25;
+    let mut lines = Vec::new();
+    if turns.is_empty() {
+        lines.push("  (nothing has been said yet)".to_string());
+    }
+    for (i, turn) in turns.iter().enumerate() {
+        lines.push(format!("── turn {} ─────────────────────────────", i + 1));
+        for (n, l) in turn.user_message.lines().enumerate() {
+            lines.push(if n == 0 {
+                format!("> {l}")
+            } else {
+                format!("  {l}")
+            });
+        }
+        for call in &turn.tool_calls {
+            let mark = if call.success { "●" } else { "✗" };
+            let args = call.input.to_string();
+            let args: String = args.chars().take(200).collect();
+            lines.push(format!("{mark} {} {args}", call.tool_name));
+            let out: Vec<&str> = call.output.lines().collect();
+            for l in out.iter().take(MAX_RESULT_LINES) {
+                lines.push(format!("    {l}"));
+            }
+            if out.len() > MAX_RESULT_LINES {
+                lines.push(format!(
+                    "    … {} more line(s)",
+                    out.len() - MAX_RESULT_LINES
+                ));
+            }
+        }
+        if let Some(reply) = &turn.assistant_message {
+            lines.push(String::new());
+            lines.extend(reply.trim().lines().map(|l| format!("  {l}")));
+        }
+        lines.push(String::new());
+    }
+    lines
+}
+
 /// Scrollback lines that show the last turns of a resumed conversation.
 pub fn replay_lines(turns: &[Turn], max_turns: usize) -> Vec<String> {
     let start = turns.len().saturating_sub(max_turns);
@@ -215,6 +257,26 @@ mod tests {
         assert!(export_path("", &s, dir)
             .to_string_lossy()
             .contains(&short_id(s.id)));
+    }
+
+    #[test]
+    fn the_transcript_includes_tool_calls_and_trims_long_results() {
+        let mut t = turn("do it\nplease", "all done", 1);
+        t.tool_calls[0].output = (0..40)
+            .map(|i| format!("row {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        t.tool_calls[0].success = false;
+        let lines = transcript_lines(&[t]);
+        assert!(lines[0].contains("turn 1"));
+        assert_eq!(lines[1], "> do it");
+        assert_eq!(lines[2], "  please");
+        assert!(lines.iter().any(|l| l.starts_with("✗ bash")));
+        assert!(lines.contains(&"    row 24".to_string()));
+        assert!(!lines.contains(&"    row 25".to_string()));
+        assert!(lines.contains(&"    … 15 more line(s)".to_string()));
+        assert!(lines.contains(&"  all done".to_string()));
+        assert!(transcript_lines(&[])[0].contains("nothing has been said"));
     }
 
     #[test]

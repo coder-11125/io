@@ -95,6 +95,8 @@ pub struct Settings {
     pub additional_directories: Vec<PathBuf>,
     pub default_mode: Option<InteractionMode>,
     pub output_style: Option<String>,
+    /// `vim` for Vim-style prompt editing; anything else is the default.
+    pub editor_mode: Option<String>,
     /// Shell command whose first output line replaces the status row's left side.
     pub status_line: Option<String>,
     pub sandbox: SandboxSettings,
@@ -277,6 +279,9 @@ impl Settings {
         }
         if let Some(style) = doc.get("outputStyle").and_then(|v| v.as_str()) {
             self.output_style = Some(style.to_string());
+        }
+        if let Some(mode) = doc.get("editorMode").and_then(|v| v.as_str()) {
+            self.editor_mode = Some(mode.to_string());
         }
         if let Some(sandbox) = doc.get("sandbox") {
             if let Some(enabled) = sandbox.get("enabled").and_then(|v| v.as_bool()) {
@@ -507,6 +512,15 @@ mod tests {
         let s = f.load();
         assert!(s.rules_in(RuleList::Allow).is_empty());
         assert_eq!(s.rules_in(RuleList::Deny), ["WebFetch"]);
+    }
+
+    #[test]
+    fn editor_mode_is_a_plain_scalar() {
+        let f = Fixture::new();
+        f.write(SettingsScope::User, json!({"editorMode": "vim"}));
+        assert_eq!(f.load().editor_mode.as_deref(), Some("vim"));
+        f.write(SettingsScope::Local, json!({"editorMode": "normal"}));
+        assert_eq!(f.load().editor_mode.as_deref(), Some("normal"));
     }
 
     #[test]
