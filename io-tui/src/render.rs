@@ -7,6 +7,21 @@ pub const PROMPT_BAR_HEIGHT: u16 = 3;
 /// Maximum input lines before the prompt stops growing (capped at this height).
 pub const MAX_INPUT_LINES: u16 = 5;
 
+/// Short state shown in the status row (e.g. `⏸ plan mode · thinking`),
+/// set by the app whenever the working mode or thinking setting changes.
+static STATUS_BADGE: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Set the status-row badge; an empty string clears it.
+pub fn set_status_badge(badge: &str) {
+    if let Ok(mut b) = STATUS_BADGE.lock() {
+        *b = badge.to_string();
+    }
+}
+
+fn status_badge() -> String {
+    STATUS_BADGE.lock().map(|b| b.clone()).unwrap_or_default()
+}
+
 // ── Theme ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy)]
@@ -464,15 +479,19 @@ pub fn draw_prompt_bar(
     let dot = " · ";
     let hint = "/commands";
     let ctx = format_context_info(input_tokens, context_window);
-    let right = if ctx.is_empty() {
-        format!("{}  ", hint)
-    } else {
-        format!("{}  {}  ", ctx, hint)
-    };
+    let badge = status_badge();
+    let right = [badge.as_str(), ctx.as_str(), hint]
+        .iter()
+        .filter(|part| !part.is_empty())
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("  ")
+        + "  ";
+    let right_cols = right.chars().count();
 
     // Compute how much width is available for model_id
     let left_fixed = 2 + agent_name.len() + dot.len() * 2 + provider_id.len();
-    let model_budget = (w as usize).saturating_sub(left_fixed + right.len());
+    let model_budget = (w as usize).saturating_sub(left_fixed + right_cols);
     let mut m_end = model_id.len().min(model_budget);
     while m_end > 0 && !model_id.is_char_boundary(m_end) {
         m_end -= 1;
@@ -496,7 +515,7 @@ pub fn draw_prompt_bar(
     )?;
 
     // Right-aligned info
-    let right_x = w.saturating_sub(right.len() as u16);
+    let right_x = w.saturating_sub(right_cols as u16);
     execute!(
         std::io::stdout(),
         cursor::MoveTo(right_x, status_row),
@@ -752,15 +771,45 @@ pub fn tool_detail(name: &str, input: &serde_json::Value) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        "fetch" => input
-            .get("url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
+        "fetch" => {
+            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            match input.get("prompt").and_then(|v| v.as_str()) {
+                Some(p) if !p.trim().is_empty() => format!("{url}  ⟶ {}", preview(p, 50)),
+                _ => url.to_string(),
+            }
+        }
         "grep" => {
             let pat = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             let path = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
             format!("{pat}  in  {path}")
+        }
+        "multi_edit" => {
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let n = input
+                .get("edits")
+                .and_then(|v| v.as_array())
+                .map_or(0, Vec::len);
+            format!("{path}  ({n} edit{})", if n == 1 { "" } else { "s" })
+        }
+        "notebook_edit" => {
+            let path = input.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let mode = input
+                .get("edit_mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("replace");
+            format!("{path}  ({mode})")
+        }
+        "web_search" => input
+            .get("query")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "todo_write" => {
+            let n = input
+                .get("todos")
+                .and_then(|v| v.as_array())
+                .map_or(0, Vec::len);
+            format!("{n} item{}", if n == 1 { "" } else { "s" })
         }
         "spawn_agent" => {
             let agent_id = input.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -781,6 +830,52 @@ pub fn tool_detail(name: &str, input: &serde_json::Value) -> String {
     }
 }
 
+/// First `max` characters of `s` on one line, with an ellipsis when cut.
+fn preview(s: &str, max: usize) -> String {
+    let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    match one_line.char_indices().nth(max) {
+        Some((idx, _)) => format!("{}…", &one_line[..idx]),
+        None => one_line,
+    }
+}
+
+/// The todo list as ANSI-styled lines: `☒` done (dim, struck through),
+/// `◐` in progress (accent, bold), `☐` pending.
+pub fn todo_lines(todos: &[io_runtime::tools::todo::TodoItem], theme: &Theme) -> Vec<String> {
+    use io_runtime::tools::todo::TodoStatus;
+    let accent = ansi_fg(theme.accent);
+    let muted = ansi_fg(theme.muted);
+    todos
+        .iter()
+        .map(|t| match t.status {
+            TodoStatus::Completed => format!("{muted}\x1b[9m☒ {}\x1b[0m", t.display()),
+            TodoStatus::InProgress => format!("{accent}\x1b[1m◐ {}\x1b[0m", t.display()),
+            TodoStatus::Pending => format!("☐ {}", t.display()),
+        })
+        .collect()
+}
+
+/// Extra lines shown under a tool call's header, as ANSI-styled strings (the
+/// caller indents them): the live checklist for `todo_write` and the proposed
+/// plan for `exit_plan_mode`. Empty for every other tool.
+pub fn tool_body_lines(name: &str, input: &serde_json::Value, theme: &Theme) -> Vec<String> {
+    match name {
+        "todo_write" => input
+            .get("todos")
+            .and_then(|v| io_runtime::tools::todo::parse_todos(v).ok())
+            .map(|todos| todo_lines(&todos, theme))
+            .unwrap_or_default(),
+        "exit_plan_mode" => {
+            let plan = input.get("plan").and_then(|v| v.as_str()).unwrap_or("");
+            let mut lines = vec![String::new()];
+            lines.extend(render_markdown_lines(plan, theme));
+            lines.push(String::new());
+            lines
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub fn render_tool_start(name: &str, input: &serde_json::Value, theme: &Theme) {
     use crossterm::style::Stylize;
     let label = format!(" {name} ")
@@ -791,6 +886,9 @@ pub fn render_tool_start(name: &str, input: &serde_json::Value, theme: &Theme) {
         print!("  {label}\r\n");
     } else {
         print!("  {label}  {}\r\n", detail.dark_grey());
+    }
+    for line in tool_body_lines(name, input, theme) {
+        print!("    {line}\x1b[0m\r\n");
     }
     let _ = std::io::stdout().flush();
 }
@@ -846,8 +944,8 @@ pub fn render_tool_done(name: &str, output: &str, success: bool, theme: &Theme) 
         return;
     }
     match name {
-        "write" | "edit" => render_diff(output, theme),
-        "bash" | "read" | "grep" | "glob" => render_text_output(output),
+        "write" | "edit" | "multi_edit" | "notebook_edit" => render_diff(output, theme),
+        "bash" | "read" | "grep" | "glob" | "web_search" => render_text_output(output),
         _ => {}
     }
 }
@@ -1280,8 +1378,15 @@ fn draw_splash_status_at(
         style::{Print, ResetColor, SetForegroundColor},
     };
     let sep = " · ";
+    let badge = status_badge();
+    // Room for the badge (and its separator) after the provider, if set.
+    let badge_cols = if badge.is_empty() {
+        0
+    } else {
+        sep.chars().count() + badge.chars().count()
+    };
     // visible chars: 2 prefix + agent + sep + model + sep + provider
-    let base = 2 + agent_name.len() + sep.len() + sep.len() + provider_id.len();
+    let base = 2 + agent_name.len() + sep.len() + sep.len() + provider_id.len() + badge_cols;
     let model_max = inner_w.saturating_sub(base);
     let mut end = model_id.len().min(model_max);
     while end > 0 && !model_id.is_char_boundary(end) {
@@ -1311,12 +1416,23 @@ fn draw_splash_status_at(
         Print(sep),
         Print(provider_id),
         ResetColor,
-    )
+    )?;
+    if !badge.is_empty() {
+        execute!(
+            out,
+            SetForegroundColor(theme.muted),
+            Print(sep),
+            SetForegroundColor(theme.accent),
+            Print(&badge),
+            ResetColor,
+        )?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::splash_box_width;
+    use super::{get_theme, preview, splash_box_width, tool_body_lines, tool_detail};
 
     #[test]
     fn short_input_stays_at_default_width() {
@@ -1342,5 +1458,73 @@ mod tests {
     fn narrow_terminal_never_shrinks_below_default() {
         // term_w so small that term_w - 6 would undercut the default.
         assert_eq!(splash_box_width(&"x".repeat(500), 40), 52);
+    }
+
+    #[test]
+    fn tool_detail_summarizes_the_new_tools() {
+        let md = serde_json::json!({"path": "src/a.rs", "edits": [{}, {}]});
+        assert_eq!(tool_detail("multi_edit", &md), "src/a.rs  (2 edits)");
+        let one = serde_json::json!({"path": "a.rs", "edits": [{}]});
+        assert_eq!(tool_detail("multi_edit", &one), "a.rs  (1 edit)");
+        let nb = serde_json::json!({"path": "x.ipynb", "edit_mode": "insert"});
+        assert_eq!(tool_detail("notebook_edit", &nb), "x.ipynb  (insert)");
+        assert_eq!(
+            tool_detail("web_search", &serde_json::json!({"query": "rust 2026"})),
+            "rust 2026"
+        );
+        assert_eq!(
+            tool_detail("todo_write", &serde_json::json!({"todos": [{}, {}, {}]})),
+            "3 items"
+        );
+        let fetch = serde_json::json!({"url": "https://x.dev", "prompt": "list the\nchanges"});
+        assert_eq!(
+            tool_detail("fetch", &fetch),
+            "https://x.dev  ⟶ list the changes"
+        );
+        assert_eq!(
+            tool_detail("fetch", &serde_json::json!({"url": "https://x.dev"})),
+            "https://x.dev"
+        );
+    }
+
+    #[test]
+    fn preview_collapses_whitespace_and_cuts_at_a_char_boundary() {
+        assert_eq!(preview("a  b\n c", 10), "a b c");
+        assert_eq!(preview("héllo wörld", 5), "héllo…");
+    }
+
+    #[test]
+    fn todo_checklist_marks_each_status_and_uses_the_active_form() {
+        let theme = get_theme("default");
+        let input = serde_json::json!({"todos": [
+            {"content": "Write code", "status": "completed"},
+            {"content": "Run tests", "status": "in_progress", "activeForm": "Running tests"},
+            {"content": "Ship it", "status": "pending"}
+        ]});
+        let lines = tool_body_lines("todo_write", &input, &theme);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("☒ Write code"));
+        assert!(
+            lines[0].contains("\x1b[9m"),
+            "completed items are struck through"
+        );
+        assert!(lines[1].contains("◐ Running tests"));
+        assert!(lines[2].contains("☐ Ship it"));
+        // Invalid input just renders nothing.
+        assert!(tool_body_lines("todo_write", &serde_json::json!({}), &theme).is_empty());
+    }
+
+    #[test]
+    fn plan_body_renders_the_markdown_plan() {
+        let theme = get_theme("default");
+        let lines = tool_body_lines(
+            "exit_plan_mode",
+            &serde_json::json!({"plan": "1. Add the thing\n2. Test it"}),
+            &theme,
+        );
+        let joined = lines.join("\n");
+        assert!(joined.contains("Add the thing"));
+        assert!(joined.contains("Test it"));
+        assert!(tool_body_lines("read", &serde_json::json!({}), &theme).is_empty());
     }
 }

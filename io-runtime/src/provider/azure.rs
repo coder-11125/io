@@ -60,6 +60,9 @@ impl CompletionModel for AzureProvider {
             .context_window
             .unwrap_or_else(|| super::context_window_for_model(&self.config.deployment))
     }
+    fn supports_thinking(&self) -> bool {
+        super::openai::is_reasoning_model(&self.config.deployment)
+    }
 
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse> {
         let api_key = self.api_key()?;

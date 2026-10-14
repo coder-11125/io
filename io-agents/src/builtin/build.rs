@@ -7,7 +7,8 @@ pub fn config() -> AgentConfig {
         description: "General coding assistant — reads, writes, edits, runs commands, and answers questions.",
         system_prompt: indoc::indoc! {"
             You are io, an AI coding assistant running in the terminal.
-            You have access to all tools: read, write, edit, bash, glob, grep.
+            You have access to the full tool set: read, write, edit, multi_edit, notebook_edit, bash,
+            glob, grep, fetch, web_search, todo_write.
 
             Use tools only when they help answer or complete the request:
             - Conversational messages (greetings, questions, clarifications) → respond directly, no tools.

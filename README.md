@@ -20,7 +20,13 @@
 ## Features
 
 - **Multi-provider** — 13 LLM providers supported (Anthropic, OpenAI, Gemini, Groq, DeepSeek, Mistral, Ollama, Azure, Bedrock, OpenRouter, xAI, OpenCode Go, OpenCode Zen)
-- **8 built-in tools** — `read`, `write`, `edit`, `bash`, `glob`, `grep`, `fetch`, `spawn_agent` for full codebase interaction
+- **13 built-in tools** — `read`, `write`, `edit`, `multi_edit`, `notebook_edit`, `bash`, `glob`, `grep`, `fetch`, `web_search`, `todo_write`, `exit_plan_mode`, `spawn_agent` for full codebase interaction
+- **Task list** — the model plans multi-step work with `todo_write`; the checklist renders live in the scrollback
+- **Plan mode** — Shift+Tab cycles *default → accept edits → plan*. Plan mode is read-only; the model researches, then proposes a plan with `exit_plan_mode` for you to approve
+- **Safe editing** — files must be read before they are edited, and edits are refused if the file changed on disk since the read (by you, a formatter, another process)
+- **Images & PDFs** — `read` shows images to vision models and extracts PDF text; attach images with `@shot.png`, drag-and-drop, or Ctrl+V from the clipboard
+- **Web search** — `web_search` (DuckDuckGo out of the box; Brave or Tavily with an API key) with domain allow/block lists; `fetch` turns HTML into readable text and can answer a `prompt` about a page
+- **Extended thinking** — `/think`, Alt+T or `[thinking]` config, plus `think` / `think hard` / `ultrathink` keywords, on Anthropic, Bedrock, Gemini and OpenAI reasoning models
 - **Cost tracking** — Built-in API cost calculation with `/cost` command for supported providers
 - **Interactive & single-shot modes** — Full-screen REPL with splash screen, prompt bar, and scrollback
 - **Color themes** — 12 built-in themes (dark/light) with live `/theme` switcher
@@ -145,11 +151,40 @@ Launches an interactive session with a streaming agent loop. Commands:
 | `/cost` | Show API cost summary for the current session |
 | `/compact` | Summarize and compress conversation history |
 | `/rewind` (or press Esc twice) | Restore files to an earlier point in the chat |
+| `/plan` | Enter or leave plan mode |
+| `/think [on\|off\|low\|medium\|high\|<tokens>]` | Toggle extended thinking, or set its token budget |
 | `/exit`, `/quit`, `/q` | Exit the session |
 | `!<cmd>` | Run a shell command directly |
 
-Tab key at the empty prompt cycles through available full agents.
-Type `@path/to/file` to expand file or directory contents inline.
+| Key | Action |
+|---|---|
+| Tab (empty prompt) | Cycle through the full agents |
+| Shift+Tab | Cycle the working mode: default → accept edits → plan |
+| Alt+T | Toggle extended thinking |
+| Ctrl+V | Attach an image from the clipboard (needs `pngpaste`, `wl-paste` or `xclip`) |
+| Esc Esc | Open `/rewind` |
+
+Type `@path/to/file` to expand file or directory contents inline; image files
+(`@shot.png`, or `@"path with spaces.png"`) are attached to the message
+instead. Dragging an image file into the terminal does the same.
+
+**Working modes.** The mode shows in the status row. *Accept edits* approves
+file changes (`write`, `edit`, `multi_edit`, `notebook_edit`) without asking —
+the sensitive-path and project-root guards still apply. *Plan mode* is
+read-only: file changes and anything but provably read-only shell commands are
+refused, whatever `permissions.default` says. When the plan is ready the model
+calls `exit_plan_mode` and you choose between *approve and accept edits*,
+*approve and keep the edit prompts*, or *keep planning*.
+
+**Extended thinking.** `/think` (or Alt+T, or `thinking.enabled = true`) makes
+the model reason before answering, with a token budget (`/think 12000`,
+`thinking.budget_tokens`). Independently, a keyword raises thinking for one
+turn: `think` (4K tokens, only as an instruction such as "think about…"),
+`think hard` / `megathink` (10K), `ultrathink` (32K). Turn the keywords off with
+`thinking.keywords = false`. Anthropic and Bedrock use the `thinking` parameter,
+Gemini 2.5+ `thinkingConfig`, and OpenAI o-series / GPT-5 `reasoning_effort`
+(low / medium / high by budget); other providers ignore it. Reasoning is shown
+as a dimmed `(thought)` block.
 
 The TUI features a splash screen with centered logo and command reference,
 a fixed prompt bar at the bottom showing agent/model/provider and context usage,
@@ -216,8 +251,21 @@ default = "agent"       # "allow" | "agent" | "prompt" | "deny"
 allowed_commands = []
 denied_commands = ["rm", "sudo"]
 
+[thinking]
+enabled = false         # reason before answering on every turn (/think, Alt+T)
+budget_tokens = 8000    # token budget for that reasoning
+keywords = true         # "think" / "think hard" / "ultrathink" raise it for one turn
+
 # Optional: theme = "ocean"  (default, ocean, rose, forest, sunset, mono, breeze, ink, dawn, sand, mint, dusk)
 ```
+
+### Web search backend
+
+`web_search` needs no setup (it uses DuckDuckGo's keyless HTML endpoint, which
+may rate-limit). For a dependable backend export `BRAVE_API_KEY` (Brave Search)
+or `TAVILY_API_KEY` (Tavily); `IO_SEARCH_BACKEND=duckduckgo|brave|tavily`
+forces one. Like `fetch`, it prompts unless `permissions.allow_network_fetch`
+is on in agent mode.
 
 ### API Keys
 
@@ -297,6 +345,8 @@ io/
 │       ├── tui.rs               # REPL orchestration: agent construction, slash command dispatch
 │       ├── input.rs             # Readline loops (REPL + splash), popup helpers, @file resolution
 │       ├── stream.rs            # Streaming event processing: ThinkParser, blink_and_print
+│       ├── status.rs            # Working mode + thinking state, status-row badge, /think
+│       ├── clipboard.rs         # Clipboard image paste (Ctrl+V) and dropped image paths
 │       ├── cost.rs              # /cost report
 │       ├── config_cmd.rs        # `io config …` and `io init` handlers
 │       ├── agent.rs             # Agent switching (/agent command)
@@ -315,7 +365,7 @@ io/
 ├── io-runtime/                  # Core engine (library crate)
 │   ├── Cargo.toml
 │   ├── tests/
-│   │   └── agent_loop.rs        # 13 integration tests against a scripted mock provider
+│   │   └── agent_loop.rs        # 44 integration tests against a scripted mock provider
 │   └── src/
 │       ├── lib.rs               # Crate root — re-exports public API + load_project_context()
 │       ├── agent.rs             # Agent loop: LLM completion + tool execution (sync & streaming)
@@ -324,18 +374,26 @@ io/
 │       ├── config.rs            # Config/schema (TOML), KeyStore, provider config structs
 │       ├── types.rs             # Core data types — Session, Turn, ToolCallRecord, TurnUsage
 │       ├── memory.rs            # SQLite-backed session persistence (CRUD)
-│       ├── sandbox.rs           # Permission checker (allow/deny/prompt modes)
+│       ├── sandbox.rs           # Permission checker (allow/deny/prompt modes) + working modes (plan/accept edits)
+│       ├── thinking.rs          # Extended thinking: per-turn budget, keywords, /think parsing
 │       ├── command_safety.rs    # Semantic command classifier (Safe/Caution/Destructive)
 │       ├── pricing.rs           # Per-token cost calculation for supported providers
-│       ├── tools/               # Built-in tools (8 tools, each with unit tests)
+│       ├── tools/               # Built-in tools (each with unit tests)
 │       │   ├── mod.rs           # Tool trait, ToolRegistry, default_registry()
-│       │   ├── read.rs          # Read files with offset/limit
+│       │   ├── file_state.rs    # FileTracker: read-before-edit + external-change detection
+│       │   ├── read.rs          # Read text (offset/limit), images, PDFs, notebooks
 │       │   ├── write.rs         # Write/create files, returns unified diff
-│       │   ├── edit.rs          # Replace first occurrence of text, returns unified diff
+│       │   ├── edit.rs          # Replace text (first or all occurrences), returns unified diff
+│       │   ├── multi_edit.rs    # Several edits to one file, all-or-nothing
+│       │   ├── notebook.rs      # .ipynb rendering + notebook_edit (replace/insert/delete cells)
 │       │   ├── bash.rs          # Execute shell commands with timeout & workdir
 │       │   ├── glob.rs          # Find files by glob pattern (sorted by mtime)
 │       │   ├── grep.rs          # Search file contents with regex
-│       │   ├── fetch.rs         # HTTP(S) GET, blocks localhost/private/link-local hosts
+│       │   ├── fetch.rs         # HTTP(S) GET → readable text, optional extraction prompt
+│       │   ├── html.rs          # HTML → text converter used by fetch and web_search
+│       │   ├── web_search.rs    # Web search (DuckDuckGo / Brave / Tavily) with domain filters
+│       │   ├── todo.rs          # todo_write — the model's task list
+│       │   ├── plan.rs          # exit_plan_mode — present a plan for approval
 │       │   └── spawn.rs         # spawn_agent — delegate to a restricted sub-agent
 │       │
 │       └── provider/            # LLM provider implementations
@@ -396,13 +454,19 @@ Agent.run_turn() / run_turn_streaming()
 
 | Tool | Description |
 |---|---|
-| **`read`** | Read files with optional `offset` (line number) and `limit` for partial reading |
-| **`write`** | Write or create a file. Returns a unified diff of what changed |
-| **`edit`** | Replace the first occurrence of `old_string` with `new_string` in a file. Returns a unified diff |
+| **`read`** | Read a file with optional `offset` (line number) and `limit`. Images (PNG/JPEG/GIF/WebP) are shown to the model; PDFs return page-tagged text (`pages` picks a range); `.ipynb` notebooks return cell by cell with outputs |
+| **`write`** | Write or create a file. Existing files must have been read first. Returns a unified diff |
+| **`edit`** | Replace the first (or, with `replace_all`, every) occurrence of `old_string` with `new_string`. The file must have been read and unchanged since. Returns a unified diff |
+| **`multi_edit`** | Apply several edits to one file in order, all-or-nothing, in one write |
+| **`notebook_edit`** | Replace, insert or delete a Jupyter notebook cell by id or index |
 | **`bash`** | Execute shell commands with configurable `timeout` (ms) and `workdir` |
 | **`glob`** | Find files by glob pattern, sorted by modification time (newest first) |
 | **`grep`** | Search file contents with regex, optional file type filtering via `include` glob |
-| **`fetch`** | Fetch a URL via HTTP(S) GET, returning the response body as text (truncated past 100 KB). Blocks localhost/private/link-local hosts |
+| **`fetch`** | Fetch a URL via HTTP(S) GET. HTML becomes readable text; pass `prompt` to get just the answer to a question about the page. Truncated past 100 KB. Blocks localhost/private/link-local hosts |
+| **`web_search`** | Search the web; `allowed_domains` / `blocked_domains` filter results |
+| **`todo_write`** | Create and update the task list shown live in the TUI |
+| **`exit_plan_mode`** | Present a plan for approval while plan mode is active |
+| **`spawn_agent`** | Delegate a scoped task to a restricted sub-agent |
 
 All tools implement the `Tool` trait with a JSON input schema exposed to the LLM, allowing autonomous discovery and use of parameters.
 
@@ -416,7 +480,7 @@ cargo build
 cargo run -- "your prompt"
 cargo run --
 
-# Run tests (212 unit tests + 13 integration tests)
+# Run tests (379 unit tests + 44 integration tests)
 cargo test
 
 # Add a new provider
@@ -429,7 +493,7 @@ cargo test
 ### Adding a New Tool
 
 1. Create `io-runtime/src/tools/<name>.rs` implementing the `Tool` trait
-2. Register it in `tools/mod.rs` (add module + register in `default_registry()`)
+2. Add it to `tool_by_name()` and `BUILTIN_TOOLS` in `tools/mod.rs`
 3. The LLM will discover it automatically via tool specs
 
 ## License

@@ -2,10 +2,15 @@
 //! streaming/cancellation/permission dance, and slash command dispatch.
 
 use crate::cost::show_cost_summary;
-use crate::input::{clear_rows_above, resolve_at_mentions, splash_read_line, tui_read_line};
-use crate::stream::{blink_and_print, push_line, LineBuf, PendingPermission, SCROLL_STEP};
-use crate::{agent, connect, login, model};
+use crate::input::{
+    clear_rows_above, resolve_at_mentions_with_images, splash_read_line, tui_read_line,
+};
+use crate::stream::{
+    blink_and_print, push_line, LineBuf, PendingPerm, PendingPermission, SCROLL_STEP,
+};
+use crate::{agent, connect, login, model, status};
 use io_runtime::types::SessionId;
+use io_runtime::PermissionReply;
 use io_tui::picker;
 use io_tui::render::{
     clear_prompt_input, draw_prompt_bar, enter_tui, exit_tui, prepare_streaming,
@@ -123,9 +128,10 @@ async fn build_agent(
     // run in the project root.
     let hooks = io_runtime::Hooks::new(config.hooks.clone(), project_root.clone());
     let mut checker = io_runtime::sandbox::PermissionChecker::from(&config.permissions)
-        .with_project_root(project_root);
+        .with_project_root(project_root)
+        .with_interaction_mode(status::current_mode());
     if agent_config.auto_allow_writes {
-        checker = checker.with_allowed_tools(&["write", "edit"]);
+        checker = checker.with_allowed_tools(io_runtime::sandbox::FILE_WRITE_TOOLS);
     }
     let permissions = std::sync::Arc::new(checker);
 
@@ -139,6 +145,11 @@ async fn build_agent(
     };
 
     let mut tools = io_runtime::tools::default_registry();
+    // `fetch` answers a `prompt` about a page by running a one-shot
+    // completion with the session's own model.
+    tools.register(Box::new(
+        io_runtime::tools::FetchTool::new().with_extractor(provider.clone()),
+    ));
     let spawn_tool = io_runtime::SpawnAgentTool::new(
         provider.clone(),
         model_id.clone(),
@@ -149,12 +160,14 @@ async fn build_agent(
     .with_hooks(&hooks);
     tools.register(Box::new(spawn_tool));
 
+    status::update_badge(status::current_mode(), &config.thinking);
+
     Ok(io_runtime::Agent::new(
         provider,
         tools,
         memory,
         permissions,
-        agent_config.system_prompt.clone(),
+        agent_config.full_system_prompt(),
         project_context,
         session_id,
         model_id,
@@ -162,7 +175,97 @@ async fn build_agent(
         config.session.auto_compact,
         pricing_override,
     )
-    .with_hooks(hooks))
+    .with_hooks(hooks)
+    .with_thinking(config.thinking.clone()))
+}
+
+// ── Permission dialogs ─────────────────────────────────────────────────────────
+
+/// One option in a permission dialog: its label and hint, the reply it
+/// stands for, and what to echo after it is chosen.
+struct Choice {
+    label: &'static str,
+    hint: &'static str,
+    reply: PermissionReply,
+    echo: &'static str,
+}
+
+struct PermissionDialog {
+    title: String,
+    choices: Vec<Choice>,
+    /// The option preselected when the dialog opens (always the safe one).
+    initial: usize,
+}
+
+fn permission_dialog(pending: &PendingPerm) -> PermissionDialog {
+    if pending.name == "exit_plan_mode" {
+        // The plan itself was printed above when the call started.
+        return PermissionDialog {
+            title: "Ready to leave plan mode and start on this plan?".to_string(),
+            choices: vec![
+                Choice {
+                    label: "Yes, and accept edits",
+                    hint: "approve the plan; file edits run without asking",
+                    reply: PermissionReply::AllowSession,
+                    echo: "plan approved — accepting edits",
+                },
+                Choice {
+                    label: "Yes, and approve edits manually",
+                    hint: "approve the plan; keep the usual edit prompts",
+                    reply: PermissionReply::AllowOnce,
+                    echo: "plan approved",
+                },
+                Choice {
+                    label: "No, keep planning",
+                    hint: "stay in plan mode and revise",
+                    reply: PermissionReply::Deny,
+                    echo: "plan not approved — still planning",
+                },
+            ],
+            initial: 2,
+        };
+    }
+    let title = if pending.detail.is_empty() {
+        format!("allow \"{}\"?", pending.name)
+    } else {
+        format!("allow \"{}\" ({})?", pending.name, pending.detail)
+    };
+    PermissionDialog {
+        title,
+        choices: vec![
+            Choice {
+                label: "Yes, once",
+                hint: "allow this one call",
+                reply: PermissionReply::AllowOnce,
+                echo: "yes",
+            },
+            Choice {
+                label: "Always",
+                hint: "allow for the rest of the session",
+                reply: PermissionReply::AllowSession,
+                echo: "always",
+            },
+            Choice {
+                label: "No",
+                hint: "deny",
+                reply: PermissionReply::Deny,
+                echo: "no",
+            },
+        ],
+        // Default to "No" (deny) — the safe choice.
+        initial: 2,
+    }
+}
+
+/// Show `dialog` and return the reply plus what to echo. Esc, `q`, Ctrl+C or
+/// a picker failure all count as the last option, which is always a denial.
+fn ask_permission(dialog: &PermissionDialog) -> (PermissionReply, &'static str) {
+    let items: Vec<(&str, &str)> = dialog.choices.iter().map(|c| (c.label, c.hint)).collect();
+    let chosen = picker::pick_permission(&dialog.title, &items, dialog.initial)
+        .ok()
+        .and_then(|i| dialog.choices.get(i))
+        .unwrap_or_else(|| dialog.choices.last().expect("dialogs have options"));
+    (chosen.reply, chosen.echo)
 }
 
 // ── Single-shot ────────────────────────────────────────────────────────────────
@@ -202,7 +305,8 @@ pub async fn run_single_shot(prompt: &str, model_override: Option<&str>) -> anyh
     let build_config = io_agents::builtin::by_id("build").expect("build agent must exist");
     let agent = build_agent(SessionChoice::New, &build_config, model_override).await?;
     agent.set_prompt_fn(std::sync::Arc::new(prompt_on_stdin));
-    let response = agent.run_turn(&resolve_at_mentions(prompt)).await?;
+    let (prompt, images) = resolve_at_mentions_with_images(prompt);
+    let response = agent.run_turn_with_images(&prompt, images).await?;
     println!("{response}");
     Ok(())
 }
@@ -357,7 +461,11 @@ pub async fn run_interactive(
                     "  /context       Fetch real context window, pricing, and tool support",
                     "  /compact       Summarize and compress conversation history",
                     "  /rewind        Restore files to an earlier point in the chat (or Esc Esc)",
+                    "  /plan          Enter or leave plan mode (read-only research, then approve a plan)",
+                    "  /think [x]     Extended thinking: on|off|low|medium|high|<tokens> (or Alt+T)",
                     "  !<cmd>         Run a shell command",
+                    "  Shift+Tab      Cycle mode: default → accept edits → plan",
+                    "  Ctrl+V         Attach an image from the clipboard (or @image.png)",
                 ];
                 let (_, h) = crossterm::terminal::size()?;
                 let start_row = h.saturating_sub(PROMPT_BAR_HEIGHT + 1 + help_lines.len() as u16);
@@ -863,6 +971,52 @@ pub async fn run_interactive(
                 }
                 continue;
             }
+            "/plan" => {
+                let target = if agent.interaction_mode() == io_runtime::InteractionMode::Plan {
+                    io_runtime::InteractionMode::Default
+                } else {
+                    io_runtime::InteractionMode::Plan
+                };
+                status::set_mode(&agent, target);
+                let msg = match target {
+                    io_runtime::InteractionMode::Plan => {
+                        "Plan mode on — read-only until you approve a plan (Shift+Tab to cycle)."
+                    }
+                    _ => "Plan mode off.",
+                };
+                let _ = draw_prompt_bar(
+                    msg,
+                    current_agent.name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    last_input_tokens,
+                    agent.context_window(),
+                    &theme,
+                );
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            _ if input == "/think" || input.starts_with("/think ") => {
+                let msg = match status::apply_think_command(&agent, &input["/think".len()..]) {
+                    Ok(msg) => msg,
+                    Err(e) => format!("error: {e}"),
+                };
+                let _ = draw_prompt_bar(
+                    &msg,
+                    current_agent.name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    last_input_tokens,
+                    agent.context_window(),
+                    &theme,
+                );
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
             _ if input.starts_with('!') => {
                 let cmd = input[1..].trim();
                 let output = run_bash(cmd).await;
@@ -913,7 +1067,8 @@ pub async fn run_interactive(
             _ => {}
         }
 
-        let prompt = resolve_at_mentions(&input);
+        let (prompt, images) = resolve_at_mentions_with_images(&input);
+        let image_count = images.len();
         let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         agent.set_cancel(cancel_flag.clone());
 
@@ -936,6 +1091,15 @@ pub async fn run_interactive(
             )?;
         }
         push_line(&line_buf, format!("  > {}", input));
+        if image_count > 0 {
+            let note = format!(
+                "  + {image_count} image{} attached",
+                if image_count == 1 { "" } else { "s" }
+            );
+            print!("{note}\r\n\r\n");
+            let _ = std::io::stdout().flush();
+            push_line(&line_buf, note);
+        }
         push_line(&line_buf, String::new());
 
         let print_task = tokio::spawn(blink_and_print(
@@ -955,7 +1119,6 @@ pub async fn run_interactive(
         let line_buf_scroll = line_buf.clone();
         let key_listener = tokio::task::spawn_blocking(move || {
             use crossterm::event;
-            use io_runtime::PermissionReply;
             loop {
                 if streaming_done2.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
@@ -966,32 +1129,9 @@ pub async fn run_interactive(
                 // press is required to trigger it.
                 let pending = pending_for_listener.lock().unwrap().take();
                 if let Some(pending) = pending {
-                    let title = if pending.detail.is_empty() {
-                        format!("allow \"{}\"?", pending.name)
-                    } else {
-                        format!("allow \"{}\" ({})?", pending.name, pending.detail)
-                    };
-                    // Default to "No" (deny) — the safe choice.
-                    let reply = match picker::pick_permission(
-                        &title,
-                        &[
-                            ("Yes, once", "allow this one call"),
-                            ("Always", "allow for the rest of the session"),
-                            ("No", "deny"),
-                        ],
-                        2,
-                    ) {
-                        Ok(0) => PermissionReply::AllowOnce,
-                        Ok(1) => PermissionReply::AllowSession,
-                        // No, Esc, q, Ctrl+C, or picker failure.
-                        _ => PermissionReply::Deny,
-                    };
-                    let label = match reply {
-                        PermissionReply::AllowOnce => "yes",
-                        PermissionReply::AllowSession => "always",
-                        PermissionReply::Deny => "no",
-                    };
-                    print!("  → {label}\r\n");
+                    let dialog = permission_dialog(&pending);
+                    let (reply, echo) = ask_permission(&dialog);
+                    print!("  → {echo}\r\n");
                     let _ = std::io::stdout().flush();
                     let _ = pending.respond.send(reply);
                     continue;
@@ -1040,7 +1180,7 @@ pub async fn run_interactive(
         });
 
         tokio::select! {
-            result = agent.run_turn_streaming(&prompt, token_tx) => {
+            result = agent.run_turn_streaming_with_images(&prompt, images, token_tx) => {
                 if let Err(e) = result {
                     if !e.is::<io_runtime::Cancelled>() {
                         let _ = draw_prompt_bar(
@@ -1059,6 +1199,9 @@ pub async fn run_interactive(
         }
         streaming_done.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = key_listener.await;
+
+        // Approving a plan switches modes inside the agent; follow it.
+        status::sync_from_agent(&agent);
 
         let (agent_thoughts, turn_input_tokens) = print_task.await.unwrap_or((None, 0));
         if turn_input_tokens > last_input_tokens {
@@ -1138,5 +1281,51 @@ async fn run_bash(cmd: &str) -> String {
         }
         Ok(Err(e)) => format!("error: {e}"),
         Err(_) => "command timed out".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending(name: &str, detail: &str) -> PendingPerm {
+        let (respond, _rx) = tokio::sync::oneshot::channel();
+        PendingPerm {
+            name: name.to_string(),
+            detail: detail.to_string(),
+            respond,
+        }
+    }
+
+    #[test]
+    fn ordinary_permission_dialogs_default_to_no() {
+        let d = permission_dialog(&pending("bash", "rm -r build"));
+        assert_eq!(d.title, "allow \"bash\" (rm -r build)?");
+        assert_eq!(d.choices.len(), 3);
+        assert_eq!(d.choices[d.initial].reply, PermissionReply::Deny);
+        assert_eq!(d.choices[0].reply, PermissionReply::AllowOnce);
+        assert_eq!(d.choices[1].reply, PermissionReply::AllowSession);
+        assert_eq!(
+            permission_dialog(&pending("bash", "")).title,
+            "allow \"bash\"?"
+        );
+    }
+
+    #[test]
+    fn the_plan_dialog_maps_onto_the_replies_the_agent_expects() {
+        let d = permission_dialog(&pending("exit_plan_mode", ""));
+        // "AllowSession" accepts edits, "AllowOnce" leaves edit prompts on.
+        let replies: Vec<_> = d.choices.iter().map(|c| c.reply).collect();
+        assert_eq!(
+            replies,
+            [
+                PermissionReply::AllowSession,
+                PermissionReply::AllowOnce,
+                PermissionReply::Deny
+            ]
+        );
+        // Dismissing never approves a plan.
+        assert_eq!(d.choices[d.initial].reply, PermissionReply::Deny);
+        assert_eq!(d.choices.last().unwrap().reply, PermissionReply::Deny);
     }
 }

@@ -53,9 +53,13 @@ impl CompletionModel for GeminiProvider {
             .unwrap_or_else(|| super::context_window_for_model(&self.config.model))
     }
 
+    fn supports_thinking(&self) -> bool {
+        supports_thinking(&self.config.model)
+    }
+
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse> {
         let api_key = self.api_key()?;
-        let body = build_request_body(&request);
+        let body = build_request_body(&request, &self.config.model);
         let url = self.url(
             &format!("models/{}:generateContent", self.config.model),
             &api_key,
@@ -82,7 +86,7 @@ impl CompletionModel for GeminiProvider {
         request: CompletionRequest,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<StreamEvent>>> {
         let api_key = self.api_key()?;
-        let body = build_request_body(&request);
+        let body = build_request_body(&request, &self.config.model);
         let url = self.url(
             &format!("models/{}:streamGenerateContent", self.config.model),
             &api_key,
@@ -123,12 +127,10 @@ impl CompletionModel for GeminiProvider {
                             let data = &line[6..];
                             match serde_json::from_str::<GeminiResponse>(data) {
                                 Ok(chunk) => {
-                                    if tx
-                                        .send(Ok(convert_response_to_stream_event(chunk)))
-                                        .await
-                                        .is_err()
-                                    {
-                                        return;
+                                    for event in convert_response_to_stream_events(chunk) {
+                                        if tx.send(Ok(event)).await.is_err() {
+                                            return;
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -158,7 +160,13 @@ impl CompletionModel for GeminiProvider {
     }
 }
 
-fn build_request_body(request: &CompletionRequest) -> serde_json::Value {
+/// Gemini models with controllable thinking (2.5 and later).
+fn supports_thinking(model: &str) -> bool {
+    let m = model.to_lowercase();
+    m.contains("gemini-2.5") || m.contains("gemini-3")
+}
+
+fn build_request_body(request: &CompletionRequest, model: &str) -> serde_json::Value {
     let contents = build_contents(request);
     let mut body = serde_json::json!({ "contents": contents });
 
@@ -188,6 +196,15 @@ fn build_request_body(request: &CompletionRequest) -> serde_json::Value {
     if let Some(temp) = request.temperature {
         gen_config.insert("temperature".to_string(), serde_json::json!(temp));
     }
+    if let (Some(thinking), true) = (request.thinking, supports_thinking(model)) {
+        gen_config.insert(
+            "thinkingConfig".to_string(),
+            serde_json::json!({
+                "thinkingBudget": thinking.budget_tokens.clamp(128, 24_576),
+                "includeThoughts": true,
+            }),
+        );
+    }
     if !gen_config.is_empty() {
         body["generationConfig"] = serde_json::Value::Object(gen_config);
     }
@@ -211,27 +228,36 @@ fn build_contents(request: &CompletionRequest) -> Vec<serde_json::Value> {
         let parts: Vec<serde_json::Value> = msg
             .content
             .iter()
-            .map(|block| match block {
-                ContentBlock::Text { text } => serde_json::json!({ "text": text }),
-                ContentBlock::ToolUse { name, input, .. } => serde_json::json!({
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(serde_json::json!({ "text": text })),
+                ContentBlock::ToolUse { name, input, .. } => Some(serde_json::json!({
                     "functionCall": { "name": name, "args": input }
-                }),
+                })),
                 ContentBlock::ToolResult {
                     tool_use_id,
                     content,
                     ..
                 } => {
                     let fn_name = tool_use_id.strip_prefix("tool_").unwrap_or(tool_use_id);
-                    serde_json::json!({
+                    Some(serde_json::json!({
                         "functionResponse": {
                             "name": fn_name,
                             "response": { "output": content }
                         }
-                    })
+                    }))
                 }
+                ContentBlock::Image { media_type, data } => Some(serde_json::json!({
+                    "inlineData": { "mimeType": media_type, "data": data }
+                })),
+                // Gemini thoughts are display-only and never sent back.
+                ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
             })
             .collect();
 
+        // A message that was only thoughts has nothing left to send.
+        if parts.is_empty() {
+            continue;
+        }
         contents.push(serde_json::json!({ "role": role, "parts": parts }));
     }
 
@@ -260,6 +286,9 @@ struct GeminiContent {
 #[derive(serde::Deserialize)]
 struct GeminiPart {
     text: Option<String>,
+    /// True when `text` is a thought summary rather than answer text.
+    #[serde(default)]
+    thought: Option<bool>,
     #[serde(rename = "functionCall")]
     function_call: Option<GeminiFunctionCall>,
 }
@@ -303,7 +332,14 @@ fn convert_response(data: GeminiResponse) -> CompletionResponse {
             for part in c.parts {
                 if let Some(text) = part.text {
                     if !text.is_empty() {
-                        content.push(ContentBlock::Text { text });
+                        content.push(if part.thought == Some(true) {
+                            ContentBlock::Thinking {
+                                thinking: text,
+                                signature: None,
+                            }
+                        } else {
+                            ContentBlock::Text { text }
+                        });
                     }
                 }
                 if let Some(fc) = part.function_call {
@@ -326,15 +362,17 @@ fn convert_response(data: GeminiResponse) -> CompletionResponse {
     }
 }
 
-fn convert_response_to_stream_event(data: GeminiResponse) -> StreamEvent {
-    let mut delta = None;
-    let mut content_block = None;
+/// One streamed chunk as agent events: thought summaries first (display
+/// only), then the answer text, then each tool call as its own event, and
+/// finally a bare event carrying the stop reason and usage. A chunk can hold
+/// several text parts or parallel function calls, so none may overwrite
+/// another.
+fn convert_response_to_stream_events(data: GeminiResponse) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
+    let mut text = String::new();
+    let mut calls = Vec::new();
     let mut stop_reason = None;
-    let mut usage = None;
-
-    if let Some(ref u) = data.usage_metadata {
-        usage = Some(Usage::from(u));
-    }
+    let usage = data.usage_metadata.as_ref().map(Usage::from);
 
     for candidate in data.candidates.unwrap_or_default() {
         if let Some(reason) = candidate.finish_reason {
@@ -344,13 +382,17 @@ fn convert_response_to_stream_event(data: GeminiResponse) -> StreamEvent {
         }
         if let Some(c) = candidate.content {
             for part in c.parts {
-                if let Some(text) = part.text {
-                    if !text.is_empty() {
-                        delta = Some(text);
+                if let Some(t) = part.text {
+                    if t.is_empty() {
+                        // nothing to show
+                    } else if part.thought == Some(true) {
+                        events.push(StreamEvent::thinking_delta(t));
+                    } else {
+                        text.push_str(&t);
                     }
                 }
                 if let Some(fc) = part.function_call {
-                    content_block = Some(ContentBlock::ToolUse {
+                    calls.push(ContentBlock::ToolUse {
                         id: format!("tool_{}", fc.name),
                         name: fc.name,
                         input: fc.args,
@@ -360,12 +402,29 @@ fn convert_response_to_stream_event(data: GeminiResponse) -> StreamEvent {
         }
     }
 
-    StreamEvent {
-        delta,
-        content_block,
+    if !text.is_empty() {
+        events.push(StreamEvent {
+            delta: Some(text),
+            content_block: None,
+            stop_reason: None,
+            usage: None,
+        });
+    }
+    for call in calls {
+        events.push(StreamEvent {
+            delta: None,
+            content_block: Some(call),
+            stop_reason: None,
+            usage: None,
+        });
+    }
+    events.push(StreamEvent {
+        delta: None,
+        content_block: None,
         stop_reason,
         usage,
-    }
+    });
+    events
 }
 
 #[cfg(test)]
@@ -407,7 +466,11 @@ mod tests {
                 "cachedContentTokenCount":500}}"#,
         )
         .unwrap();
-        let u = convert_response_to_stream_event(chunk).usage.unwrap();
+        let u = convert_response_to_stream_events(chunk)
+            .pop()
+            .unwrap()
+            .usage
+            .unwrap();
         assert_eq!((u.input_tokens, u.cache_read_tokens), (100, 500));
     }
 
@@ -430,18 +493,113 @@ mod tests {
                     }],
                 },
             ],
-            tools: vec![],
-            system_prompt: None,
-            max_tokens: None,
-            temperature: None,
-            stream: false,
+            ..Default::default()
         };
-        let body = build_request_body(&request);
+        let body = build_request_body(&request, "gemini-2.5-pro");
         assert_eq!(
             body["systemInstruction"]["parts"][0]["text"],
             "You are a test agent."
         );
         // The system text is not duplicated into the conversation contents.
         assert_eq!(body["contents"].as_array().unwrap().len(), 1);
+    }
+
+    fn chunk(json: &str) -> GeminiResponse {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn thinking_config_is_sent_only_for_models_that_support_it() {
+        let request = CompletionRequest {
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            }],
+            thinking: Some(crate::provider::ThinkingRequest {
+                budget_tokens: 10_000,
+            }),
+            ..Default::default()
+        };
+        let body = build_request_body(&request, "gemini-2.5-flash");
+        let cfg = &body["generationConfig"]["thinkingConfig"];
+        assert_eq!(cfg["thinkingBudget"], 10_000);
+        assert_eq!(cfg["includeThoughts"], true);
+
+        let body = build_request_body(&request, "gemini-1.5-pro");
+        assert!(body.get("generationConfig").is_none());
+
+        let off = CompletionRequest {
+            thinking: None,
+            ..request
+        };
+        assert!(build_request_body(&off, "gemini-2.5-pro")
+            .get("generationConfig")
+            .is_none());
+    }
+
+    #[test]
+    fn thought_parts_stream_as_thinking_and_text_parts_concatenate() {
+        let events = convert_response_to_stream_events(chunk(
+            r#"{"candidates":[{"content":{"parts":[
+                {"text":"weighing options","thought":true},
+                {"text":"Hello "},{"text":"world"},
+                {"functionCall":{"name":"read","args":{"a":1}}},
+                {"functionCall":{"name":"glob","args":{"b":2}}}
+            ]},"finishReason":"STOP"}]}"#,
+        ));
+        assert!(matches!(
+            &events[0].content_block,
+            Some(ContentBlock::Thinking { thinking, signature: None }) if thinking == "weighing options"
+        ));
+        assert_eq!(events[1].delta.as_deref(), Some("Hello world"));
+        // Parallel calls each survive.
+        assert!(
+            matches!(&events[2].content_block, Some(ContentBlock::ToolUse { name, .. }) if name == "read")
+        );
+        assert!(
+            matches!(&events[3].content_block, Some(ContentBlock::ToolUse { name, .. }) if name == "glob")
+        );
+        assert_eq!(events.last().unwrap().stop_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn blocking_response_separates_thoughts_from_answer_text() {
+        let resp = convert_response(chunk(
+            r#"{"candidates":[{"content":{"parts":[
+                {"text":"hmm","thought":true},{"text":"answer"}]}}]}"#,
+        ));
+        assert!(matches!(&resp.content[0], ContentBlock::Thinking { .. }));
+        assert!(matches!(&resp.content[1], ContentBlock::Text { text } if text == "answer"));
+    }
+
+    #[test]
+    fn images_become_inline_data_and_thinking_is_never_replayed() {
+        let request = CompletionRequest {
+            messages: vec![
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Thinking {
+                        thinking: "x".into(),
+                        signature: Some("s".into()),
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Image {
+                        media_type: "image/png".into(),
+                        data: "QUJD".into(),
+                    }],
+                },
+            ],
+            ..Default::default()
+        };
+        let contents = build_contents(&request);
+        // The thinking-only assistant message is dropped entirely.
+        assert_eq!(contents.len(), 1);
+        assert_eq!(
+            contents[0]["parts"][0]["inlineData"]["mimeType"],
+            "image/png"
+        );
+        assert_eq!(contents[0]["parts"][0]["inlineData"]["data"], "QUJD");
     }
 }

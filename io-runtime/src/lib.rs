@@ -9,6 +9,7 @@ pub mod pricing;
 pub mod provider;
 pub mod rewind;
 pub mod sandbox;
+pub mod thinking;
 pub mod tools;
 pub mod types;
 
@@ -20,6 +21,7 @@ pub use pricing::{
     ModelPricing, ProviderPricingCategory,
 };
 pub use rewind::RewindResult;
+pub use sandbox::InteractionMode;
 pub use tools::SpawnAgentTool;
 pub use types::{Session, SessionId};
 

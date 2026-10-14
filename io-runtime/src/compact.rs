@@ -94,11 +94,8 @@ pub async fn run(
             role: Role::User,
             content: vec![ContentBlock::Text { text: prompt }],
         }],
-        tools: vec![],
-        system_prompt: None,
         max_tokens: Some(4096),
-        temperature: None,
-        stream: false,
+        ..Default::default()
     };
 
     let response = provider

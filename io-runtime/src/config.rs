@@ -16,6 +16,9 @@ pub struct Config {
     /// turns). Read from the global config only — see `hooks.rs`.
     #[serde(default)]
     pub hooks: crate::hooks::HooksConfig,
+    /// Extended thinking: let the model reason before it answers.
+    #[serde(default)]
+    pub thinking: ThinkingConfig,
 }
 
 fn default_theme() -> String {
@@ -696,6 +699,42 @@ fn default_permission_mode() -> String {
     "agent".to_string()
 }
 
+/// Smallest budget accepted for extended thinking (the Anthropic minimum).
+pub const MIN_THINKING_BUDGET: u32 = 1024;
+/// Token budgets for the thinking keywords and the `/think` presets.
+pub const THINK_BUDGET_BASIC: u32 = 4_000;
+pub const THINK_BUDGET_HARD: u32 = 10_000;
+pub const THINK_BUDGET_MAX: u32 = 31_999;
+
+/// Extended-thinking settings (`[thinking]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingConfig {
+    /// Think before answering on every turn.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Token budget for the reasoning when `enabled`.
+    #[serde(default = "default_thinking_budget")]
+    pub budget_tokens: u32,
+    /// Let `think` / `think hard` / `ultrathink` in a prompt switch thinking
+    /// on for that turn, even when `enabled` is false.
+    #[serde(default = "default_true")]
+    pub keywords: bool,
+}
+
+fn default_thinking_budget() -> u32 {
+    8_000
+}
+
+impl Default for ThinkingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            budget_tokens: default_thinking_budget(),
+            keywords: true,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -719,6 +758,7 @@ impl Default for Config {
             permissions: PermissionConfig::default(),
             theme: default_theme(),
             hooks: crate::hooks::HooksConfig::default(),
+            thinking: ThinkingConfig::default(),
         }
     }
 }
@@ -1157,5 +1197,38 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&keys_path);
         let _ = std::fs::remove_file(&oauth_path);
+    }
+
+    #[test]
+    fn thinking_defaults_to_off_with_keywords_on() {
+        let t = Config::default().thinking;
+        assert!(!t.enabled);
+        assert!(t.keywords);
+        assert_eq!(t.budget_tokens, 8_000);
+    }
+
+    #[test]
+    fn schema_upgrade_adds_the_thinking_table_without_touching_user_values() {
+        let path = temp_config_path("thinking");
+        let contents = "[permissions]\ndefault = \"prompt\"\n";
+        std::fs::write(&path, contents).unwrap();
+
+        let config = Config::load_with_schema_upgrade(&path, contents).unwrap();
+        assert_eq!(config.thinking, ThinkingConfig::default());
+        assert_eq!(config.permissions.default, "prompt");
+
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(rewritten.contains("[thinking]"));
+        assert!(rewritten.contains("budget_tokens = 8000"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn thinking_parses_from_a_user_config_and_partial_tables_fill_defaults() {
+        let config: Config =
+            toml::from_str("[thinking]\nenabled = true\nbudget_tokens = 12000\n").unwrap();
+        assert!(config.thinking.enabled);
+        assert_eq!(config.thinking.budget_tokens, 12_000);
+        assert!(config.thinking.keywords, "unset keys keep their defaults");
     }
 }

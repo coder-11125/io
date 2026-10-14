@@ -8,7 +8,10 @@ This document provides comprehensive guidance for AI agents and developers worki
 
 ### Key Features
 - Multi-provider support (13 providers: Anthropic, OpenAI, Gemini, Groq, Ollama, Azure, Bedrock, Mistral, DeepSeek, OpenRouter, xAI, OpenCode Go, OpenCode Zen)
-- 8 built-in tools: read, write, edit, bash, glob, grep, fetch (HTTP GET), spawn_agent (sub-agent delegation)
+- 13 built-in tools: read (text, images, PDFs, notebooks), write, edit, multi_edit, notebook_edit, bash, glob, grep, fetch (HTTP GET → readable text, optional extraction prompt), web_search, todo_write (task list), exit_plan_mode, spawn_agent (sub-agent delegation)
+- Working modes cycled with Shift+Tab: default → accept edits → plan (read-only research, then a plan to approve)
+- Edit safety: files must be read before they are modified, and edits are refused if the file changed on disk since
+- Vision input (`read` on images, `@image.png`, Ctrl+V clipboard paste) and extended thinking (`/think`, Alt+T, `think`/`ultrathink` keywords)
 - Built-in agent roles (`io-agents` crate): full agents (build, plan, debug, refactor) and restricted sub-agents (explore, review, test, security, docs, git, …)
 - Full-screen TUI and single-shot modes
 - Permission sandboxing (allow/deny/prompt modes)
@@ -32,6 +35,8 @@ io/
 │       ├── tui.rs             # REPL orchestration: agent construction, slash command dispatch
 │       ├── input.rs           # Readline loops (REPL + splash), popup helpers, @file resolution
 │       ├── stream.rs          # Streaming event processing: ThinkParser, blink_and_print
+│       ├── status.rs          # Working mode + thinking state, status-row badge, /think handling
+│       ├── clipboard.rs       # Ctrl+V clipboard image paste, dropped image paths → @mentions
 │       ├── cost.rs            # /cost report
 │       ├── config_cmd.rs      # `io config …` and `io init` handlers
 │       ├── agent.rs           # Agent switching (/agent command)
@@ -59,7 +64,8 @@ io/
 │       ├── pricing.rs         # Per-model cost tables
 │       ├── types.rs           # Core data types (Session, Turn, etc.)
 │       ├── memory.rs          # SQLite-backed session persistence
-│       ├── sandbox.rs         # Permission checking system
+│       ├── sandbox.rs         # Permission checking system + working modes (InteractionMode)
+│       ├── thinking.rs        # Extended thinking: per-turn budget, keyword tiers, /think parsing
 │       ├── command_safety.rs  # Semantic command classifier (Safe/Caution/Destructive)
 │       ├── provider/          # LLM provider implementations
 │       │   ├── mod.rs         # Provider trait, retry wrapper, OpenAI-compat table,
@@ -74,13 +80,20 @@ io/
 │       │   └── bedrock.rs     # AWS Bedrock — binary event-stream + shared AnthropicStreamState
 │       └── tools/             # Built-in tool implementations
 │           ├── mod.rs         # Tool trait and registry
-│           ├── read.rs
+│           ├── file_state.rs  # FileTracker — read-before-edit + external-change detection
+│           ├── read.rs        # text (offset/limit), images, PDFs (pdf-extract), notebooks
 │           ├── write.rs
-│           ├── edit.rs
+│           ├── edit.rs        # also home of apply_edit(), shared with multi_edit
+│           ├── multi_edit.rs  # several edits to one file, all-or-nothing
+│           ├── notebook.rs    # .ipynb render/parse/serialize + notebook_edit
 │           ├── bash.rs
 │           ├── glob.rs
 │           ├── grep.rs
-│           ├── fetch.rs       # HTTP(S) GET, blocks localhost/private/link-local hosts
+│           ├── fetch.rs       # HTTP(S) GET → readable text; optional `prompt` extraction
+│           ├── html.rs        # HTML → text converter (fetch, web_search)
+│           ├── web_search.rs  # DuckDuckGo / Brave / Tavily search with domain filters
+│           ├── todo.rs        # todo_write
+│           ├── plan.rs        # exit_plan_mode
 │           └── spawn.rs       # spawn_agent — delegate to a restricted sub-agent
 └── io-agents/                 # Built-in agent definitions (library crate)
     └── src/
@@ -100,7 +113,7 @@ io/
 
 **io-tui (TUI crate)**:
 - Terminal UI components: interactive picker, custom readline, theme picker
-- Terminal rendering: markdown, diffs, splash screen, prompt bar, scrollback
+- Terminal rendering: markdown, diffs, splash screen, prompt bar (with a status badge for the working mode / thinking), scrollback, the live todo checklist
 - Used by `io` (CLI) and available to any future binary that needs TUI
 
 **io-runtime (library crate)**:
@@ -273,6 +286,68 @@ that didn't exist yet. Only `write`/`edit` calls are tracked; `bash` has no
 file-snapshotting and is out of scope, so file changes made via `bash` are
 left as-is by a rewind.
 
+**Edit safety** (`tools/file_state.rs`): one `FileTracker` is shared by
+`read`, `write`, `edit`, `multi_edit` and `notebook_edit` in a registry (built by
+`filtered_registry`, so each sub-agent registry has its own). `read` records a
+fingerprint of the *whole* file (even for a partial read) and each successful
+write records the new content, so consecutive edits need no re-read. Modifying
+an existing file whose path was never read, or whose content no longer matches
+the fingerprint, is refused with a message telling the model to read it again;
+creating a new file needs no read. A formatter `post_tool_use` hook therefore
+makes the next edit ask for a re-read — intended. After `/rewind` restores files
+the same mechanism makes the model re-read them.
+
+**Working modes** (`sandbox::InteractionMode`, held by the shared
+`PermissionChecker`; `Agent::{interaction_mode, set_interaction_mode,
+cycle_interaction_mode}`): `Default`, `AcceptEdits`, `Plan`. The TUI keeps the
+user's mode in `io/src/status.rs` so it survives agent rebuilds (`/model`,
+`/agent`, …), and the status-row badge comes from there.
+- `Plan` is enforced first in `decide_tool` (`plan_mode_decision`), ahead of the
+  permission mode — even `permissions.default = "allow"` cannot write in plan
+  mode. File-write tools are denied; `bash` runs only if expansion-free,
+  redirection-free and classified `Safe` (or it is background-job bookkeeping);
+  `exit_plan_mode` always prompts (deny mode still denies). While plan mode is
+  on the agent appends `PLAN_MODE_PROMPT` to the system message (rebuilt on every
+  loop iteration, so it drops away the moment the plan is approved).
+- `exit_plan_mode` is resolved in `Agent::resolve_permission`: outside plan mode
+  it returns a harmless error; the user's reply decides the new mode —
+  `AllowSession` → `AcceptEdits`, `AllowOnce` → `Default`, `Deny` stays in plan
+  mode with a "revise your plan" message. It is never recorded as a session
+  approval. The TUI shows the plan (markdown, under the tool header) and a
+  three-option dialog whose order matches those replies.
+- `AcceptEdits` approves `FILE_WRITE_TOOLS` at the end of `decide_tool`, i.e.
+  after the sensitive-path and project-root guards.
+
+**Extended thinking** (`thinking.rs`, `[thinking]` config, `Agent::{thinking,
+set_thinking, with_thinking}`): per turn, `budget_for_turn` combines the
+configured setting with a keyword in the user's text — `ultrathink` (32K),
+`think hard`/`megathink`/… (10K), and a bare `think` only when it is an
+instruction (sentence start or after "please"; never "I think …"). Keywords raise
+a configured budget but never lower it, work even when thinking is off (unless
+`keywords = false`), and ignore `@file`/hook/project-context blocks. The request
+carries `CompletionRequest::thinking` and `max_tokens` is raised to
+`budget + 4096` (cap 64K). All of that happens only when the active model
+reports `CompletionModel::supports_thinking()` (Claude 3.7+/4 on Anthropic and
+Bedrock, Gemini 2.5+, OpenAI o-series/GPT-5): for any other model a keyword or
+the setting is ignored, because raising `max_tokens` past what such a model
+allows would make its API reject the request. Anthropic additionally caps
+`max_tokens` at 32K for Opus 4/4.1 (`anthropic::cap_output_tokens`). Reasoning blocks use `ContentBlock::Thinking`: an
+unsigned block is a display delta (→ `AgentEvent::Thinking`, never replayed); a
+*signed* block (Anthropic/Bedrock) is the finished block and, with
+`RedactedThinking`, is stored ahead of the text/tool calls in the assistant
+message so the next request of the tool loop carries it back verbatim (the API
+requires this). Unsigned blocks are filtered out of history in blocking mode.
+Thinking blocks are never persisted — prior turns replay as text only.
+
+**Images**: `ContentBlock::Image { media_type, data }` (base64). A tool can
+return images (`ToolOutput::with_image`, used by `read`); the agent appends them
+as `Image` blocks after the `ToolResult` blocks of the same user message
+(Anthropic requires results first; OpenAI turns them into a follow-up user
+message because `role: tool` is text-only). User attachments go through
+`Agent::run_turn_{streaming_}with_images` and lead the user message. Images are
+not persisted: the saved turn gets a note ("N image(s) were attached"). Supported
+types are sniffed by magic number (PNG/JPEG/GIF/WebP), limit 5 MB.
+
 **Hooks** (`hooks.rs`; attached with `Agent::with_hooks`, built in
 `build_agent` from `config.hooks`): user-configured shell commands run with
 `sh -c` in the project root at four points — `pre_tool_use`,
@@ -342,6 +417,22 @@ implementation notes:
   `bedrock.rs`; each `chunk` event base64-decodes to the same Anthropic SSE
   event JSON, which is then processed by the shared `AnthropicStreamState`.
 - **OpenAI / compat providers** — OpenAI SSE protocol with `stream_options.include_usage`.
+
+**Thinking and images per provider**: Anthropic/Bedrock send
+`thinking: {type: enabled, budget_tokens}` (`anthropic::thinking_param` clamps to
+`1024 <= budget < max_tokens`, and skips thinking when there is no room), stream
+`thinking_delta`/`signature_delta` through `AnthropicStreamState` (a signed block
+is emitted at `content_block_stop`; unsigned ones are dropped), and replay signed
+`thinking`/`redacted_thinking` blocks in `build_messages`. Gemini 2.5+ sends
+`generationConfig.thinkingConfig {thinkingBudget, includeThoughts}` and treats
+`thought: true` parts as display-only; its stream converter now returns a `Vec` of
+events per chunk (thoughts, concatenated text, each function call, then stop/usage)
+so parallel calls and multi-part text are no longer overwritten. OpenAI o-series /
+GPT-5 (`openai::is_reasoning_model`, also looks through `provider/` prefixes) get
+`reasoning_effort` (≤4K low, ≤12K medium, else high) and `max_completion_tokens`
+instead of `max_tokens`; DeepSeek-style `reasoning_content`/`reasoning` deltas
+stream as thinking. Other providers ignore `thinking`. Images: Anthropic/Bedrock
+`image` source blocks, OpenAI `image_url` data URLs, Gemini `inlineData`.
 
 **System prompt delivery**: the agent supplies its system prompt (plus any
 compaction summary) as a `Role::System` message with `system_prompt: None`.
@@ -416,13 +507,28 @@ pub trait Tool: Send + Sync {
 ```
 
 **Built-in Tools**:
-- `ReadTool` - Read file contents
-- `WriteTool` - Write/create files. Captures the file's pre-write content (or
+- `ReadTool` - Read file contents. Dispatches on the bytes: images (magic-number
+  sniffed; ≤ 5 MB; returned as `ToolOutput.images` plus a text line with
+  dimensions), PDFs (`pdf-extract` on the blocking pool inside `catch_unwind`;
+  page-tagged text, `pages` like `"2-5"`, first 20 pages and 100K characters by
+  default), `.ipynb` notebooks (`notebook::render`: cells with ids and text
+  outputs), otherwise line-numbered text. Binary non-image files are an error.
+- `WriteTool` - Write/create files (overwriting needs a prior read). Captures the file's pre-write content (or
   its absence, for a new file) as a `FileSnapshot` on `ToolOutput`, skipping
   files over `MAX_SNAPSHOT_BYTES` (2 MB) so `/rewind` doesn't bloat the
   session's persisted JSON blob
-- `EditTool` - String replacement in files. Captures the same pre-edit
-  `FileSnapshot` as `WriteTool`
+- `EditTool` - String replacement in files (first occurrence, or all with
+  `replace_all`). Captures the same pre-edit `FileSnapshot` as `WriteTool`
+- `MultiEditTool` - Several edits to one file, applied in order to the running
+  result and written once; any failing edit leaves the file untouched
+- `NotebookEditTool` - Replace/insert/delete a notebook cell by `cell_id` or
+  `cell_number`; serializes like Jupyter (sorted keys, 1-space indent), gives new
+  cells an id when the notebook uses them, clears outputs of replaced code cells
+- `TodoWriteTool` - Replaces the whole task list. Stateless: the TUI renders the
+  checklist from the call's input (`render::tool_body_lines`), so it also
+  shows up in scrollback
+- `ExitPlanModeTool` - Presents a plan; the approval lives in the agent loop
+  (see Working modes)
 - `BashTool` - Execute shell commands with resource limits (512 MB VM, 60 s CPU,
   200 MB file size) applied at spawn. Foreground runs support a timeout (ms)
   that kills the **whole process group** (no orphaned grandchildren) and
@@ -432,8 +538,19 @@ pub trait Tool: Send + Sync {
   running command via the process group.
 - `GlobTool` - File pattern matching
 - `GrepTool` - Search file contents
-- `FetchTool` - HTTP(S) GET-only; returns the response body as text (capped
-  at 100 KB, truncated beyond that). Blocks localhost/private/link-local
+- `WebSearchTool` - `web_search`: backend chosen from the environment
+  (`BRAVE_API_KEY` → Brave, `TAVILY_API_KEY` → Tavily, else DuckDuckGo's keyless
+  HTML endpoint; `IO_SEARCH_BACKEND` forces one). `allowed_domains` /
+  `blocked_domains` are applied to the results here (subdomains match, block
+  wins), so they behave the same on every backend. Permission-wise it follows
+  the same `allow_network_fetch` rule as `fetch`.
+- `FetchTool` - HTTP(S) GET-only; HTML is converted to readable text
+  (`html::to_text`), other text is returned as is (capped
+  at 100 KB, truncated beyond that). With a `prompt` it answers that question
+  by running one completion over the page text on an extraction model
+  (`FetchTool::with_extractor`; `build_agent` passes the session's provider,
+  the page is framed as untrusted data) and falls back to the page text if the
+  call fails or no extractor is attached. Blocks localhost/private/link-local
   hosts and cloud-metadata IPs by hostname/literal-IP string check (not full
   SSRF protection — a public hostname resolving to a private address at
   request time is not caught); the same check is re-applied to every
@@ -451,7 +568,11 @@ pub trait Tool: Send + Sync {
 2. Implement the `Tool` trait
 3. Add to `tool_by_name()` and `BUILTIN_TOOLS` in `tools/mod.rs`
    (single source of truth for both `default_registry()` and the
-   sub-agent `filtered_registry()`)
+   sub-agent `filtered_registry()`). File tools take the shared
+   `Arc<FileTracker>` there. A tool that edits files must also be added to
+   `sandbox::FILE_WRITE_TOOLS` (plan mode, accept-edits mode, sensitive-path /
+   project-root guards, per-path session approval, `/rewind`, and the
+   `written_this_turn` check all key off it) and use the `path` argument name
 4. Export in `tools/mod.rs`
 
 ### Session Management (io-runtime/src/memory.rs)
@@ -508,7 +629,11 @@ Mode is configured via `permissions.default` (a string):
 - `with_allowed_tools(&[&str]) -> Self` builder: adds tool names to the static
   allowlist so they are auto-approved without prompting (used by `build_agent`
   to pre-approve `write` and `edit` for agents with `auto_allow_writes: true`)
-- In `prompt`/`agent` modes, read-only tools (read, glob, grep) run without
+- Working modes (`InteractionMode`, Shift+Tab) sit on top of all of this: plan
+  mode restricts first and accept-edits relaxes last (see Working modes under
+  Agent System).
+- In `prompt`/`agent` modes, read-only tools (read, glob, grep, and todo_write,
+  which only edits the model's own task list) run without
   asking; bash commands are matched against
   `allowed_commands`/`denied_commands`; everything else asks the user via an
   arrow picker modal: **Yes once / Always this session / No**
@@ -606,6 +731,11 @@ auto_compact = true
 memory_enabled = true
 max_turns = 100
 
+[thinking]
+enabled = false               # reason before answering on every turn (/think, Alt+T)
+budget_tokens = 8000          # token budget for that reasoning (min 1024)
+keywords = true               # think / think hard / ultrathink raise it for one turn
+
 [permissions]
 default = "agent"   # "allow" | "agent" | "prompt" | "deny"
 allowed_commands = []
@@ -689,10 +819,17 @@ struct Cli {
 - `io config {show|set}` - Configuration management. `config set` keys:
   `provider.default`, `provider.<name>.model`, `provider.<name>.api_key_env`,
   `provider.azure.deployment`, `session.auto_compact`, `session.memory_enabled`,
-  `session.max_turns`, `session.max_tokens`, `permissions.default`, `theme`
+  `session.max_turns`, `session.max_tokens`, `permissions.default`,
+  `permissions.allow_network_fetch`, `permissions.allowed_commands`,
+  `permissions.denied_commands`, `thinking.enabled`, `thinking.budget_tokens`,
+  `thinking.keywords`, `theme`
 - `io init` - Initialize project-level config
 
-**TUI slash commands**: `/help`, `/new`, `/agent`, `/connect`, `/model`, `/theme`, `/cost`, `/compact`, `/rewind` (also triggered by pressing Esc twice within 500 ms at the idle prompt), `/exit` (also `/quit`, `/q`).
+**TUI slash commands**: `/help`, `/new`, `/agent`, `/connect`, `/model`, `/theme`, `/cost`, `/compact`, `/rewind` (also triggered by pressing Esc twice within 500 ms at the idle prompt), `/plan` (toggle plan mode), `/think [on|off|low|medium|high|<tokens>]` (persists to `[thinking]`), `/exit` (also `/quit`, `/q`).
+Key bindings: Shift+Tab cycles the working mode, Alt+T toggles extended thinking,
+Ctrl+V attaches a clipboard image (`pngpaste`, `wl-paste` or `xclip`), Tab at the
+empty prompt cycles agents. A pasted path to an image file (drag-and-drop) is
+turned into an `@path` mention.
 Switching agent, provider, or model mid-conversation keeps the current session
 (`SessionChoice::Existing` in `build_agent`) — history is preserved.
 
@@ -702,6 +839,8 @@ to the `PermissionChecker` when `agent_config.auto_allow_writes` is `true`.
 
 **@file mentions**: Typing `@path/to/file` expands the file or directory contents inline
 before sending to the LLM. Supports text files (up to 100KB) and directories (lists entries).
+`@"path with spaces"` is accepted. Image files are not inlined: `resolve_at_mentions_with_images`
+returns them separately and they are attached to the message as vision input.
 
 ### TUI Loop (io/src/tui.rs + input.rs + stream.rs)
 
@@ -816,8 +955,8 @@ Message history is built inline in `Agent::run_turn_inner`:
 
 ## Testing
 
-The project has 256 unit tests (243 in `io-runtime`, 9 in `io`, 4 in `io-tui`) plus 24
-integration tests (`io-runtime/tests/agent_loop.rs` — full agent-loop runs
+The project has 379 unit tests (345 in `io-runtime`, 25 in `io`, 8 in `io-tui`, 1 in
+`io-agents`) plus 44 integration tests (`io-runtime/tests/agent_loop.rs` — full agent-loop runs
 against a scripted mock provider, covering tool execution, permission
 prompting/denial, streaming events, usage tracking, session resumption,
 sub-agent permission inheritance, partial-progress persistence on
@@ -827,7 +966,12 @@ counting toward the compaction threshold — a rewind that restores a file and
 truncates the session, and hooks: pre-tool veto that permissions can't
 override, fail-open on a crashing hook, post-tool feedback, prompt rejection
 and context injection, stop-hook firing only on success, and sub-agents
-inheriting tool hooks). Run with `cargo test`.
+inheriting tool hooks; and for the Phase 1 features: edit-before-read
+and stale-file refusals, multi_edit rewind, todo_write, the plan-mode flow —
+edits blocked until the plan is approved, approve-once vs accept-edits, rejection,
+read-only research, exit_plan_mode outside plan mode — accept-edits mode, tool-returned
+and attached images, and extended thinking: budgets, keywords, signed-block replay).
+Run with `cargo test`.
 
 | Module | Tests |
 |---|---|
@@ -846,7 +990,16 @@ inheriting tool hooks). Run with `cargo test`.
 | `provider/gemini.rs` | system message sent as `systemInstruction`; `cachedContentTokenCount` split out of the prompt count (blocking + streaming, absent = uncached) |
 | `provider/openai.rs` | `cached_tokens` split out of `prompt_tokens` (blocking + streaming); missing/null/empty details = uncached |
 | `hooks.rs` | matcher, TOML parsing, exit-2 block (stderr reason), fail-open on other exits/timeouts, JSON stdin + env, cwd, post/prompt feedback, output cap, large-stdin no-deadlock, sub-agent hook subset |
-| `config.rs` | default config, roundtrip serialization, schema upgrade (incl. `prompt_cache` / `[hooks]`), hooks + prompt_cache parsing |
+| `config.rs` | default config, roundtrip serialization, schema upgrade (incl. `prompt_cache` / `[hooks]` / `[thinking]`), hooks + prompt_cache + thinking parsing |
+| `tools/file_state.rs` | unread / unchanged / stale / re-recorded / forgotten paths |
+| `tools/{edit,write,multi_edit,notebook}.rs` | read-before-edit and stale-file refusals, `replace_all`, all-or-nothing multi-edit, notebook replace/insert/delete by id and index, Jupyter-style serialization |
+| `tools/read.rs` | image sniffing + dimensions + size limit, PDF text/page ranges (fixture PDF built in the test), notebooks, binary files, tracker recording |
+| `tools/{html,fetch,web_search}.rs` | HTML→text, extraction via a canned model (success, failure fallback, no extractor), DuckDuckGo/Brave/Tavily parsing, domain filters, backend selection |
+| `tools/{todo,plan}.rs`, `tools/mod.rs` | todo parsing/summary, plan validation, registry contents, tracker sharing within (not across) registries |
+| `thinking.rs` | keyword tiers, bare-`think` heuristics, embedded-file exclusion, turn budget combination, `/think` argument parsing |
+| `sandbox.rs` (modes) | mode cycle, plan-mode denials under every permission mode, read-only shell commands, `exit_plan_mode` prompting, accept-edits with guards, new tools' path rules, `web_search` knob |
+| `provider/{anthropic,openai,gemini,bedrock}.rs` (thinking/images) | `thinking` parameter + clamping, signed-block replay, streamed thinking/signature events, reasoning effort + `max_completion_tokens`, image parts, Gemini thought parts and multi-part chunks |
+| `io/src/{status,clipboard,input,tui}.rs` | badge text, pasted-image-path forms, `@image` / quoted mentions, permission-dialog reply mapping |
 | `pricing.rs` | cost calculation (incl. cache read/write rates), per-provider cache rates (Anthropic/Bedrock-Claude/OpenAI/Gemini/unknown), known models, free/subscription/passthrough providers |
 | `types.rs` | `TurnUsage` cost with cache traffic (Anthropic and OpenAI rates, unknown-model fallback), serde of cache fields (omitted at 0, old records load) |
 | `io/src/stream.rs` | ThinkParser: plain text, think blocks, tags split across deltas, unterminated blocks, multibyte boundaries |
@@ -883,7 +1036,7 @@ GitHub Actions runs on every push and PR to `main` (`.github/workflows/ci.yml`):
 1. Create tool file in `io-runtime/src/tools/`
 2. Implement `Tool` trait with name, description, schema
 3. Implement async execute method
-4. Register in `default_registry()` in `tools/mod.rs`
+4. Register it in `tool_by_name()` / `BUILTIN_TOOLS` in `tools/mod.rs`
 5. Export in `tools/mod.rs`
 6. Test tool execution in agent context
 
@@ -918,6 +1071,9 @@ sqlite3 ~/.local/share/io/sessions.db "SELECT * FROM sessions;"
 - `thiserror` - Custom error types
 - `tracing` - Structured logging
 
+### Runtime-Specific Dependencies
+- `pdf-extract` - PDF text extraction for the `read` tool
+
 ### CLI-Specific Dependencies
 - `termimad` - Terminal markdown rendering
 
@@ -935,6 +1091,8 @@ Provider API keys (can also be stored in `~/.io/keys.toml`):
 - `AZURE_OPENAI_API_KEY` - Azure OpenAI
 - `OPENCODE_GO_API_KEY` / `OPENCODE_API_KEY` - OpenCode Go / Zen
 - Ollama and Bedrock use local credentials — no API key required
+- `BRAVE_API_KEY` / `TAVILY_API_KEY` - optional `web_search` backends (DuckDuckGo needs none);
+  `IO_SEARCH_BACKEND=duckduckgo|brave|tavily` forces one
 
 Debug logging:
 ```bash

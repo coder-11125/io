@@ -81,6 +81,20 @@ fn set_config_key(
         ["permissions", "denied_commands"] => {
             config.permissions.denied_commands = parse_command_list(key, value)?;
         }
+        ["thinking", "enabled"] => config.thinking.enabled = parse_bool(key, value)?,
+        ["thinking", "keywords"] => config.thinking.keywords = parse_bool(key, value)?,
+        ["thinking", "budget_tokens"] => {
+            let budget: u32 = value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid value for {key}: expected a number"))?;
+            if budget < io_runtime::config::MIN_THINKING_BUDGET {
+                anyhow::bail!(
+                    "invalid value for {key}: the budget must be at least {} tokens",
+                    io_runtime::config::MIN_THINKING_BUDGET
+                );
+            }
+            config.thinking.budget_tokens = budget;
+        }
         ["theme"] => {
             if !io_tui::render::THEME_NAMES.contains(&value) {
                 anyhow::bail!(
@@ -99,7 +113,8 @@ fn set_config_key(
              provider.azure.deployment, session.auto_compact, \
              session.memory_enabled, session.max_turns, session.max_tokens, \
              permissions.default, permissions.allow_network_fetch, \
-             permissions.allowed_commands, permissions.denied_commands, theme"
+             permissions.allowed_commands, permissions.denied_commands, thinking.enabled, \
+             thinking.budget_tokens, thinking.keywords, theme"
         ),
     }
     Ok(())
@@ -235,5 +250,21 @@ mod tests {
         assert!(set_config_key(&mut config, "permissions.allow_network_fetch", "yes").is_err());
         assert!(set_config_key(&mut config, "permissions.allowed_commands", "[not json]").is_err());
         assert!(set_config_key(&mut config, "permissions.default", "always").is_err());
+    }
+
+    #[test]
+    fn config_set_supports_the_thinking_keys() {
+        let mut config = io_runtime::config::Config::default();
+        set_config_key(&mut config, "thinking.enabled", "true").unwrap();
+        set_config_key(&mut config, "thinking.budget_tokens", "12000").unwrap();
+        set_config_key(&mut config, "thinking.keywords", "false").unwrap();
+        assert!(config.thinking.enabled);
+        assert_eq!(config.thinking.budget_tokens, 12_000);
+        assert!(!config.thinking.keywords);
+        // Garbage and too-small budgets are errors, not silent defaults.
+        assert!(set_config_key(&mut config, "thinking.enabled", "maybe").is_err());
+        assert!(set_config_key(&mut config, "thinking.budget_tokens", "lots").is_err());
+        assert!(set_config_key(&mut config, "thinking.budget_tokens", "100").is_err());
+        assert_eq!(config.thinking.budget_tokens, 12_000);
     }
 }

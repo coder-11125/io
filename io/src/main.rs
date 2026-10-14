@@ -3,12 +3,14 @@ use io_runtime::types::SessionId;
 use std::str::FromStr;
 
 mod agent;
+mod clipboard;
 mod config_cmd;
 mod connect;
 mod cost;
 mod input;
 mod login;
 mod model;
+mod status;
 mod stream;
 mod tui;
 

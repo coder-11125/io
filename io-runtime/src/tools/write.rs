@@ -1,7 +1,23 @@
+use super::file_state::FileTracker;
 use super::{Tool, ToolInput, ToolOutput};
 use similar::{ChangeTag, TextDiff};
+use std::sync::Arc;
 
-pub struct WriteTool;
+pub struct WriteTool {
+    tracker: Arc<FileTracker>,
+}
+
+impl WriteTool {
+    pub fn new(tracker: Arc<FileTracker>) -> Self {
+        Self { tracker }
+    }
+}
+
+impl Default for WriteTool {
+    fn default() -> Self {
+        Self::new(FileTracker::shared())
+    }
+}
 
 #[async_trait::async_trait]
 impl Tool for WriteTool {
@@ -10,7 +26,9 @@ impl Tool for WriteTool {
     }
 
     fn description(&self) -> &str {
-        "Write content to a file, creating it or overwriting it. Returns a unified diff of what changed."
+        "Write content to a file, creating it or overwriting it. An existing file must have been \
+         read first (and not changed since); a new file needs no read. Prefer edit/multi_edit \
+         for changes to existing files. Returns a unified diff of what changed."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -29,18 +47,31 @@ impl Tool for WriteTool {
             Some(p) => p,
             None => return ToolOutput::err("missing required argument: path"),
         };
-        let path = match super::resolve_safe_path(path_str) {
+        let resolved = match super::resolve_safe_path(path_str) {
             Ok(p) => p,
             Err(e) => return ToolOutput::err(e),
         };
-        let path = path.to_string_lossy().into_owned();
+        let path = resolved.to_string_lossy().into_owned();
         let content = match input.args.get("content").and_then(|v| v.as_str()) {
             Some(c) => c.to_string(),
             None => return ToolOutput::err("missing required argument: content"),
         };
 
-        let old_content = std::fs::read_to_string(&path).unwrap_or_default();
-        let is_new = !std::path::Path::new(&path).exists();
+        let is_new = !resolved.exists();
+        let old_content = if is_new {
+            String::new()
+        } else {
+            match std::fs::read_to_string(&resolved) {
+                Ok(c) => c,
+                Err(e) => return ToolOutput::err(format!("failed to read {path}: {e}")),
+            }
+        };
+        // Overwriting needs the model to have seen the file as it is now.
+        if !is_new {
+            if let Err(e) = self.tracker.check(&resolved, &old_content) {
+                return ToolOutput::err(e);
+            }
+        }
 
         if let Some(parent) = std::path::Path::new(&path).parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
@@ -51,6 +82,7 @@ impl Tool for WriteTool {
         if let Err(e) = std::fs::write(&path, &content) {
             return ToolOutput::err(format!("failed to write {path}: {e}"));
         }
+        self.tracker.record(&resolved, &content);
 
         let prior_content = if is_new {
             None
@@ -129,9 +161,16 @@ mod tests {
         std::env::temp_dir().join(format!("io_write_test_{}_{}", uuid::Uuid::new_v4(), name))
     }
 
+    /// A write tool that has already "read" `path` as it currently is.
+    fn tool_that_read(path: &std::path::Path) -> WriteTool {
+        let tracker = FileTracker::shared();
+        tracker.record(path, &std::fs::read_to_string(path).unwrap());
+        WriteTool::new(tracker)
+    }
+
     #[tokio::test]
     async fn missing_path_returns_error() {
-        let out = WriteTool
+        let out = WriteTool::default()
             .execute(input(serde_json::json!({ "content": "hi" })))
             .await;
         assert!(!out.success);
@@ -140,7 +179,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_content_returns_error() {
-        let out = WriteTool
+        let out = WriteTool::default()
             .execute(input(serde_json::json!({ "path": "/tmp/x" })))
             .await;
         assert!(!out.success);
@@ -150,7 +189,7 @@ mod tests {
     #[tokio::test]
     async fn creates_new_file() {
         let path = temp_path("new.txt");
-        let out = WriteTool
+        let out = WriteTool::default()
             .execute(input(serde_json::json!({
                 "path": path.to_str().unwrap(),
                 "content": "hello world"
@@ -172,7 +211,7 @@ mod tests {
     async fn overwrites_existing_file_and_diffs() {
         let path = temp_path("overwrite.txt");
         std::fs::write(&path, "old content\n").unwrap();
-        let out = WriteTool
+        let out = tool_that_read(&path)
             .execute(input(serde_json::json!({
                 "path": path.to_str().unwrap(),
                 "content": "new content\n"
@@ -192,7 +231,7 @@ mod tests {
     async fn oversized_prior_content_is_not_snapshotted() {
         let path = temp_path("huge.txt");
         std::fs::write(&path, "x".repeat(super::super::MAX_SNAPSHOT_BYTES + 1)).unwrap();
-        let out = WriteTool
+        let out = tool_that_read(&path)
             .execute(input(serde_json::json!({
                 "path": path.to_str().unwrap(),
                 "content": "new content\n"
@@ -204,5 +243,59 @@ mod tests {
             out.pre_edit_snapshot.is_none(),
             "oversized prior content should be skipped"
         );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_overwrite_an_existing_file_that_was_never_read() {
+        let path = temp_path("unread.txt");
+        std::fs::write(&path, "precious\n").unwrap();
+        let out = WriteTool::default()
+            .execute(input(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "content": "clobbered"
+            })))
+            .await;
+        let after = std::fs::read_to_string(&path).ok();
+        std::fs::remove_file(&path).ok();
+        assert!(!out.success);
+        assert!(out.data.contains("has not been read yet"), "{}", out.data);
+        assert_eq!(after.as_deref(), Some("precious\n"));
+    }
+
+    #[tokio::test]
+    async fn refuses_to_overwrite_a_file_modified_since_it_was_read() {
+        let path = temp_path("stale.txt");
+        std::fs::write(&path, "v1\n").unwrap();
+        let tool = tool_that_read(&path);
+        std::fs::write(&path, "v2 by the user\n").unwrap();
+        let out = tool
+            .execute(input(serde_json::json!({
+                "path": path.to_str().unwrap(),
+                "content": "v3"
+            })))
+            .await;
+        let after = std::fs::read_to_string(&path).ok();
+        std::fs::remove_file(&path).ok();
+        assert!(!out.success);
+        assert!(out.data.contains("modified since"), "{}", out.data);
+        assert_eq!(after.as_deref(), Some("v2 by the user\n"));
+    }
+
+    #[tokio::test]
+    async fn a_file_the_tool_just_created_can_be_rewritten_without_a_read() {
+        let path = temp_path("created.txt");
+        let tool = WriteTool::default();
+        for content in ["first", "second"] {
+            let out = tool
+                .execute(input(serde_json::json!({
+                    "path": path.to_str().unwrap(),
+                    "content": content
+                })))
+                .await;
+            assert!(out.success, "{}", out.data);
+        }
+        let after = std::fs::read_to_string(&path).ok();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(after.as_deref(), Some("second"));
     }
 }
