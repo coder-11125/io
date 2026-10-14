@@ -214,12 +214,59 @@ pub fn handle_init() -> anyhow::Result<()> {
         println!("io already initialized in {}", root.display());
     }
 
+    // Personal files shouldn't be committed by accident.
+    if root.join(".git").exists() {
+        let ignore = root.join(".gitignore");
+        let existing = std::fs::read_to_string(&ignore).unwrap_or_default();
+        let missing = missing_ignore_lines(&existing);
+        if !missing.is_empty() {
+            let sep = if existing.is_empty() || existing.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            std::fs::write(
+                &ignore,
+                format!(
+                    "{existing}{sep}# io: personal settings and notes\n{}\n",
+                    missing.join("\n")
+                ),
+            )?;
+            println!("Added {} to .gitignore", missing.join(", "));
+        }
+    }
+
     Ok(())
+}
+
+/// Personal io files that belong in `.gitignore` and aren't there yet.
+fn missing_ignore_lines(existing: &str) -> Vec<&'static str> {
+    [
+        ".io/settings.local.json",
+        "CLAUDE.local.md",
+        ".io/worktrees/",
+    ]
+    .into_iter()
+    .filter(|line| !existing.lines().any(|l| l.trim() == *line))
+    .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn init_ignores_personal_files_once() {
+        assert_eq!(missing_ignore_lines("target/\n").len(), 3);
+        assert_eq!(
+            missing_ignore_lines("target/\n.io/settings.local.json\nCLAUDE.local.md\n"),
+            [".io/worktrees/"]
+        );
+        assert!(
+            missing_ignore_lines(".io/settings.local.json\nCLAUDE.local.md\n.io/worktrees/\n")
+                .is_empty()
+        );
+    }
 
     #[test]
     fn config_set_supports_permission_lists_and_network_fetch() {
