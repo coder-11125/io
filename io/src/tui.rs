@@ -119,6 +119,9 @@ async fn build_agent(
     let memory = io_runtime::memory::SessionStore::new()?;
     let project_root = detect_project_root();
     let project_context = io_runtime::load_project_context(&project_root);
+    // Hooks come from the global config only (see `io_runtime::hooks`) and
+    // run in the project root.
+    let hooks = io_runtime::Hooks::new(config.hooks.clone(), project_root.clone());
     let mut checker = io_runtime::sandbox::PermissionChecker::from(&config.permissions)
         .with_project_root(project_root);
     if agent_config.auto_allow_writes {
@@ -142,7 +145,8 @@ async fn build_agent(
         config.session.max_tokens,
         permissions.clone(),
         project_context.clone(),
-    );
+    )
+    .with_hooks(&hooks);
     tools.register(Box::new(spawn_tool));
 
     Ok(io_runtime::Agent::new(
@@ -157,7 +161,8 @@ async fn build_agent(
         config.session.max_tokens,
         config.session.auto_compact,
         pricing_override,
-    ))
+    )
+    .with_hooks(hooks))
 }
 
 // ── Single-shot ────────────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@ pub mod agent;
 pub mod command_safety;
 pub mod compact;
 pub mod config;
+pub mod hooks;
 pub mod memory;
 pub mod oauth;
 pub mod pricing;
@@ -11,8 +12,9 @@ pub mod sandbox;
 pub mod tools;
 pub mod types;
 
-pub use agent::{Agent, AgentEvent, Cancelled, PermissionReply, PromptFn};
+pub use agent::{Agent, AgentEvent, Cancelled, PermissionReply, PromptBlocked, PromptFn};
 pub use compact::CompactResult;
+pub use hooks::{HookEntry, Hooks, HooksConfig};
 pub use pricing::{
     cache_rates_for_model, get_pricing_for_model, get_provider_pricing_category, CacheRates,
     ModelPricing, ProviderPricingCategory,

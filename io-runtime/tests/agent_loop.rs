@@ -4,7 +4,8 @@
 //! persistence — everything except a real LLM HTTP call.
 
 use async_trait::async_trait;
-use io_runtime::agent::{Agent, AgentEvent, PermissionReply};
+use io_runtime::agent::{Agent, AgentEvent, PermissionReply, PromptBlocked};
+use io_runtime::hooks::{HookEntry, Hooks, HooksConfig};
 use io_runtime::memory::SessionStore;
 use io_runtime::provider::{
     CompletionModel, CompletionRequest, CompletionResponse, ContentBlock, StreamEvent, Usage,
@@ -812,4 +813,361 @@ async fn turn_usage_records_cache_traffic_separately_from_input() {
     assert_eq!(usage.input_tokens, 40, "input_tokens stays uncached-only");
     assert_eq!(usage.cache_read_tokens, 900);
     assert_eq!(usage.cache_write_tokens, 60);
+}
+
+// ── Hooks ─────────────────────────────────────────────────────────────────────
+
+fn hook(matcher: Option<&str>, command: &str) -> HookEntry {
+    HookEntry {
+        matcher: matcher.map(str::to_string),
+        command: command.to_string(),
+        timeout_ms: None,
+    }
+}
+
+fn hooks(config: HooksConfig) -> Hooks {
+    Hooks::new(config, std::env::temp_dir())
+}
+
+/// The first tool result the model was shown in `request`, if any.
+fn tool_result_text(request: &CompletionRequest) -> Option<(String, Option<bool>)> {
+    request.messages.iter().rev().find_map(|m| {
+        m.content.iter().find_map(|b| match b {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => Some((content.clone(), *is_error)),
+            _ => None,
+        })
+    })
+}
+
+#[tokio::test]
+async fn pre_tool_use_hook_blocks_the_tool_even_when_permissions_allow_it() {
+    let target = temp_path("io-test-hook-write", ".txt");
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "write",
+            serde_json::json!({"path": target.to_str().unwrap(), "content": "x"}),
+        ),
+        text_response("ok"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow")).with_hooks(hooks(
+        HooksConfig {
+            pre_tool_use: vec![hook(Some("write"), "echo 'writes are frozen' >&2; exit 2")],
+            ..Default::default()
+        },
+    ));
+
+    agent.run_turn("write the file").await.unwrap();
+
+    assert!(!target.exists(), "a vetoed write must not run");
+    let (content, is_error) = tool_result_text(&provider.recorded_requests()[1]).unwrap();
+    assert_eq!(
+        content, "blocked by pre_tool_use hook: writes are frozen",
+        "the model sees the hook's reason"
+    );
+    assert_eq!(is_error, Some(true));
+}
+
+#[tokio::test]
+async fn pre_tool_use_hook_cannot_grant_permission() {
+    // Prompt mode with no way to ask: the write is denied. A hook that exits
+    // 0 ("fine by me") must not turn that into an allow.
+    let target = temp_path("io-test-hook-write", ".txt");
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "write",
+            serde_json::json!({"path": target.to_str().unwrap(), "content": "x"}),
+        ),
+        text_response("ok"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("prompt")).with_hooks(hooks(
+        HooksConfig {
+            pre_tool_use: vec![hook(None, "exit 0")],
+            ..Default::default()
+        },
+    ));
+
+    agent.run_turn("write the file").await.unwrap();
+
+    assert!(!target.exists());
+    let (content, _) = tool_result_text(&provider.recorded_requests()[1]).unwrap();
+    assert!(content.contains("no prompt is available"), "got: {content}");
+}
+
+#[tokio::test]
+async fn pre_tool_use_hook_that_fails_open_lets_the_tool_run() {
+    // Only exit 2 blocks; a hook that crashes (exit 1) is logged and ignored.
+    let file = temp_path("io-test-hook-read", ".txt");
+    std::fs::write(&file, "readable").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "read",
+            serde_json::json!({"file_path": file.to_str().unwrap()}),
+        ),
+        text_response("done"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow")).with_hooks(hooks(
+        HooksConfig {
+            pre_tool_use: vec![hook(None, "exit 1")],
+            ..Default::default()
+        },
+    ));
+
+    agent.run_turn("read it").await.unwrap();
+
+    let (content, is_error) = tool_result_text(&provider.recorded_requests()[1]).unwrap();
+    assert!(content.contains("readable"));
+    assert_eq!(is_error, None);
+    std::fs::remove_file(&file).ok();
+}
+
+#[tokio::test]
+async fn post_tool_use_hook_feedback_is_shown_to_the_model() {
+    let file = temp_path("io-test-hook-read", ".txt");
+    std::fs::write(&file, "file body").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "read",
+            serde_json::json!({"file_path": file.to_str().unwrap()}),
+        ),
+        text_response("done"),
+    ]);
+    let db = temp_path("io-test", ".db");
+    let agent = make_agent_at(
+        provider.clone(),
+        PermissionChecker::new("allow"),
+        db.clone(),
+        None,
+    )
+    .with_hooks(hooks(HooksConfig {
+        post_tool_use: vec![
+            hook(Some("read"), "echo 'lint: all good'"),
+            // Wrong tool — must not run.
+            hook(Some("write"), "echo 'wrong tool'"),
+        ],
+        ..Default::default()
+    }));
+
+    agent.run_turn("read it").await.unwrap();
+
+    let (content, _) = tool_result_text(&provider.recorded_requests()[1]).unwrap();
+    assert!(content.contains("file body"), "original output is kept");
+    assert!(
+        content.ends_with("[post_tool_use hook]\nlint: all good"),
+        "feedback is appended, got: {content}"
+    );
+    assert!(!content.contains("wrong tool"));
+
+    // The saved record matches what the model saw.
+    let store = SessionStore::with_path(db).unwrap();
+    let session = store.load_session(agent.session_id().await).unwrap();
+    assert!(session.turns[0].tool_calls[0]
+        .output
+        .contains("lint: all good"));
+    std::fs::remove_file(&file).ok();
+}
+
+#[tokio::test]
+async fn post_tool_use_hook_does_not_run_for_blocked_or_denied_calls() {
+    let marker = temp_path("io-test-hook-post-marker", ".txt");
+    let target = temp_path("io-test-hook-write", ".txt");
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "write",
+            serde_json::json!({"path": target.to_str().unwrap(), "content": "x"}),
+        ),
+        text_response("ok"),
+    ]);
+    let agent =
+        make_agent(provider, PermissionChecker::new("allow")).with_hooks(hooks(HooksConfig {
+            pre_tool_use: vec![hook(None, "exit 2")],
+            post_tool_use: vec![hook(None, &format!("touch {}", marker.display()))],
+            ..Default::default()
+        }));
+
+    agent.run_turn("write the file").await.unwrap();
+
+    assert!(
+        !marker.exists(),
+        "post hook must not fire for a call that never ran"
+    );
+}
+
+#[tokio::test]
+async fn user_prompt_submit_hook_can_reject_the_prompt() {
+    let provider = MockProvider::new(vec![text_response("should never be asked")]);
+    let db = temp_path("io-test", ".db");
+    let agent = make_agent_at(
+        provider.clone(),
+        PermissionChecker::new("allow"),
+        db.clone(),
+        None,
+    )
+    .with_hooks(hooks(HooksConfig {
+        user_prompt_submit: vec![hook(None, "echo 'no secrets please' >&2; exit 2")],
+        ..Default::default()
+    }));
+
+    let err = agent.run_turn("my password is hunter2").await.unwrap_err();
+    let blocked = err.downcast_ref::<PromptBlocked>().expect("typed error");
+    assert_eq!(blocked.0, "no secrets please");
+
+    assert!(
+        provider.recorded_requests().is_empty(),
+        "a rejected prompt never reaches the model"
+    );
+    let store = SessionStore::with_path(db).unwrap();
+    let session = store.load_session(agent.session_id().await);
+    assert!(
+        session.map(|s| s.turns.is_empty()).unwrap_or(true),
+        "a rejected prompt is not saved"
+    );
+}
+
+#[tokio::test]
+async fn user_prompt_submit_hook_context_reaches_the_model_but_not_the_saved_turn() {
+    let provider = MockProvider::new(vec![text_response("ok")]);
+    let db = temp_path("io-test", ".db");
+    let agent = make_agent_at(
+        provider.clone(),
+        PermissionChecker::new("allow"),
+        db.clone(),
+        None,
+    )
+    .with_hooks(hooks(HooksConfig {
+        user_prompt_submit: vec![hook(None, "echo 'current branch: main'")],
+        ..Default::default()
+    }));
+
+    agent.run_turn("what branch am I on?").await.unwrap();
+
+    let requests = provider.recorded_requests();
+    let sent = requests[0].messages.last().unwrap();
+    let sent_text = match &sent.content[0] {
+        ContentBlock::Text { text } => text.clone(),
+        other => panic!("expected text, got {other:?}"),
+    };
+    assert!(sent_text.starts_with("what branch am I on?"));
+    assert!(sent_text.contains("<hook-context>\ncurrent branch: main\n</hook-context>"));
+
+    let store = SessionStore::with_path(db).unwrap();
+    let session = store.load_session(agent.session_id().await).unwrap();
+    assert_eq!(
+        session.turns[0].user_message, "what branch am I on?",
+        "the saved turn keeps the prompt as typed"
+    );
+}
+
+#[tokio::test]
+async fn stop_hook_runs_after_a_completed_turn_only() {
+    let marker = temp_path("io-test-hook-stop", ".txt");
+    let stop_config = HooksConfig {
+        stop: vec![hook(None, &format!("cat > {}", marker.display()))],
+        ..Default::default()
+    };
+
+    // A failing turn (provider has no scripted response) must not fire it.
+    let failing = make_agent(MockProvider::new(vec![]), PermissionChecker::new("allow"))
+        .with_hooks(hooks(stop_config.clone()));
+    assert!(failing.run_turn("hi").await.is_err());
+    assert!(
+        !marker.exists(),
+        "stop hook must not fire for a failed turn"
+    );
+
+    let provider = MockProvider::new(vec![text_response("all done")]);
+    let agent =
+        make_agent(provider, PermissionChecker::new("allow")).with_hooks(hooks(stop_config));
+    agent.run_turn("hi").await.unwrap();
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+    assert_eq!(payload["hook_event_name"], "Stop");
+    assert_eq!(payload["response"], "all done");
+    std::fs::remove_file(&marker).ok();
+}
+
+#[tokio::test]
+async fn sub_agents_inherit_pre_tool_use_hooks() {
+    // The guard must hold when the model delegates the work: a sub-agent's
+    // `read` is vetoed by the parent's hook.
+    let file = temp_path("io-test-hook-sub-read", ".txt");
+    std::fs::write(&file, "secret contents").unwrap();
+    let hook_config = HooksConfig {
+        pre_tool_use: vec![hook(Some("read"), "echo 'reads are frozen' >&2; exit 2")],
+        // Prompt/stop hooks are for the user's turn — not inherited, so this
+        // one must not fire for the sub-agent's task prompt.
+        user_prompt_submit: vec![hook(None, "echo 'prompt hook ran' >&2; exit 2")],
+        ..Default::default()
+    };
+    let hooks = hooks(hook_config);
+
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "spawn_agent",
+            serde_json::json!({"agent_id": "explore", "task": "read the file"}),
+        ),
+        tool_response(
+            "read",
+            serde_json::json!({"file_path": file.to_str().unwrap()}),
+        ),
+        text_response("sub-agent done"),
+        text_response("parent done"),
+    ]);
+    let permissions = Arc::new(PermissionChecker::new("allow"));
+    let mut tools = default_registry();
+    tools.register(Box::new(
+        io_runtime::SpawnAgentTool::new(
+            provider.clone(),
+            "mock-model".to_string(),
+            1024,
+            permissions.clone(),
+            None,
+        )
+        .with_hooks(&hooks),
+    ));
+    let memory = SessionStore::with_path(temp_path("io-test", ".db")).expect("session store");
+    // The parent itself has no user_prompt_submit hook (only the sub-agent
+    // config carries one, and it is stripped on inheritance).
+    let parent_hooks = Hooks::new(
+        HooksConfig {
+            user_prompt_submit: vec![],
+            ..HooksConfig::default()
+        },
+        std::env::temp_dir(),
+    );
+    let agent = Agent::new(
+        provider.clone(),
+        tools,
+        memory,
+        permissions,
+        "You are a test agent.".to_string(),
+        None,
+        None,
+        "mock-model".to_string(),
+        1024,
+        false,
+        None,
+    )
+    .with_hooks(parent_hooks);
+
+    let reply = agent.run_turn("delegate this").await.unwrap();
+    assert_eq!(reply, "parent done");
+
+    let requests = provider.recorded_requests();
+    let sub_agent_saw_veto = requests.iter().any(
+        |r| matches!(tool_result_text(r), Some((c, Some(true))) if c.contains("reads are frozen")),
+    );
+    assert!(
+        sub_agent_saw_veto,
+        "sub-agent's read must be vetoed by the inherited hook"
+    );
+    let leaked = requests
+        .iter()
+        .flat_map(|r| r.messages.iter())
+        .flat_map(|m| m.content.iter())
+        .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("secret contents")));
+    assert!(!leaked, "file contents must never reach the model");
+    std::fs::remove_file(&file).ok();
 }

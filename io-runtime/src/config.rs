@@ -12,6 +12,10 @@ pub struct Config {
     pub permissions: PermissionConfig,
     #[serde(default = "default_theme")]
     pub theme: String,
+    /// Lifecycle hooks (shell commands run around tool calls, prompts and
+    /// turns). Read from the global config only — see `hooks.rs`.
+    #[serde(default)]
+    pub hooks: crate::hooks::HooksConfig,
 }
 
 fn default_theme() -> String {
@@ -714,6 +718,7 @@ impl Default for Config {
             session: SessionConfig::default(),
             permissions: PermissionConfig::default(),
             theme: default_theme(),
+            hooks: crate::hooks::HooksConfig::default(),
         }
     }
 }
@@ -991,8 +996,8 @@ mod tests {
     }
 
     #[test]
-    fn schema_upgrade_adds_prompt_cache_without_touching_user_values() {
-        let path = temp_config_path("cache-upgrade");
+    fn schema_upgrade_adds_prompt_cache_and_hooks_without_touching_user_values() {
+        let path = temp_config_path("cache-hooks");
         let contents = r#"
             [provider]
             default = "anthropic"
@@ -1004,23 +1009,47 @@ mod tests {
 
         let config = Config::load_with_schema_upgrade(&path, contents).unwrap();
         assert!(config.provider.anthropic.as_ref().unwrap().prompt_cache);
+        assert!(config.hooks.pre_tool_use.is_empty());
 
         let rewritten = std::fs::read_to_string(&path).unwrap();
         assert!(rewritten.contains("prompt_cache = true"));
+        assert!(rewritten.contains("[hooks]"));
 
         let _ = std::fs::remove_file(&path);
     }
 
     #[test]
-    fn prompt_cache_can_be_turned_off_in_a_user_config() {
+    fn hooks_and_prompt_cache_parse_from_a_user_config() {
         let config: Config = toml::from_str(
             r#"
             [provider.anthropic]
             prompt_cache = false
+
+            [[hooks.pre_tool_use]]
+            matcher = "bash"
+            command = "./guard.sh"
+
+            [[hooks.stop]]
+            command = "echo done"
             "#,
         )
         .unwrap();
         assert!(!config.provider.anthropic.as_ref().unwrap().prompt_cache);
+        assert_eq!(config.hooks.pre_tool_use[0].command, "./guard.sh");
+        assert_eq!(config.hooks.stop.len(), 1);
+        assert!(config.hooks.post_tool_use.is_empty());
+    }
+
+    #[test]
+    fn config_with_hooks_survives_a_save_roundtrip() {
+        let mut config = Config::default();
+        config.hooks.post_tool_use.push(crate::hooks::HookEntry {
+            matcher: Some("write|edit".to_string()),
+            command: "cargo fmt".to_string(),
+            timeout_ms: Some(5000),
+        });
+        let parsed: Config = toml::from_str(&toml::to_string_pretty(&config).unwrap()).unwrap();
+        assert_eq!(parsed.hooks, config.hooks);
     }
 
     #[test]

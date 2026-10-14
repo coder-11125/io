@@ -54,6 +54,7 @@ io/
 │       ├── agent.rs           # Agent loop (LLM + tool execution)
 │       ├── compact.rs         # /compact + auto-compact summarization
 │       ├── rewind.rs          # /rewind — restore files to an earlier point in the chat
+│       ├── hooks.rs           # Lifecycle hooks: user shell commands around tool calls, prompts, turns
 │       ├── config.rs          # Configuration schema, loading, provider lookups
 │       ├── pricing.rs         # Per-model cost tables
 │       ├── types.rs           # Core data types (Session, Turn, etc.)
@@ -272,14 +273,40 @@ that didn't exist yet. Only `write`/`edit` calls are tracked; `bash` has no
 file-snapshotting and is out of scope, so file changes made via `bash` are
 left as-is by a rewind.
 
+**Hooks** (`hooks.rs`; attached with `Agent::with_hooks`, built in
+`build_agent` from `config.hooks`): user-configured shell commands run with
+`sh -c` in the project root at four points — `pre_tool_use`,
+`post_tool_use`, `user_prompt_submit`, `stop`. Each gets a JSON description
+of the event on stdin (plus `IO_HOOK_EVENT` / `IO_TOOL_NAME`). Exit codes:
+`0` = success (stdout becomes extra prompt context for `user_prompt_submit`
+and extra tool-result text for `post_tool_use`), `2` = block (stderr is the
+reason), anything else / spawn failure / timeout = logged and ignored, so a
+crashing guard fails *open*. Properties worth keeping:
+- `pre_tool_use` runs **before** the permission check and can only veto; a
+  hook can never grant permission the checker withholds.
+- `post_tool_use` runs only for calls that actually executed (not for
+  hook-blocked or permission-denied ones); its feedback is appended to the
+  tool output the model sees and to the saved `ToolCallRecord`.
+- A blocked prompt returns the typed `agent::PromptBlocked` error before
+  anything is sent or saved; hook-supplied prompt context rides on that
+  request only — the saved turn keeps the user's text as typed.
+- `SpawnAgentTool::with_hooks` gives sub-agents the parent's tool hooks
+  (`Hooks::for_sub_agent`: `pre`/`post_tool_use` only), so delegating can't
+  sidestep a guard. Prompt/stop hooks are not inherited.
+- Hooks are read from the **global** `~/.io/config.toml` only. Project
+  config is deliberately not consulted, so a cloned repo can't plant a
+  command that runs on the user's machine. Output per stream is capped at
+  16 KB; default timeout 30 s (`timeout_ms` per hook), and a timed-out hook's
+  whole process group is killed.
+
 **Agent Loop**:
-1. Build message history from session (system prompt, then optional project-context synthetic message pair, then prior turns, then current user input)
+1. Build message history from session (system prompt, then optional project-context synthetic message pair, then prior turns, then current user input). `user_prompt_submit` hooks run first and may reject the prompt or add context
 2. Call LLM with tools
 3. Parse response for text and tool calls
-4. Execute permitted tools
+4. Run `pre_tool_use` hooks, check permissions, execute permitted tools, run `post_tool_use` hooks
 5. Feed tool results back to LLM
 6. Repeat until no more tool calls
-7. Save turn to session
+7. Save turn to session, then run `stop` hooks
 
 ### Provider System (io-runtime/src/provider/)
 
@@ -584,6 +611,22 @@ default = "agent"   # "allow" | "agent" | "prompt" | "deny"
 allowed_commands = []
 denied_commands = ["rm", "sudo"]
 allow_network_fetch = false   # agent mode: auto-run read-only curl/wget fetches
+
+# Hooks — global config only. Edit the file by hand (not settable via `io config set`).
+[[hooks.pre_tool_use]]
+matcher = "bash"              # tool names joined by "|"; omit or "*" = all tools
+command = "./scripts/guard.sh"   # exit 2 blocks the call; stderr is shown to the model
+timeout_ms = 10000            # optional, default 30000
+
+[[hooks.post_tool_use]]
+matcher = "write|edit"
+command = "cargo fmt"         # stdout is appended to the tool result
+
+[[hooks.user_prompt_submit]]
+command = "git status --short"   # stdout is added to the prompt as context; exit 2 rejects it
+
+[[hooks.stop]]
+command = "notify-send 'io finished'"
 ```
 
 ### Theme System (io/src/render.rs + io/src/theme.rs)
@@ -773,16 +816,18 @@ Message history is built inline in `Agent::run_turn_inner`:
 
 ## Testing
 
-The project has 240 unit tests (227 in `io-runtime`, 9 in `io`, 4 in `io-tui`) plus 15
+The project has 256 unit tests (243 in `io-runtime`, 9 in `io`, 4 in `io-tui`) plus 24
 integration tests (`io-runtime/tests/agent_loop.rs` — full agent-loop runs
 against a scripted mock provider, covering tool execution, permission
 prompting/denial, streaming events, usage tracking, session resumption,
 sub-agent permission inheritance, partial-progress persistence on
 mid-turn provider failure, auto-compact triggering — including a second
 compaction pass folding the prior summary into the new one, and cache reads
-counting toward the compaction threshold and cache traffic recorded
-separately on the turn — and a rewind that restores a file and truncates the
-session). Run with `cargo test`.
+counting toward the compaction threshold — a rewind that restores a file and
+truncates the session, and hooks: pre-tool veto that permissions can't
+override, fail-open on a crashing hook, post-tool feedback, prompt rejection
+and context injection, stop-hook firing only on success, and sub-agents
+inheriting tool hooks). Run with `cargo test`.
 
 | Module | Tests |
 |---|---|
@@ -800,7 +845,8 @@ session). Run with `cargo test`.
 | `provider/anthropic.rs` | system prompt sent from a system message, cache markers (system + last message block, none elsewhere), caching off = no markers, streaming/blocking bodies identical, last-tool breakpoint when no system, cache usage parsing (stream + blocking, nulls) |
 | `provider/gemini.rs` | system message sent as `systemInstruction`; `cachedContentTokenCount` split out of the prompt count (blocking + streaming, absent = uncached) |
 | `provider/openai.rs` | `cached_tokens` split out of `prompt_tokens` (blocking + streaming); missing/null/empty details = uncached |
-| `config.rs` | default config, roundtrip serialization, schema upgrade (incl. `prompt_cache`), prompt_cache parsing |
+| `hooks.rs` | matcher, TOML parsing, exit-2 block (stderr reason), fail-open on other exits/timeouts, JSON stdin + env, cwd, post/prompt feedback, output cap, large-stdin no-deadlock, sub-agent hook subset |
+| `config.rs` | default config, roundtrip serialization, schema upgrade (incl. `prompt_cache` / `[hooks]`), hooks + prompt_cache parsing |
 | `pricing.rs` | cost calculation (incl. cache read/write rates), per-provider cache rates (Anthropic/Bedrock-Claude/OpenAI/Gemini/unknown), known models, free/subscription/passthrough providers |
 | `types.rs` | `TurnUsage` cost with cache traffic (Anthropic and OpenAI rates, unknown-model fallback), serde of cache fields (omitted at 0, old records load) |
 | `io/src/stream.rs` | ThinkParser: plain text, think blocks, tags split across deltas, unterminated blocks, multibyte boundaries |

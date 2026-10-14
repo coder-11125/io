@@ -1,4 +1,5 @@
 use crate::agent::Agent;
+use crate::hooks::Hooks;
 use crate::memory::SessionStore;
 use crate::provider::CompletionModel;
 use crate::sandbox::PermissionChecker;
@@ -32,6 +33,8 @@ pub struct SpawnAgentTool {
     description: String,
     project_context: Option<String>,
     cancel: Mutex<Arc<AtomicBool>>,
+    /// Tool hooks inherited by spawned sub-agents (see [`Hooks::for_sub_agent`]).
+    hooks: Hooks,
 }
 
 impl SpawnAgentTool {
@@ -69,7 +72,17 @@ impl SpawnAgentTool {
             description,
             project_context,
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
+            hooks: Hooks::default(),
         }
+    }
+
+    /// Give spawned sub-agents the parent's tool hooks, so a `pre_tool_use`
+    /// guard can't be sidestepped by delegating the work. Prompt and stop
+    /// hooks are not inherited: sub-agents aren't driven by the user's
+    /// prompts.
+    pub fn with_hooks(mut self, hooks: &Hooks) -> Self {
+        self.hooks = hooks.for_sub_agent();
+        self
     }
 }
 
@@ -176,7 +189,8 @@ impl Tool for SpawnAgentTool {
             // Sub-agents don't carry the parent's Config, so no discovered
             // pricing override — turn cost falls back to the static table.
             None,
-        );
+        )
+        .with_hooks(self.hooks.clone());
         agent.set_cancel(cancel);
 
         let session_id = agent.session_id().await;

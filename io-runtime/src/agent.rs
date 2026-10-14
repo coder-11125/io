@@ -4,6 +4,13 @@
 #[error("cancelled")]
 pub struct Cancelled;
 
+/// A `user_prompt_submit` hook rejected the prompt, so the turn never
+/// started. The message is the hook's stated reason. Callers detect it with
+/// `err.is::<PromptBlocked>()`.
+#[derive(Debug, thiserror::Error)]
+#[error("prompt blocked by hook: {0}")]
+pub struct PromptBlocked(pub String);
+
 /// User's answer to a permission prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionReply {
@@ -53,6 +60,7 @@ pub enum AgentEvent {
 /// (e.g. single-shot mode, where there is no event channel to ask through).
 pub type PromptFn = Arc<dyn Fn(&str, &serde_json::Value) -> PermissionReply + Send + Sync>;
 
+use crate::hooks::Hooks;
 use crate::memory::SessionStore;
 use crate::pricing::ModelPricing;
 use crate::provider::{CompletionModel, CompletionRequest, ContentBlock, StreamEvent, Usage};
@@ -84,6 +92,9 @@ pub struct Agent {
     /// Per-token pricing discovered from a provider catalog (`ProviderConfig::pricing_override_for`),
     /// taking precedence over the static `pricing.rs` table when set.
     pricing_override: Option<ModelPricing>,
+    /// User-configured lifecycle hooks; empty (a no-op) unless set with
+    /// [`Agent::with_hooks`].
+    hooks: Hooks,
 }
 
 impl Agent {
@@ -130,7 +141,14 @@ impl Agent {
             model_id,
             provider_id,
             pricing_override,
+            hooks: Hooks::default(),
         }
+    }
+
+    /// Attach lifecycle hooks (see [`crate::hooks`]).
+    pub fn with_hooks(mut self, hooks: Hooks) -> Self {
+        self.hooks = hooks;
+        self
     }
 
     /// Set a blocking permission prompt for the non-streaming `run_turn` path.
@@ -178,13 +196,28 @@ impl Agent {
         token_tx: Option<&tokio::sync::mpsc::Sender<AgentEvent>>,
     ) -> anyhow::Result<String> {
         // Hold the lock only long enough to snapshot history; release before any async I/O.
-        let (prior_turns, summary, tool_specs) = {
+        let (prior_turns, summary, tool_specs, session_id) = {
             let session = self.session.lock().await;
             (
                 session.turns.clone(),
                 session.summary.clone(),
                 self.tools.specs(),
+                session.id.to_string(),
             )
+        };
+
+        // A user_prompt_submit hook can reject the prompt before anything is
+        // sent or saved, or contribute extra context for the model. The
+        // context rides along on this request only; the saved turn keeps the
+        // user's text as typed.
+        let hook_context = self
+            .hooks
+            .user_prompt_submit(&session_id, user_input)
+            .await
+            .map_err(PromptBlocked)?;
+        let model_input = match hook_context {
+            Some(ctx) => format!("{user_input}\n\n<hook-context>\n{ctx}\n</hook-context>"),
+            None => user_input.to_string(),
         };
 
         let system_text = match summary {
@@ -243,9 +276,7 @@ impl Agent {
 
         messages.push(Message {
             role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: user_input.to_string(),
-            }],
+            content: vec![ContentBlock::Text { text: model_input }],
         });
 
         let mut all_text = String::new();
@@ -419,13 +450,41 @@ impl Agent {
                         .and_then(|v| v.as_str())
                         .map(|cmd| written_this_turn.iter().any(|p| cmd.contains(p.as_str())))
                         .unwrap_or(false);
-                let (output, success, pre_edit_snapshot) = match self
-                    .resolve_permission(name, input, token_tx, force_prompt)
-                    .await
-                {
-                    Err(denial) => (denial, false, None),
-                    Ok(()) => self.execute_tool(name, input).await,
-                };
+                // pre_tool_use hooks run before the permission check: they can
+                // veto a call, but never grant permission that the checker
+                // withholds.
+                let (mut output, success, pre_edit_snapshot, executed) =
+                    match self.hooks.pre_tool_use(&session_id, name, input).await {
+                        Err(reason) => (
+                            format!("blocked by pre_tool_use hook: {reason}"),
+                            false,
+                            None,
+                            false,
+                        ),
+                        Ok(()) => match self
+                            .resolve_permission(name, input, token_tx, force_prompt)
+                            .await
+                        {
+                            Err(denial) => (denial, false, None, false),
+                            Ok(()) => {
+                                let (output, success, snapshot) =
+                                    self.execute_tool(name, input).await;
+                                (output, success, snapshot, true)
+                            }
+                        },
+                    };
+                // post_tool_use feedback (formatter/linter output, etc.) is
+                // appended to what the model sees. Blocked or denied calls
+                // never ran, so there is nothing to react to.
+                if executed {
+                    if let Some(feedback) = self
+                        .hooks
+                        .post_tool_use(&session_id, name, input, &output, success)
+                        .await
+                    {
+                        output.push_str(&format!("\n\n[post_tool_use hook]\n{feedback}"));
+                    }
+                }
                 if success && (name == "write" || name == "edit") {
                     if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
                         written_this_turn.push(path.to_string());
@@ -540,6 +599,8 @@ impl Agent {
                 }
             }
         }
+
+        self.hooks.stop(&session_id, &all_text).await;
 
         Ok(all_text)
     }
