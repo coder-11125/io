@@ -286,11 +286,25 @@ impl Agent {
         // sent or saved, or contribute extra context for the model. The
         // context rides along on this request only; the saved turn keeps the
         // user's text as typed.
-        let hook_context = self
+        let prompt_context = self
             .hooks
             .user_prompt_submit(&session_id, user_input)
             .await
             .map_err(PromptBlocked)?;
+        // session_start fires once, ahead of the first turn (after the
+        // prompt hooks, so a rejected prompt doesn't use it up).
+        let source = if prior_turns.is_empty() && summary.is_none() {
+            "startup"
+        } else {
+            "resume"
+        };
+        let hook_context = match (
+            self.hooks.session_start(&session_id, source).await,
+            prompt_context,
+        ) {
+            (Some(start), Some(prompt)) => Some(format!("{start}\n{prompt}")),
+            (start, prompt) => start.or(prompt),
+        };
         let model_input = match hook_context {
             Some(ctx) => format!("{user_input}\n\n<hook-context>\n{ctx}\n</hook-context>"),
             None => user_input.to_string(),
@@ -562,7 +576,9 @@ impl Agent {
                 break;
             }
 
-            // Execute each tool and collect results
+            // Execute the tool calls, in order. Each call is gated first (start
+            // event, pre_tool_use hooks, permission — which may prompt the
+            // user), then run and reported.
             let mut tool_results: Vec<ContentBlock> = Vec::new();
             // Images tools returned (e.g. `read` on a screenshot), sent after
             // the tool results in the same user message.
@@ -586,77 +602,38 @@ impl Agent {
                         .map(|cmd| written_this_turn.iter().any(|p| cmd.contains(p.as_str())))
                         .unwrap_or(false);
                 // pre_tool_use hooks run before the permission check: they can
-                // veto a call, but never grant permission that the checker
-                // withholds.
-                let (mut output, success, pre_edit_snapshot, executed) =
-                    match self.hooks.pre_tool_use(&session_id, name, input).await {
-                        Err(reason) => (
-                            format!("blocked by pre_tool_use hook: {reason}"),
-                            false,
-                            None,
-                            false,
-                        ),
-                        Ok(()) => match self
-                            .resolve_permission(name, input, token_tx, force_prompt)
-                            .await
-                        {
-                            Err(denial) => (denial, false, None, false),
-                            Ok(()) => {
-                                let run = self.execute_tool(name, input).await;
-                                tool_images.extend(run.images.into_iter().map(|i| {
-                                    ContentBlock::Image {
-                                        media_type: i.media_type,
-                                        data: i.data,
-                                    }
-                                }));
-                                (run.output, run.success, run.snapshot, true)
-                            }
-                        },
-                    };
-                // post_tool_use feedback (formatter/linter output, etc.) is
-                // appended to what the model sees. Blocked or denied calls
-                // never ran, so there is nothing to react to.
-                if executed {
-                    if let Some(feedback) = self
-                        .hooks
-                        .post_tool_use(&session_id, name, input, &output, success)
+                // veto a call or force a prompt, but never grant permission
+                // that the checker withholds.
+                let verdict = match self.hooks.pre_tool_use(&session_id, name, input).await {
+                    Err(reason) => Err(format!("blocked by pre_tool_use hook: {reason}")),
+                    Ok(pre) => match self
+                        .resolve_permission(
+                            name,
+                            input,
+                            token_tx,
+                            force_prompt || pre.ask,
+                            &session_id,
+                        )
                         .await
                     {
-                        output.push_str(&format!("\n\n[post_tool_use hook]\n{feedback}"));
-                    }
-                }
-                if success && is_file_write_tool(name) {
-                    if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
-                        written_this_turn.push(path.to_string());
-                    }
-                }
-
-                if let Some(tx) = token_tx {
-                    let _ = tx
-                        .send(AgentEvent::ToolDone {
-                            name: name.clone(),
-                            output: output.clone(),
-                            success,
-                        })
-                        .await;
-                }
-
-                let duration = start.elapsed().as_millis() as u64;
-                let record = ToolCallRecord {
-                    tool_name: name.clone(),
-                    input: input.clone(),
-                    output: output.clone(),
-                    success,
-                    duration_ms: duration,
-                    pre_edit_snapshot,
+                        Err(denial) => Err(denial),
+                        Ok(()) => Ok(pre.context),
+                    },
                 };
-                append_audit_log(&record);
-                all_tool_calls.push(record);
-                tool_results.push(ContentBlock::ToolResult {
-                    tool_use_id: id.clone(),
-                    content: output,
-                    is_error: if success { None } else { Some(true) },
-                });
+                let gated = Gated {
+                    id: id.clone(),
+                    name: name.clone(),
+                    input: input.clone(),
+                    start,
+                    verdict,
+                };
+                let mut sink = Sink {
+                    written: &mut written_this_turn,
+                    calls: &mut all_tool_calls,
+                    results: &mut tool_results,
+                    images: &mut tool_images,
+                };
+                self.settle(gated, &session_id, token_tx, &mut sink).await;
             }
 
             // Feed results back into the conversation
@@ -729,7 +706,7 @@ impl Agent {
         if self.auto_compact && tally.last_context_tokens > 0 {
             let threshold = (self.context_window() as f64 * 0.8) as u32;
             if tally.last_context_tokens >= threshold {
-                match crate::compact::run(&self.session, &self.provider, &self.memory).await {
+                match self.compact_for("auto").await {
                     Ok(r) if r.turns_compacted > 0 => match token_tx {
                         Some(tx) => {
                             let _ = tx
@@ -781,6 +758,7 @@ impl Agent {
         input: &serde_json::Value,
         token_tx: Option<&tokio::sync::mpsc::Sender<AgentEvent>>,
         force_prompt: bool,
+        session_id: &str,
     ) -> Result<(), String> {
         let in_plan_mode = self.interaction_mode() == InteractionMode::Plan;
         if name == "exit_plan_mode" && !in_plan_mode {
@@ -799,7 +777,10 @@ impl Agent {
         match effective {
             PermissionLevel::Allow => Ok(()),
             PermissionLevel::Deny
-                if in_plan_mode && (is_file_write_tool(name) || name == "bash") =>
+                if in_plan_mode
+                    && (is_file_write_tool(name)
+                        || name == "bash"
+                        || name.starts_with("mcp__")) =>
             {
                 Err(format!(
                     "{name} refused: plan mode is active, so file changes and state-changing \
@@ -809,6 +790,21 @@ impl Agent {
             }
             PermissionLevel::Deny => Err(format!("tool {name} not permitted")),
             PermissionLevel::Prompt => {
+                // Tell any notification hooks the user is needed (fire and
+                // forget — it never delays the prompt).
+                let detail = match name {
+                    "bash" => input.get("command").and_then(|v| v.as_str()),
+                    n if is_file_write_tool(n) => input.get("path").and_then(|v| v.as_str()),
+                    _ => None,
+                };
+                self.hooks.notify(
+                    session_id,
+                    "permission",
+                    &match detail {
+                        Some(d) => format!("io needs your permission to use {name}: {d}"),
+                        None => format!("io needs your permission to use {name}"),
+                    },
+                );
                 let reply = if let Some(tx) = token_tx {
                     let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                     let sent = tx
@@ -877,6 +873,72 @@ impl Agent {
         }
     }
 
+    /// Run one gated tool call, then report it: post-hooks, the `ToolDone`
+    /// event, the saved record and the tool result for the model.
+    async fn settle(
+        &self,
+        g: Gated,
+        session_id: &str,
+        token_tx: Option<&tokio::sync::mpsc::Sender<AgentEvent>>,
+        sink: &mut Sink<'_>,
+    ) {
+        let (mut output, success, snapshot) = match g.verdict {
+            Ok(pre_context) => {
+                let run = self.execute_tool(&g.name, &g.input).await;
+                sink.images
+                    .extend(run.images.into_iter().map(|i| ContentBlock::Image {
+                        media_type: i.media_type,
+                        data: i.data,
+                    }));
+                let mut output = run.output;
+                // post_tool_use feedback (formatter/linter output, etc.) is
+                // appended to what the model sees.
+                let feedback = self
+                    .hooks
+                    .post_tool_use(session_id, &g.name, &g.input, &output, run.success)
+                    .await;
+                if let Some(context) = pre_context {
+                    output.push_str(&format!("\n\n[pre_tool_use hook]\n{context}"));
+                }
+                if let Some(feedback) = feedback {
+                    output.push_str(&format!("\n\n[post_tool_use hook]\n{feedback}"));
+                }
+                (output, run.success, run.snapshot)
+            }
+            // Blocked or denied calls never ran: nothing to react to.
+            Err(denial) => (denial, false, None),
+        };
+        if success && is_file_write_tool(&g.name) {
+            if let Some(path) = g.input.get("path").and_then(|v| v.as_str()) {
+                sink.written.push(path.to_string());
+            }
+        }
+        if let Some(tx) = token_tx {
+            let _ = tx
+                .send(AgentEvent::ToolDone {
+                    name: g.name.clone(),
+                    output: output.clone(),
+                    success,
+                })
+                .await;
+        }
+        let record = ToolCallRecord {
+            tool_name: g.name,
+            input: g.input,
+            output: output.clone(),
+            success,
+            duration_ms: g.start.elapsed().as_millis() as u64,
+            pre_edit_snapshot: snapshot,
+        };
+        append_audit_log(&record);
+        sink.calls.push(record);
+        sink.results.push(ContentBlock::ToolResult {
+            tool_use_id: g.id,
+            content: std::mem::take(&mut output),
+            is_error: if success { None } else { Some(true) },
+        });
+    }
+
     async fn execute_tool(&self, name: &str, input: &serde_json::Value) -> ToolRun {
         let tool_input = ToolInput {
             name: name.to_string(),
@@ -909,7 +971,33 @@ impl Agent {
     }
 
     pub async fn compact(&self) -> anyhow::Result<crate::compact::CompactResult> {
-        crate::compact::run(&self.session, &self.provider, &self.memory).await
+        self.compact_for("manual").await
+    }
+
+    /// Compact the session after the `pre_compact` hooks have had their say:
+    /// a hook can cancel it, or add guidance for the summary. `trigger` is
+    /// `manual` or `auto`.
+    async fn compact_for(&self, trigger: &str) -> anyhow::Result<crate::compact::CompactResult> {
+        let session_id = self.session.lock().await.id.to_string();
+        let guidance = self
+            .hooks
+            .pre_compact(&session_id, trigger)
+            .await
+            .map_err(|reason| anyhow::anyhow!("compaction cancelled by a hook: {reason}"))?;
+        crate::compact::run(
+            &self.session,
+            &self.provider,
+            &self.memory,
+            guidance.as_deref(),
+        )
+        .await
+    }
+
+    /// Tell the `session_end` hooks this session is over. `reason` is
+    /// `exit`, `new` or `single_shot`.
+    pub async fn end_session(&self, reason: &str) {
+        let session_id = self.session.lock().await.id.to_string();
+        self.hooks.session_end(&session_id, reason).await;
     }
 
     /// Turns in the current session, for a caller (e.g. the `/rewind` picker)
@@ -926,6 +1014,26 @@ impl Agent {
     ) -> anyhow::Result<crate::rewind::RewindResult> {
         crate::rewind::run(&self.session, &self.memory, turn_index).await
     }
+}
+
+/// A tool call that has been through its start event, hooks and permission
+/// check. `verdict` is `Ok(pre_tool_use context)` to run it, or `Err(why)`
+/// with the message the model should see instead.
+struct Gated {
+    id: String,
+    name: String,
+    input: serde_json::Value,
+    start: std::time::Instant,
+    verdict: Result<Option<String>, String>,
+}
+
+/// Where `settle` records what the calls produced.
+struct Sink<'a> {
+    /// Paths written this turn (a later `bash` mentioning one gets a prompt).
+    written: &'a mut Vec<String>,
+    calls: &'a mut Vec<ToolCallRecord>,
+    results: &'a mut Vec<ContentBlock>,
+    images: &'a mut Vec<ContentBlock>,
 }
 
 /// What one tool call produced, as the agent loop needs it.

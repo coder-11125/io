@@ -106,6 +106,15 @@ fn apply_model_spec(config: &mut io_runtime::config::Config, spec: &str) {
 
 // ── Agent construction ─────────────────────────────────────────────────────────
 
+/// "`session_start` hooks already fired" for the current session, shared by
+/// every agent built for it: `/model`, `/agent` and friends rebuild the agent
+/// but must not re-announce the session. `/new` resets it.
+fn session_gate() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    static GATE: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(Default::default).clone()
+}
+
 async fn build_agent(
     session: SessionChoice,
     agent_config: &io_agents::AgentConfig,
@@ -126,7 +135,8 @@ async fn build_agent(
     let project_context = io_runtime::load_project_context(&project_root);
     // Hooks come from the global config only (see `io_runtime::hooks`) and
     // run in the project root.
-    let hooks = io_runtime::Hooks::new(config.hooks.clone(), project_root.clone());
+    let hooks = io_runtime::Hooks::new(config.hooks.clone(), project_root.clone())
+        .with_session_gate(session_gate());
     let mut checker = io_runtime::sandbox::PermissionChecker::from(&config.permissions)
         .with_project_root(project_root)
         .with_interaction_mode(status::current_mode());
@@ -306,8 +316,9 @@ pub async fn run_single_shot(prompt: &str, model_override: Option<&str>) -> anyh
     let agent = build_agent(SessionChoice::New, &build_config, model_override).await?;
     agent.set_prompt_fn(std::sync::Arc::new(prompt_on_stdin));
     let (prompt, images) = resolve_at_mentions_with_images(prompt);
-    let response = agent.run_turn_with_images(&prompt, images).await?;
-    println!("{response}");
+    let response = agent.run_turn_with_images(&prompt, images).await;
+    agent.end_session("single_shot").await;
+    println!("{}", response?);
     Ok(())
 }
 
@@ -884,6 +895,8 @@ pub async fn run_interactive(
                 continue;
             }
             "/new" => {
+                agent.end_session("new").await;
+                session_gate().store(false, std::sync::atomic::Ordering::SeqCst);
                 match build_agent(SessionChoice::New, &current_agent, None).await {
                     Ok(new_agent) => {
                         agent = new_agent;
@@ -1240,6 +1253,7 @@ pub async fn run_interactive(
         )?;
     }
 
+    agent.end_session("exit").await;
     exit_tui()?;
     Ok(())
 }
