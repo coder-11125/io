@@ -1996,3 +1996,38 @@ async fn session_end_hooks_run_when_the_session_is_ended() {
     assert_eq!(payload["reason"], "exit");
     std::fs::remove_file(&marker).ok();
 }
+
+// ── Memory ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn nested_memory_files_surface_once_when_a_file_below_them_is_read() {
+    let root = std::env::temp_dir().join(format!("io-test-nested-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/CLAUDE.md"), "Always use snake_case here.").unwrap();
+    std::fs::write(root.join("src/a.rs"), "fn a() {}").unwrap();
+    std::fs::write(root.join("src/b.rs"), "fn b() {}").unwrap();
+    let read = |name: &str| serde_json::json!({"file_path": root.join("src").join(name).to_str().unwrap()});
+
+    let provider = MockProvider::new(vec![
+        tool_response("read", read("a.rs")),
+        tool_response("read", read("b.rs")),
+        text_response("done"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow"))
+        .with_nested_memory(root.clone(), Default::default());
+    agent.run_turn("look around").await.unwrap();
+
+    let requests = provider.recorded_requests();
+    let (first, _) = last_tool_result(&requests[1]);
+    assert!(
+        first.contains("<nested-instructions file=\"src/CLAUDE.md\">"),
+        "{first}"
+    );
+    assert!(first.contains("Always use snake_case here."));
+    let (second, _) = last_tool_result(&requests[2]);
+    assert!(
+        !second.contains("nested-instructions"),
+        "only surfaced once: {second}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}

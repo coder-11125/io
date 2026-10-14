@@ -3,6 +3,7 @@ pub mod command_safety;
 pub mod compact;
 pub mod config;
 pub mod hooks;
+pub mod instructions;
 pub mod mcp;
 pub mod memory;
 pub mod oauth;
@@ -28,23 +29,9 @@ pub use sandbox::InteractionMode;
 pub use tools::SpawnAgentTool;
 pub use types::{Session, SessionId};
 
-/// Read `AGENTS.md` and `CLAUDE.md` from the project root and return their
-/// contents as a `<project-context>` block. Returns `None` if neither exists.
+/// The `<project-context>` block for a session at `root` (see
+/// [`instructions`] for what is loaded). Returns `None` if there are no
+/// memory files.
 pub fn load_project_context(root: &std::path::Path) -> Option<String> {
-    let mut sections: Vec<String> = Vec::new();
-    for name in &["AGENTS.md", "CLAUDE.md"] {
-        if let Ok(content) = std::fs::read_to_string(root.join(name)) {
-            let trimmed = content.trim();
-            if !trimmed.is_empty() {
-                sections.push(format!("### {name}\n\n{trimmed}"));
-            }
-        }
-    }
-    if sections.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "<project-context>\n{}\n</project-context>",
-        sections.join("\n\n")
-    ))
+    instructions::load(root, root).0
 }

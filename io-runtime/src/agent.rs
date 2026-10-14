@@ -100,6 +100,14 @@ pub struct Agent {
     hooks: Hooks,
     /// Extended-thinking settings, adjustable mid-session (`/think`).
     thinking: Mutex<ThinkingConfig>,
+    /// Project root and the memory files already in context, so memory files
+    /// in subdirectories can be surfaced the first time a file there is used.
+    nested_memory: Mutex<
+        Option<(
+            std::path::PathBuf,
+            std::collections::HashSet<std::path::PathBuf>,
+        )>,
+    >,
 }
 
 /// Appended to the system prompt while plan mode is active.
@@ -157,7 +165,37 @@ impl Agent {
             pricing_override,
             hooks: Hooks::default(),
             thinking: Mutex::new(ThinkingConfig::default()),
+            nested_memory: Mutex::new(None),
         }
+    }
+
+    /// Surface `CLAUDE.md` / `AGENTS.md` files in subdirectories of `root` the
+    /// first time a tool touches a file below them. `loaded` holds the memory
+    /// files already in the context (see [`crate::instructions::loaded_set`]).
+    pub fn with_nested_memory(
+        self,
+        root: std::path::PathBuf,
+        loaded: std::collections::HashSet<std::path::PathBuf>,
+    ) -> Self {
+        *self.nested_memory.lock().unwrap() = Some((root, loaded));
+        self
+    }
+
+    /// Instructions from not-yet-loaded memory files covering `input`'s path.
+    fn nested_memory_for(&self, input: &serde_json::Value) -> String {
+        let Some(path) = input
+            .get("path")
+            .or_else(|| input.get("file_path"))
+            .and_then(|v| v.as_str())
+        else {
+            return String::new();
+        };
+        let mut guard = self.nested_memory.lock().unwrap();
+        let Some((root, loaded)) = guard.as_mut() else {
+            return String::new();
+        };
+        let found = crate::instructions::nested_for(root, std::path::Path::new(path), loaded);
+        crate::instructions::render_nested(&found)
     }
 
     /// Attach lifecycle hooks (see [`crate::hooks`]).
@@ -891,6 +929,14 @@ impl Agent {
                         data: i.data,
                     }));
                 let mut output = run.output;
+                if run.success
+                    && matches!(
+                        g.name.as_str(),
+                        "read" | "write" | "edit" | "multi_edit" | "notebook_edit"
+                    )
+                {
+                    output.push_str(&self.nested_memory_for(&g.input));
+                }
                 // post_tool_use feedback (formatter/linter output, etc.) is
                 // appended to what the model sees.
                 let feedback = self

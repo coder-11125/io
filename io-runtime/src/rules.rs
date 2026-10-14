@@ -215,7 +215,11 @@ impl RuleSet {
 
     fn path_matches(&self, rule: &Rule, input: &serde_json::Value) -> bool {
         let Some(spec) = &rule.spec else { return true };
-        let target = input.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+        let target = input
+            .get("path")
+            .or_else(|| input.get("file_path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(".");
         let root = self.root_dir();
         let Some(glob) = path_glob(spec, &root) else {
             return false;
@@ -527,6 +531,13 @@ mod tests {
         assert!(r.denies("write", &json!({"path": "/proj/secrets"})));
         assert!(!r.denies("read", &json!({"path": "src/main.rs"})));
         assert!(!r.denies("edit", &json!({"path": ".env"})));
+    }
+
+    #[test]
+    fn the_read_tools_file_path_argument_is_covered_too() {
+        let r = set(&[], &[], &["Read(./.env)"]);
+        assert!(r.denies("read", &json!({"file_path": "/proj/.env"})));
+        assert!(!r.denies("read", &json!({"file_path": "/proj/a.rs"})));
     }
 
     #[test]
