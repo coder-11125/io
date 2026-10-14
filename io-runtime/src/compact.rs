@@ -10,10 +10,13 @@ pub struct CompactResult {
     pub summary: String,
 }
 
+/// Summarize the session's turns into `session.summary` and clear them.
+/// `guidance` is extra instruction for the summary (from `pre_compact` hooks).
 pub async fn run(
     session: &Arc<Mutex<Session>>,
     provider: &Arc<dyn CompletionModel>,
     memory: &Arc<SessionStore>,
+    guidance: Option<&str>,
 ) -> anyhow::Result<CompactResult> {
     let (turns, existing_summary) = {
         let s = session.lock().await;
@@ -72,10 +75,15 @@ pub async fn run(
         ""
     };
 
+    let guidance_block = guidance
+        .map(|g| format!("Additional guidance for this summary:\n{g}\n\n"))
+        .unwrap_or_default();
+
     let prompt = format!(
         "You are summarizing a coding session between a user and an AI assistant.\n\
         Produce a dense, structured summary that preserves ALL context a reader \
         would need to continue this work without having seen the original conversation.\n\n\
+        {guidance_block}\
         {prior_summary_block}\
         Include:\n\
         - The overall goal / task being worked on\n\

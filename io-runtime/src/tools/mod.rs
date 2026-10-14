@@ -139,6 +139,29 @@ pub trait Tool: Send + Sync {
     fn set_cancel(&self, _cancel: Arc<AtomicBool>) {}
 }
 
+/// A tool shared between registries — e.g. an MCP tool backed by one live
+/// server connection but registered with every rebuilt agent.
+pub struct SharedTool(pub Arc<dyn Tool>);
+
+#[async_trait::async_trait]
+impl Tool for SharedTool {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+    fn input_schema(&self) -> serde_json::Value {
+        self.0.input_schema()
+    }
+    async fn execute(&self, input: ToolInput) -> ToolOutput {
+        self.0.execute(input).await
+    }
+    fn set_cancel(&self, cancel: Arc<AtomicBool>) {
+        self.0.set_cancel(cancel)
+    }
+}
+
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,

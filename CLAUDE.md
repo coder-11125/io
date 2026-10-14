@@ -13,6 +13,7 @@ This document provides comprehensive guidance for AI agents and developers worki
 - Edit safety: files must be read before they are modified, and edits are refused if the file changed on disk since
 - Vision input (`read` on images, `@image.png`, Ctrl+V clipboard paste) and extended thinking (`/think`, Alt+T, `think`/`ultrathink` keywords)
 - Built-in agent roles (`io-agents` crate): full agents (build, plan, debug, refactor) and restricted sub-agents (explore, review, test, security, docs, git, …)
+- Hooks (shell commands at eight lifecycle points) and an MCP client (stdio / streamable HTTP / SSE servers; their tools run as `mcp__<server>__<tool>`)
 - Full-screen TUI and single-shot modes
 - Permission sandboxing (allow/deny/prompt modes)
 - SQLite-backed session persistence
@@ -38,6 +39,7 @@ io/
 │       ├── status.rs          # Working mode + thinking state, status-row badge, /think handling
 │       ├── clipboard.rs       # Ctrl+V clipboard image paste, dropped image paths → @mentions
 │       ├── cost.rs            # /cost report
+│       ├── mcp_cmd.rs         # `io mcp …`, shared McpManager, project-server trust prompt
 │       ├── config_cmd.rs      # `io config …` and `io init` handlers
 │       ├── agent.rs           # Agent switching (/agent command)
 │       ├── connect.rs         # Interactive provider setup wizard
@@ -53,13 +55,17 @@ io/
 ├── io-runtime/                # Core engine (library crate)
 │   ├── Cargo.toml
 │   ├── tests/
-│   │   └── agent_loop.rs      # Integration tests against a scripted mock provider
+│   │   ├── agent_loop.rs      # Integration tests against a scripted mock provider
+│   │   ├── mcp.rs             # MCP integration tests against tests/fixtures/mock_mcp_server.py (needs python3)
+│   │   └── fixtures/
 │   └── src/
 │       ├── lib.rs             # Public API re-exports + load_project_context()
 │       ├── agent.rs           # Agent loop (LLM + tool execution)
 │       ├── compact.rs         # /compact + auto-compact summarization
 │       ├── rewind.rs          # /rewind — restore files to an earlier point in the chat
 │       ├── hooks.rs           # Lifecycle hooks: user shell commands around tool calls, prompts, turns
+│       ├── mcp/               # MCP client: config.rs (files, trust), transport.rs (stdio/HTTP/SSE JSON-RPC),
+│       │                      #   sse.rs, client.rs (McpClient), tool.rs (McpTool), mod.rs (McpManager)
 │       ├── config.rs          # Configuration schema, loading, provider lookups
 │       ├── pricing.rs         # Per-model cost tables
 │       ├── types.rs           # Core data types (Session, Turn, etc.)
@@ -350,29 +356,76 @@ types are sniffed by magic number (PNG/JPEG/GIF/WebP), limit 5 MB.
 
 **Hooks** (`hooks.rs`; attached with `Agent::with_hooks`, built in
 `build_agent` from `config.hooks`): user-configured shell commands run with
-`sh -c` in the project root at four points — `pre_tool_use`,
-`post_tool_use`, `user_prompt_submit`, `stop`. Each gets a JSON description
+`sh -c` in the project root at eight points — `pre_tool_use`,
+`post_tool_use`, `user_prompt_submit`, `stop`, `session_start`,
+`session_end`, `notification` and `pre_compact`. Each gets a JSON description
 of the event on stdin (plus `IO_HOOK_EVENT` / `IO_TOOL_NAME`). Exit codes:
 `0` = success (stdout becomes extra prompt context for `user_prompt_submit`
-and extra tool-result text for `post_tool_use`), `2` = block (stderr is the
-reason), anything else / spawn failure / timeout = logged and ignored, so a
-crashing guard fails *open*. Properties worth keeping:
-- `pre_tool_use` runs **before** the permission check and can only veto; a
-  hook can never grant permission the checker withholds.
+and `session_start`, extra tool-result text for `post_tool_use`, summary
+guidance for `pre_compact`), `2` = block (stderr is the reason; for
+`pre_compact` it cancels the compaction), anything else / spawn failure /
+timeout = logged and ignored, so a crashing guard fails *open*. A hook may
+instead print JSON: `decision` (`block`/`deny` = veto, `ask` = force a
+permission prompt, `allow` = no-op), `reason`, `additionalContext`,
+`continue: false` + `stopReason`, or `hookSpecificOutput.permissionDecision`
+(`interpret()` in `hooks.rs`). Matchers join tool names with `|` and accept
+`*` globs (`mcp__github__*`). Properties worth keeping:
+- `pre_tool_use` runs **before** the permission check and can only restrict
+  (`PreToolOutcome { ask, context }`); a hook can never grant permission the
+  checker withholds.
 - `post_tool_use` runs only for calls that actually executed (not for
   hook-blocked or permission-denied ones); its feedback is appended to the
   tool output the model sees and to the saved `ToolCallRecord`.
 - A blocked prompt returns the typed `agent::PromptBlocked` error before
   anything is sent or saved; hook-supplied prompt context rides on that
   request only — the saved turn keeps the user's text as typed.
+- `session_start` fires once per session (a gate shared by every agent built
+  for it — `tui.rs::session_gate()` — so `/model` and `/agent` rebuilds don't
+  re-fire it; `/new` resets it); `session_end` fires from `Agent::end_session`
+  on `/new`, exit and single-shot completion. `notification` is
+  fire-and-forget, spawned when a permission prompt is shown.
 - `SpawnAgentTool::with_hooks` gives sub-agents the parent's tool hooks
   (`Hooks::for_sub_agent`: `pre`/`post_tool_use` only), so delegating can't
-  sidestep a guard. Prompt/stop hooks are not inherited.
+  sidestep a guard. The other hooks are not inherited.
 - Hooks are read from the **global** `~/.io/config.toml` only. Project
   config is deliberately not consulted, so a cloned repo can't plant a
   command that runs on the user's machine. Output per stream is capped at
   16 KB; default timeout 30 s (`timeout_ms` per hook), and a timed-out hook's
   whole process group is killed.
+
+**MCP** (`io-runtime/src/mcp/`; `io/src/mcp_cmd.rs` owns the process-wide
+`McpManager`): servers are read from `~/.io/mcp.json` (user) and `.mcp.json`
+in the project root, in the Claude-compatible `mcpServers` shape
+(`type`: stdio/http/sse, inferred from `command`/`url`; `${VAR}` and
+`${VAR:-default}` expanded in commands, args, env, URLs, headers).
+`McpManager::start` connects servers concurrently (initialize with protocol
+`2025-03-26`, then `tools/list`); a server that fails is reported and skipped,
+never fatal. Transports (`transport.rs`) all speak JSON-RPC through a
+`Router` that matches responses to requests by id: stdio (child process,
+stderr kept for error messages), streamable HTTP (JSON or SSE replies,
+`Mcp-Session-Id`), and the legacy SSE transport. Tools are exposed as
+`mcp__<server>__<tool>` (≤ 64 chars; server names are validated and may not
+contain `__`); `build_agent` registers the manager's tools in every agent it
+builds, so `/model`/`/agent` rebuilds reuse live connections (`SharedTool`).
+Results are text (images/resources summarized) capped at `MAX_RESULT_BYTES`.
+Startup / per-call timeouts: `IO_MCP_STARTUP_TIMEOUT_MS` (20 s),
+`IO_MCP_TOOL_TIMEOUT_MS` (60 s).
+- **Trust.** `.mcp.json` is untrusted input that can name any command, so
+  project-scope servers launch only after approval, remembered per project in
+  `~/.io/mcp_trust.json` keyed by `name:fingerprint` (changing a definition
+  asks again). `run_interactive` asks on plain stdin *before* `enter_tui`;
+  `run_single_shot`, `io mcp list` and `/mcp reconnect` skip unapproved
+  servers with a note. User-scope servers are the user's own config.
+- **Permissions.** MCP tools default to *Prompt*. The existing
+  `permissions.allowed_commands` / `denied_commands` lists accept `mcp__server`,
+  `mcp__server__*` or an exact tool name (`sandbox::mcp_rule_covers`); deny
+  wins. In plan mode only tools whose server set `readOnlyHint` run
+  (advisory: `PermissionChecker::mark_read_only`, called from `build_agent`).
+  Hooks (matcher globs) and `/rewind` treat them like any other tool.
+- **CLI.** `io mcp add [--scope user|project] [-t transport] [-e K=V]
+  [-H "K: V"] <name> <command…|url>` (options before the name), `list`
+  (connects and shows status), `get` (secrets masked), `remove`. Files are
+  written `0600`. `/mcp` lists servers; `/mcp reconnect` restarts them.
 
 **Agent Loop**:
 1. Build message history from session (system prompt, then optional project-context synthetic message pair, then prior turns, then current user input). `user_prompt_submit` hooks run first and may reject the prompt or add context
@@ -381,7 +434,7 @@ crashing guard fails *open*. Properties worth keeping:
 4. Run `pre_tool_use` hooks, check permissions, execute permitted tools, run `post_tool_use` hooks
 5. Feed tool results back to LLM
 6. Repeat until no more tool calls
-7. Save turn to session, then run `stop` hooks
+7. Save turn to session, then run `stop` hooks (`session_start` runs before step 1 of a session's first turn; `session_end` when the session is left)
 
 ### Provider System (io-runtime/src/provider/)
 
@@ -757,6 +810,8 @@ command = "git status --short"   # stdout is added to the prompt as context; exi
 
 [[hooks.stop]]
 command = "notify-send 'io finished'"
+
+# Also: session_start, session_end, notification, pre_compact (same shape).
 ```
 
 ### Theme System (io/src/render.rs + io/src/theme.rs)
@@ -823,9 +878,10 @@ struct Cli {
   `permissions.allow_network_fetch`, `permissions.allowed_commands`,
   `permissions.denied_commands`, `thinking.enabled`, `thinking.budget_tokens`,
   `thinking.keywords`, `theme`
+- `io mcp {add|list|get|remove}` - MCP server management (see **MCP** above)
 - `io init` - Initialize project-level config
 
-**TUI slash commands**: `/help`, `/new`, `/agent`, `/connect`, `/model`, `/theme`, `/cost`, `/compact`, `/rewind` (also triggered by pressing Esc twice within 500 ms at the idle prompt), `/plan` (toggle plan mode), `/think [on|off|low|medium|high|<tokens>]` (persists to `[thinking]`), `/exit` (also `/quit`, `/q`).
+**TUI slash commands**: `/help`, `/new`, `/agent`, `/connect`, `/model`, `/theme`, `/cost`, `/compact`, `/mcp` (`/mcp reconnect`), `/rewind` (also triggered by pressing Esc twice within 500 ms at the idle prompt), `/plan` (toggle plan mode), `/think [on|off|low|medium|high|<tokens>]` (persists to `[thinking]`), `/exit` (also `/quit`, `/q`).
 Key bindings: Shift+Tab cycles the working mode, Alt+T toggles extended thinking,
 Ctrl+V attaches a clipboard image (`pngpaste`, `wl-paste` or `xclip`), Tab at the
 empty prompt cycles agents. A pasted path to an image file (drag-and-drop) is
@@ -955,8 +1011,9 @@ Message history is built inline in `Agent::run_turn_inner`:
 
 ## Testing
 
-The project has 379 unit tests (345 in `io-runtime`, 25 in `io`, 8 in `io-tui`, 1 in
-`io-agents`) plus 44 integration tests (`io-runtime/tests/agent_loop.rs` — full agent-loop runs
+The project has 434 unit tests (393 in `io-runtime`, 31 in `io`, 9 in `io-tui`, 1 in
+`io-agents`) plus 66 integration tests (14 in `io-runtime/tests/mcp.rs`, described below, and 52 in
+`io-runtime/tests/agent_loop.rs` — full agent-loop runs
 against a scripted mock provider, covering tool execution, permission
 prompting/denial, streaming events, usage tracking, session resumption,
 sub-agent permission inheritance, partial-progress persistence on
@@ -966,7 +1023,7 @@ counting toward the compaction threshold — a rewind that restores a file and
 truncates the session, and hooks: pre-tool veto that permissions can't
 override, fail-open on a crashing hook, post-tool feedback, prompt rejection
 and context injection, stop-hook firing only on success, and sub-agents
-inheriting tool hooks; and for the Phase 1 features: edit-before-read
+inheriting tool hooks, plus the Phase 2 hooks (session_start once per session with context, session_end, notification on permission prompts, pre_compact cancel/guidance, JSON `ask`/`block` decisions, `allow` being a no-op); and for the Phase 1 features: edit-before-read
 and stale-file refusals, multi_edit rewind, todo_write, the plan-mode flow —
 edits blocked until the plan is approved, approve-once vs accept-edits, rejection,
 read-only research, exit_plan_mode outside plan mode — accept-edits mode, tool-returned
@@ -990,6 +1047,11 @@ Run with `cargo test`.
 | `provider/gemini.rs` | system message sent as `systemInstruction`; `cachedContentTokenCount` split out of the prompt count (blocking + streaming, absent = uncached) |
 | `provider/openai.rs` | `cached_tokens` split out of `prompt_tokens` (blocking + streaming); missing/null/empty details = uncached |
 | `hooks.rs` | matcher, TOML parsing, exit-2 block (stderr reason), fail-open on other exits/timeouts, JSON stdin + env, cwd, post/prompt feedback, output cap, large-stdin no-deadlock, sub-agent hook subset |
+| `hooks.rs` (events) | session gate (fires once, reset), session_end, notify, pre_compact exit-2/guidance, JSON decisions (`ask`, `deny`, `allow`, `continue:false`), `*` glob matchers incl. `mcp__server__*`, config merge |
+| `mcp/*` | config parsing + inference, `${VAR}` expansion, name validation, 0600 writes, trust store (per project + fingerprint), SSE parser, JSON-RPC router, result parsing + size cap, schema normalisation, trust partition |
+| `io-runtime/tests/mcp.rs` | against a Python mock MCP server (needs `python3`): stdio, env, HTTP JSON/SSE replies, headers + 401, legacy SSE, multi-server, slow-tool timeout, server crash, startup failures with stderr, agent sees tools, allow/deny rules, plan mode honouring `readOnlyHint` |
+| `io/src/mcp_cmd.rs` | `--env`/`--header` parsing, building stdio/http/sse configs from CLI args, rejecting mismatched options, secret masking |
+| `sandbox.rs` (MCP) | `mcp__server`, `mcp__server__*` and exact rules; deny wins; default prompt; plan mode + `readOnlyHint` |
 | `config.rs` | default config, roundtrip serialization, schema upgrade (incl. `prompt_cache` / `[hooks]` / `[thinking]`), hooks + prompt_cache + thinking parsing |
 | `tools/file_state.rs` | unread / unchanged / stale / re-recorded / forgotten paths |
 | `tools/{edit,write,multi_edit,notebook}.rs` | read-before-edit and stale-file refusals, `replace_all`, all-or-nothing multi-edit, notebook replace/insert/delete by id and index, Jupyter-style serialization |

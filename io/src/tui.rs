@@ -8,7 +8,7 @@ use crate::input::{
 use crate::stream::{
     blink_and_print, push_line, LineBuf, PendingPerm, PendingPermission, SCROLL_STEP,
 };
-use crate::{agent, connect, login, model, status};
+use crate::{agent, connect, login, mcp_cmd, model, status};
 use io_runtime::types::SessionId;
 use io_runtime::PermissionReply;
 use io_tui::picker;
@@ -61,7 +61,7 @@ async fn login_flow() -> anyhow::Result<String> {
 
 // ── Project root detection ─────────────────────────────────────────────────────
 
-fn detect_project_root() -> std::path::PathBuf {
+pub(crate) fn detect_project_root() -> std::path::PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut dir = cwd.clone();
     loop {
@@ -106,6 +106,15 @@ fn apply_model_spec(config: &mut io_runtime::config::Config, spec: &str) {
 
 // ── Agent construction ─────────────────────────────────────────────────────────
 
+/// "`session_start` hooks already fired" for the current session, shared by
+/// every agent built for it: `/model`, `/agent` and friends rebuild the agent
+/// but must not re-announce the session. `/new` resets it.
+fn session_gate() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    static GATE: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+        std::sync::OnceLock::new();
+    GATE.get_or_init(Default::default).clone()
+}
+
 async fn build_agent(
     session: SessionChoice,
     agent_config: &io_agents::AgentConfig,
@@ -126,7 +135,8 @@ async fn build_agent(
     let project_context = io_runtime::load_project_context(&project_root);
     // Hooks come from the global config only (see `io_runtime::hooks`) and
     // run in the project root.
-    let hooks = io_runtime::Hooks::new(config.hooks.clone(), project_root.clone());
+    let hooks = io_runtime::Hooks::new(config.hooks.clone(), project_root.clone())
+        .with_session_gate(session_gate());
     let mut checker = io_runtime::sandbox::PermissionChecker::from(&config.permissions)
         .with_project_root(project_root)
         .with_interaction_mode(status::current_mode());
@@ -159,6 +169,11 @@ async fn build_agent(
     )
     .with_hooks(&hooks);
     tools.register(Box::new(spawn_tool));
+    let mcp = mcp_cmd::manager();
+    for tool in mcp.tools() {
+        tools.register(tool);
+    }
+    permissions.mark_read_only(&mcp.read_only_tool_names());
 
     status::update_badge(status::current_mode(), &config.thinking);
 
@@ -302,12 +317,16 @@ pub async fn run_single_shot(prompt: &str, model_override: Option<&str>) -> anyh
         );
     }
 
+    for note in mcp_cmd::start(false, &detect_project_root()).await {
+        eprintln!("{note}");
+    }
     let build_config = io_agents::builtin::by_id("build").expect("build agent must exist");
     let agent = build_agent(SessionChoice::New, &build_config, model_override).await?;
     agent.set_prompt_fn(std::sync::Arc::new(prompt_on_stdin));
     let (prompt, images) = resolve_at_mentions_with_images(prompt);
-    let response = agent.run_turn_with_images(&prompt, images).await?;
-    println!("{response}");
+    let response = agent.run_turn_with_images(&prompt, images).await;
+    agent.end_session("single_shot").await;
+    println!("{}", response?);
     Ok(())
 }
 
@@ -343,6 +362,11 @@ pub async fn run_interactive(
             .yellow()
         );
         println!();
+    }
+
+    // Before the TUI takes the screen: project servers may need a y/n.
+    for note in mcp_cmd::start(true, &detect_project_root()).await {
+        println!("{note}");
     }
 
     let mut current_agent = io_agents::builtin::by_id("build").expect("build agent must exist");
@@ -445,8 +469,7 @@ pub async fn run_interactive(
         match input.as_str() {
             "/exit" | "/quit" | "/q" => break,
             "/help" => {
-                clear_rows_above(0)?;
-                let help_lines = [
+                print_info_lines(&[
                     "Commands:",
                     "  /exit, /quit   Exit",
                     "  /help          Show this help",
@@ -460,25 +483,14 @@ pub async fn run_interactive(
                     "  /cost          Show API cost summary for current session",
                     "  /context       Fetch real context window, pricing, and tool support",
                     "  /compact       Summarize and compress conversation history",
+                    "  /mcp           List MCP servers (/mcp reconnect restarts them)",
                     "  /rewind        Restore files to an earlier point in the chat (or Esc Esc)",
                     "  /plan          Enter or leave plan mode (read-only research, then approve a plan)",
                     "  /think [x]     Extended thinking: on|off|low|medium|high|<tokens> (or Alt+T)",
                     "  !<cmd>         Run a shell command",
                     "  Shift+Tab      Cycle mode: default → accept edits → plan",
                     "  Ctrl+V         Attach an image from the clipboard (or @image.png)",
-                ];
-                let (_, h) = crossterm::terminal::size()?;
-                let start_row = h.saturating_sub(PROMPT_BAR_HEIGHT + 1 + help_lines.len() as u16);
-                for (i, line) in help_lines.iter().enumerate() {
-                    use crossterm::{cursor, execute, style::Print, terminal};
-                    execute!(
-                        std::io::stdout(),
-                        cursor::MoveTo(0, start_row + i as u16),
-                        terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
-                        Print(line),
-                    )?;
-                }
-                std::io::stdout().flush()?;
+                ])?;
                 if from_splash {
                     is_splash = true;
                 }
@@ -884,6 +896,8 @@ pub async fn run_interactive(
                 continue;
             }
             "/new" => {
+                agent.end_session("new").await;
+                session_gate().store(false, std::sync::atomic::Ordering::SeqCst);
                 match build_agent(SessionChoice::New, &current_agent, None).await {
                     Ok(new_agent) => {
                         agent = new_agent;
@@ -968,6 +982,27 @@ pub async fn run_interactive(
                             is_splash = true;
                         }
                     }
+                }
+                continue;
+            }
+            _ if input == "/mcp" || input == "/mcp reconnect" => {
+                let mut lines = Vec::new();
+                if input == "/mcp reconnect" {
+                    lines.extend(mcp_cmd::start(false, &detect_project_root()).await);
+                    let sid = agent.session_id().await;
+                    match build_agent(SessionChoice::Existing(sid), &current_agent, None).await {
+                        Ok(new_agent) => agent = new_agent,
+                        Err(e) => lines.push(format!("error reloading agent: {e}")),
+                    }
+                }
+                let states = mcp_cmd::manager().states().to_vec();
+                if states.is_empty() {
+                    lines.push("No MCP servers configured — add one with `io mcp add`.".into());
+                }
+                lines.extend(mcp_cmd::state_lines(&states));
+                print_info_lines(&lines)?;
+                if from_splash {
+                    is_splash = true;
                 }
                 continue;
             }
@@ -1240,7 +1275,31 @@ pub async fn run_interactive(
         )?;
     }
 
+    agent.end_session("exit").await;
     exit_tui()?;
+    Ok(())
+}
+
+/// Show `lines` as a block just above the prompt bar (used by /help, /mcp).
+fn print_info_lines<S: AsRef<str>>(lines: &[S]) -> anyhow::Result<()> {
+    use crossterm::{cursor, execute, style::Print, terminal};
+    clear_rows_above(0)?;
+    let (w, h) = terminal::size()?;
+    let start_row = h.saturating_sub(PROMPT_BAR_HEIGHT + 1 + lines.len() as u16);
+    for (i, line) in lines.iter().enumerate() {
+        let line: String = line
+            .as_ref()
+            .chars()
+            .take(w.saturating_sub(1) as usize)
+            .collect();
+        execute!(
+            std::io::stdout(),
+            cursor::MoveTo(0, start_row + i as u16),
+            terminal::Clear(terminal::ClearType::CurrentLine),
+            Print(line),
+        )?;
+    }
+    std::io::stdout().flush()?;
     Ok(())
 }
 

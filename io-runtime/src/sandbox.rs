@@ -63,6 +63,27 @@ pub fn is_file_write_tool(name: &str) -> bool {
     FILE_WRITE_TOOLS.contains(&name)
 }
 
+/// Whether an allow/deny `rule` covers MCP tool `tool` (`mcp__server__name`):
+/// the exact name, `mcp__server` for every tool of a server, or
+/// `mcp__server__*`.
+fn mcp_rule_covers(rule: &str, tool: &str) -> bool {
+    if rule == tool {
+        return true;
+    }
+    let Some(rest) = tool.strip_prefix("mcp__") else {
+        return false;
+    };
+    let Some((server, _)) = rest.split_once("__") else {
+        return false;
+    };
+    let server_rule = format!("mcp__{server}");
+    rule == server_rule || rule.strip_suffix("__*") == Some(server_rule.as_str())
+}
+
+fn is_mcp_tool(name: &str) -> bool {
+    name.starts_with("mcp__")
+}
+
 /// Tools that reach the network. They share the `allow_network_fetch` knob.
 fn is_network_tool(name: &str) -> bool {
     matches!(name, "fetch" | "web_search")
@@ -151,6 +172,9 @@ pub struct PermissionChecker {
     /// Current [`InteractionMode`], switchable at any time (Shift+Tab, or the
     /// model leaving plan mode); shared by sub-agents through the checker.
     interaction: AtomicU8,
+    /// MCP tools their servers marked read-only (`readOnlyHint`). Advisory:
+    /// the only privilege it buys is being usable in plan mode.
+    read_only_mcp: std::sync::Mutex<HashSet<String>>,
 }
 
 impl PermissionChecker {
@@ -171,7 +195,18 @@ impl PermissionChecker {
             session_allow: std::sync::Mutex::new(HashSet::new()),
             project_root: None,
             interaction: AtomicU8::new(InteractionMode::Default.to_u8()),
+            read_only_mcp: std::sync::Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Record which MCP tools their servers declared read-only, so plan mode
+    /// can allow them. Everything else from MCP stays blocked in plan mode:
+    /// io can't tell what an arbitrary external tool does.
+    pub fn mark_read_only(&self, tools: &[String]) {
+        self.read_only_mcp
+            .lock()
+            .unwrap()
+            .extend(tools.iter().cloned());
     }
 
     pub fn interaction_mode(&self) -> InteractionMode {
@@ -223,6 +258,12 @@ impl PermissionChecker {
                     _ => Some(PermissionLevel::Deny),
                 },
             },
+            // io can't tell what an arbitrary external tool does, so only
+            // those its server declared read-only run while planning.
+            name if is_mcp_tool(name) => {
+                let read_only = self.read_only_mcp.lock().unwrap().contains(name);
+                (!read_only).then_some(PermissionLevel::Deny)
+            }
             _ => None,
         }
     }
@@ -285,10 +326,15 @@ impl PermissionChecker {
                         }
                     }
                 }
-                if self.denylist.contains(tool_name) {
+                let listed = |list: &HashSet<String>| {
+                    list.contains(tool_name)
+                        || (is_mcp_tool(tool_name)
+                            && list.iter().any(|rule| mcp_rule_covers(rule, tool_name)))
+                };
+                if listed(&self.denylist) {
                     return PermissionLevel::Deny;
                 }
-                if self.allowlist.contains(tool_name) {
+                if listed(&self.allowlist) {
                     return PermissionLevel::Allow;
                 }
                 // In agent-decides mode, spawning a sub-agent is delegated to
@@ -1790,6 +1836,108 @@ mod tests {
             PermissionChecker::new("prompt")
                 .with_network_fetch(true)
                 .decide_tool("web_search", &call),
+            PermissionLevel::Prompt
+        );
+    }
+
+    // ── MCP tools ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn mcp_rules_cover_a_tool_a_server_or_a_server_wildcard() {
+        let tool = "mcp__github__search_issues";
+        for rule in [
+            "mcp__github__search_issues",
+            "mcp__github",
+            "mcp__github__*",
+        ] {
+            assert!(mcp_rule_covers(rule, tool), "{rule}");
+        }
+        for rule in [
+            "mcp__git",
+            "mcp__github__search",
+            "mcp__gitlab",
+            "mcp__gitlab__*",
+            "github",
+            "mcp__github__other",
+            "*",
+        ] {
+            assert!(!mcp_rule_covers(rule, tool), "{rule}");
+        }
+        assert!(!mcp_rule_covers("mcp__x", "bash"));
+        assert!(mcp_rule_covers("mcp__x", "mcp__x"));
+    }
+
+    #[test]
+    fn mcp_tools_prompt_unless_a_rule_allows_them() {
+        let call = serde_json::json!({"q": "x"});
+        for mode in ["prompt", "agent"] {
+            assert_eq!(
+                PermissionChecker::new(mode).decide_tool("mcp__gh__search", &call),
+                PermissionLevel::Prompt,
+                "{mode}"
+            );
+        }
+        let mut checker = PermissionChecker::new("agent");
+        checker.add_allow("mcp__gh".to_string());
+        assert_eq!(
+            checker.decide_tool("mcp__gh__search", &call),
+            PermissionLevel::Allow
+        );
+        assert_eq!(
+            checker.decide_tool("mcp__other__search", &call),
+            PermissionLevel::Prompt,
+            "the rule is per server"
+        );
+        // Deny beats allow, at any granularity.
+        checker.add_deny("mcp__gh__search".to_string());
+        assert_eq!(
+            checker.decide_tool("mcp__gh__search", &call),
+            PermissionLevel::Deny
+        );
+        assert_eq!(
+            checker.decide_tool("mcp__gh__list", &call),
+            PermissionLevel::Allow
+        );
+        checker.add_deny("mcp__gh__*".to_string());
+        assert_eq!(
+            checker.decide_tool("mcp__gh__list", &call),
+            PermissionLevel::Deny
+        );
+    }
+
+    #[test]
+    fn mcp_session_approval_is_per_tool() {
+        let checker = PermissionChecker::new("prompt");
+        let call = serde_json::json!({});
+        checker.allow_for_session("mcp__gh__search", None);
+        assert_eq!(
+            checker.decide_tool("mcp__gh__search", &call),
+            PermissionLevel::Allow
+        );
+        assert_eq!(
+            checker.decide_tool("mcp__gh__delete", &call),
+            PermissionLevel::Prompt
+        );
+    }
+
+    #[test]
+    fn plan_mode_allows_only_mcp_tools_marked_read_only() {
+        let checker = PermissionChecker::new("allow").with_interaction_mode(InteractionMode::Plan);
+        checker.mark_read_only(&["mcp__gh__search".to_string()]);
+        let call = serde_json::json!({});
+        assert_eq!(
+            checker.decide_tool("mcp__gh__search", &call),
+            PermissionLevel::Allow
+        );
+        assert_eq!(
+            checker.decide_tool("mcp__gh__create_issue", &call),
+            PermissionLevel::Deny
+        );
+        // Outside plan mode the hint changes nothing.
+        let normal = PermissionChecker::new("agent");
+        normal.mark_read_only(&["mcp__gh__search".to_string()]);
+        assert_eq!(
+            normal.decide_tool("mcp__gh__search", &call),
             PermissionLevel::Prompt
         );
     }

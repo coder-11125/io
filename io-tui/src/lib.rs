@@ -27,6 +27,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Enter plan mode: read-only research, then a plan to approve (or Shift+Tab)",
     ),
     (
+        "/mcp",
+        "Show MCP servers and their status (/mcp reconnect to restart them)",
+    ),
+    (
         "/think",
         "Extended thinking: /think [on|off|low|medium|high|<tokens>] (or Alt+T)",
     ),

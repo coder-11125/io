@@ -811,6 +811,7 @@ pub fn tool_detail(name: &str, input: &serde_json::Value) -> String {
                 .map_or(0, Vec::len);
             format!("{n} item{}", if n == 1 { "" } else { "s" })
         }
+        n if n.starts_with("mcp__") => mcp_detail(name, input),
         "spawn_agent" => {
             let agent_id = input.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
             let task = input.get("task").and_then(|v| v.as_str()).unwrap_or("");
@@ -827,6 +828,33 @@ pub fn tool_detail(name: &str, input: &serde_json::Value) -> String {
             format!("[{agent_name}]  {task_preview}")
         }
         _ => String::new(),
+    }
+}
+
+/// `server · tool  key=value …` for an MCP tool call, with long values cut.
+fn mcp_detail(name: &str, input: &serde_json::Value) -> String {
+    let rest = name.strip_prefix("mcp__").unwrap_or(name);
+    let (server, tool) = rest.split_once("__").unwrap_or((rest, ""));
+    let args = input
+        .as_object()
+        .map(|m| {
+            m.iter()
+                .map(|(k, v)| {
+                    let value = match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    format!("{k}={}", preview(&value, 40))
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    let head = format!("{server} · {tool}");
+    if args.is_empty() {
+        head
+    } else {
+        format!("{head}  {}", preview(&args, 80))
     }
 }
 
@@ -946,6 +974,7 @@ pub fn render_tool_done(name: &str, output: &str, success: bool, theme: &Theme) 
     match name {
         "write" | "edit" | "multi_edit" | "notebook_edit" => render_diff(output, theme),
         "bash" | "read" | "grep" | "glob" | "web_search" => render_text_output(output),
+        n if n.starts_with("mcp__") => render_text_output(output),
         _ => {}
     }
 }
@@ -1485,6 +1514,21 @@ mod tests {
             tool_detail("fetch", &serde_json::json!({"url": "https://x.dev"})),
             "https://x.dev"
         );
+    }
+
+    #[test]
+    fn mcp_calls_show_the_server_tool_and_a_trimmed_argument_list() {
+        let input = serde_json::json!({"query": "rust async", "limit": 5});
+        assert_eq!(
+            tool_detail("mcp__github__search", &input),
+            "github · search  limit=5 query=rust async"
+        );
+        assert_eq!(
+            tool_detail("mcp__fs__list", &serde_json::json!({})),
+            "fs · list"
+        );
+        let long = serde_json::json!({"text": "x".repeat(300)});
+        assert!(tool_detail("mcp__a__b", &long).chars().count() < 120);
     }
 
     #[test]

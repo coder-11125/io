@@ -1781,3 +1781,218 @@ async fn a_model_without_thinking_support_gets_no_budget_and_no_extra_tokens() {
     assert_eq!(req.thinking, None);
     assert_eq!(req.max_tokens, Some(1024));
 }
+
+// ── Expanded hooks ────────────────────────────────────────────────────────────
+
+fn last_user_text(request: &CompletionRequest) -> String {
+    request
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, io_runtime::provider::Role::User))
+        .map(|m| {
+            m.content
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_json_ask_decision_forces_a_prompt_even_when_everything_is_allowed() {
+    let file = temp_path("io-test-ask", ".txt");
+    std::fs::write(&file, "contents").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "read",
+            serde_json::json!({"file_path": file.to_str().unwrap()}),
+        ),
+        text_response("done"),
+    ]);
+    let agent =
+        make_agent(provider, PermissionChecker::new("allow")).with_hooks(hooks(HooksConfig {
+            pre_tool_use: vec![hook(Some("read"), r#"printf '{"decision":"ask"}'"#)],
+            ..HooksConfig::default()
+        }));
+    let prompts = Arc::new(AtomicU32::new(0));
+    let counter = prompts.clone();
+    agent.set_prompt_fn(Arc::new(move |_, _| {
+        counter.fetch_add(1, Ordering::Relaxed);
+        PermissionReply::AllowOnce
+    }));
+    agent.run_turn("read it").await.unwrap();
+    assert_eq!(prompts.load(Ordering::Relaxed), 1);
+    std::fs::remove_file(&file).ok();
+}
+
+#[tokio::test]
+async fn a_json_ask_decision_cannot_be_used_to_skip_a_denial() {
+    // Hooks only add restrictions: "allow" must not turn a refusal into a run.
+    let target = temp_path("io-test-allow-json", ".txt");
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "write",
+            serde_json::json!({"path": target.to_str().unwrap(), "content": "x"}),
+        ),
+        text_response("done"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("prompt")).with_hooks(hooks(
+        HooksConfig {
+            pre_tool_use: vec![hook(None, r#"printf '{"decision":"allow"}'"#)],
+            ..HooksConfig::default()
+        },
+    ));
+    agent.run_turn("write").await.unwrap();
+    assert!(!target.exists());
+    let (result, is_error) = last_tool_result(&provider.recorded_requests()[1]);
+    assert_eq!(is_error, Some(true));
+    assert!(result.contains("no prompt is available"), "{result}");
+}
+
+#[tokio::test]
+async fn pre_tool_use_context_is_appended_to_the_tool_result() {
+    let file = temp_path("io-test-ctx", ".txt");
+    std::fs::write(&file, "file body").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "read",
+            serde_json::json!({"file_path": file.to_str().unwrap()}),
+        ),
+        text_response("done"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow")).with_hooks(hooks(
+        HooksConfig {
+            pre_tool_use: vec![hook(
+                None,
+                r#"printf '{"additionalContext":"CI is red on main"}'"#,
+            )],
+            ..HooksConfig::default()
+        },
+    ));
+    agent.run_turn("read it").await.unwrap();
+    let (result, _) = last_tool_result(&provider.recorded_requests()[1]);
+    assert!(result.contains("file body"));
+    assert!(
+        result.contains("[pre_tool_use hook]\nCI is red on main"),
+        "{result}"
+    );
+    std::fs::remove_file(&file).ok();
+}
+
+#[tokio::test]
+async fn session_start_context_reaches_only_the_first_prompt() {
+    let provider = MockProvider::new(vec![text_response("one"), text_response("two")]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow")).with_hooks(hooks(
+        HooksConfig {
+            session_start: vec![hook(None, "echo 'branch: feature/x'")],
+            ..HooksConfig::default()
+        },
+    ));
+    agent.run_turn("first").await.unwrap();
+    agent.run_turn("second").await.unwrap();
+    let requests = provider.recorded_requests();
+    assert!(last_user_text(&requests[0]).contains("branch: feature/x"));
+    // The saved history keeps the prompt as typed…
+    assert!(!last_user_text(&requests[1]).contains("branch: feature/x"));
+    // …and the second turn replays "first" without the injected context.
+    let replayed: String = requests[1]
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(!replayed.contains("branch: feature/x"));
+}
+
+#[tokio::test]
+async fn a_pre_compact_hook_can_cancel_a_manual_compaction() {
+    let provider = MockProvider::new(vec![text_response("answer")]);
+    let agent =
+        make_agent(provider, PermissionChecker::new("allow")).with_hooks(hooks(HooksConfig {
+            pre_compact: vec![hook(None, "echo 'keep the full history' >&2; exit 2")],
+            ..HooksConfig::default()
+        }));
+    agent.run_turn("hello").await.unwrap();
+    let err = match agent.compact().await {
+        Ok(_) => panic!("the hook should cancel compaction"),
+        Err(e) => e,
+    };
+    assert!(err.to_string().contains("keep the full history"), "{err}");
+    assert_eq!(agent.session_turns().await.len(), 1, "history untouched");
+}
+
+#[tokio::test]
+async fn pre_compact_guidance_is_added_to_the_summarization_prompt() {
+    let provider = MockProvider::new(vec![text_response("answer"), text_response("the summary")]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow")).with_hooks(hooks(
+        HooksConfig {
+            pre_compact: vec![hook(Some("manual"), "echo 'always keep the TODO list'")],
+            ..HooksConfig::default()
+        },
+    ));
+    agent.run_turn("hello").await.unwrap();
+    agent.compact().await.unwrap();
+    let requests = provider.recorded_requests();
+    assert!(last_user_text(&requests[1]).contains("always keep the TODO list"));
+}
+
+#[tokio::test]
+async fn notification_hooks_fire_when_the_user_is_asked_for_permission() {
+    let marker = temp_path("io-test-notify", ".txt");
+    let target = temp_path("io-test-notify-write", ".txt");
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "write",
+            serde_json::json!({"path": target.to_str().unwrap(), "content": "x"}),
+        ),
+        text_response("done"),
+    ]);
+    let agent =
+        make_agent(provider, PermissionChecker::new("prompt")).with_hooks(hooks(HooksConfig {
+            notification: vec![hook(None, &format!("cat > {}", marker.to_str().unwrap()))],
+            ..HooksConfig::default()
+        }));
+    agent.set_prompt_fn(Arc::new(|_, _| PermissionReply::AllowOnce));
+    agent.run_turn("write it").await.unwrap();
+    for _ in 0..100 {
+        if std::fs::metadata(&marker)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let payload: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+    assert_eq!(payload["notification_type"], "permission");
+    assert!(payload["message"].as_str().unwrap().contains("write"));
+    std::fs::remove_file(&marker).ok();
+    std::fs::remove_file(&target).ok();
+}
+
+#[tokio::test]
+async fn session_end_hooks_run_when_the_session_is_ended() {
+    let marker = temp_path("io-test-session-end", ".txt");
+    let provider = MockProvider::new(vec![text_response("hi")]);
+    let agent =
+        make_agent(provider, PermissionChecker::new("allow")).with_hooks(hooks(HooksConfig {
+            session_end: vec![hook(None, &format!("cat > {}", marker.to_str().unwrap()))],
+            ..HooksConfig::default()
+        }));
+    agent.run_turn("hi").await.unwrap();
+    assert!(!marker.exists());
+    agent.end_session("exit").await;
+    let payload: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+    assert_eq!(payload["hook_event_name"], "SessionEnd");
+    assert_eq!(payload["reason"], "exit");
+    std::fs::remove_file(&marker).ok();
+}
