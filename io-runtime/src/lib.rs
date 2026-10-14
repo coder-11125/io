@@ -7,6 +7,8 @@ pub mod instructions;
 pub mod mcp;
 pub mod memory;
 pub mod oauth;
+pub mod os_sandbox;
+pub mod output_style;
 pub mod pricing;
 pub mod provider;
 pub mod rewind;
