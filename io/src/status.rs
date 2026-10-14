@@ -14,6 +14,12 @@ pub fn current_mode() -> InteractionMode {
     *MODE.lock().unwrap()
 }
 
+/// Start in `mode` (from `permissions.defaultMode` or `--permission-mode`).
+/// Only meaningful before the first agent is built.
+pub fn set_initial_mode(mode: InteractionMode) {
+    *MODE.lock().unwrap() = mode;
+}
+
 /// The status-row text for a mode and thinking setting, e.g.
 /// `⏸ plan mode · ✻ thinking 8K`. Empty when both are at their defaults.
 pub fn badge_text(mode: InteractionMode, thinking: &ThinkingConfig) -> String {

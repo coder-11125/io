@@ -8,7 +8,7 @@ use crate::input::{
 use crate::stream::{
     blink_and_print, push_line, LineBuf, PendingPerm, PendingPermission, SCROLL_STEP,
 };
-use crate::{agent, connect, login, mcp_cmd, model, status};
+use crate::{agent, connect, login, mcp_cmd, model, permissions, status};
 use io_runtime::types::SessionId;
 use io_runtime::PermissionReply;
 use io_tui::picker;
@@ -109,6 +109,20 @@ fn apply_model_spec(config: &mut io_runtime::config::Config, spec: &str) {
 /// "`session_start` hooks already fired" for the current session, shared by
 /// every agent built for it: `/model`, `/agent` and friends rebuild the agent
 /// but must not re-announce the session. `/new` resets it.
+/// Read `settings.json` once at startup: report anything unusable and start in
+/// `permissions.defaultMode`.
+fn apply_startup_settings(root: &std::path::Path) -> Vec<String> {
+    let settings = io_runtime::settings::Settings::load(root);
+    if let Some(mode) = settings.default_mode {
+        status::set_initial_mode(mode);
+    }
+    settings
+        .problems
+        .iter()
+        .map(|p| format!("settings: {p}"))
+        .collect()
+}
+
 fn session_gate() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
     static GATE: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
         std::sync::OnceLock::new();
@@ -137,9 +151,14 @@ async fn build_agent(
     // run in the project root.
     let hooks = io_runtime::Hooks::new(config.hooks.clone(), project_root.clone())
         .with_session_gate(session_gate());
-    let mut checker = io_runtime::sandbox::PermissionChecker::from(&config.permissions)
-        .with_project_root(project_root)
-        .with_interaction_mode(status::current_mode());
+    let settings = io_runtime::settings::Settings::load(&project_root);
+    let mut checker = permissions::apply(
+        io_runtime::sandbox::PermissionChecker::from(&config.permissions)
+            .with_project_root(project_root.clone())
+            .with_interaction_mode(status::current_mode()),
+        &settings,
+        &project_root,
+    );
     if agent_config.auto_allow_writes {
         checker = checker.with_allowed_tools(io_runtime::sandbox::FILE_WRITE_TOOLS);
     }
@@ -317,6 +336,9 @@ pub async fn run_single_shot(prompt: &str, model_override: Option<&str>) -> anyh
         );
     }
 
+    for note in apply_startup_settings(&detect_project_root()) {
+        eprintln!("{note}");
+    }
     for note in mcp_cmd::start(false, &detect_project_root()).await {
         eprintln!("{note}");
     }
@@ -365,6 +387,9 @@ pub async fn run_interactive(
     }
 
     // Before the TUI takes the screen: project servers may need a y/n.
+    for note in apply_startup_settings(&detect_project_root()) {
+        println!("{note}");
+    }
     for note in mcp_cmd::start(true, &detect_project_root()).await {
         println!("{note}");
     }
@@ -483,6 +508,7 @@ pub async fn run_interactive(
                     "  /cost          Show API cost summary for current session",
                     "  /context       Fetch real context window, pricing, and tool support",
                     "  /compact       Summarize and compress conversation history",
+                    "  /permissions   Show or edit allow/ask/deny rules",
                     "  /mcp           List MCP servers (/mcp reconnect restarts them)",
                     "  /rewind        Restore files to an earlier point in the chat (or Esc Esc)",
                     "  /plan          Enter or leave plan mode (read-only research, then approve a plan)",
@@ -1000,6 +1026,27 @@ pub async fn run_interactive(
                     lines.push("No MCP servers configured — add one with `io mcp add`.".into());
                 }
                 lines.extend(mcp_cmd::state_lines(&states));
+                print_info_lines(&lines)?;
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            _ if input == "/permissions" || input.starts_with("/permissions ") => {
+                let root = detect_project_root();
+                let paths = io_runtime::settings::SettingsPaths::for_project(&root);
+                let lines =
+                    match permissions::command(&input["/permissions".len()..], &paths, &root) {
+                        Ok(lines) => lines,
+                        Err(e) => vec![format!("error: {e}")],
+                    };
+                // Rebuild so new rules take effect now.
+                let sid = agent.session_id().await;
+                if let Ok(new_agent) =
+                    build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                {
+                    agent = new_agent;
+                }
                 print_info_lines(&lines)?;
                 if from_splash {
                     is_splash = true;
