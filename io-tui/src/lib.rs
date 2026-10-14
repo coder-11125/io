@@ -27,6 +27,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Enter plan mode: read-only research, then a plan to approve (or Shift+Tab)",
     ),
     (
+        "/permissions",
+        "Show or edit allow/ask/deny rules: /permissions allow Bash(npm test:*)",
+    ),
+    (
         "/mcp",
         "Show MCP servers and their status (/mcp reconnect to restart them)",
     ),

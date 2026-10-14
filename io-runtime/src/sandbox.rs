@@ -66,7 +66,7 @@ pub fn is_file_write_tool(name: &str) -> bool {
 /// Whether an allow/deny `rule` covers MCP tool `tool` (`mcp__server__name`):
 /// the exact name, `mcp__server` for every tool of a server, or
 /// `mcp__server__*`.
-fn mcp_rule_covers(rule: &str, tool: &str) -> bool {
+pub(crate) fn mcp_rule_covers(rule: &str, tool: &str) -> bool {
     if rule == tool {
         return true;
     }
@@ -175,6 +175,11 @@ pub struct PermissionChecker {
     /// MCP tools their servers marked read-only (`readOnlyHint`). Advisory:
     /// the only privilege it buys is being usable in plan mode.
     read_only_mcp: std::sync::Mutex<HashSet<String>>,
+    /// `allow` / `ask` / `deny` rules from `settings.json` (deny > ask > allow).
+    rules: crate::rules::RuleSet,
+    /// Extra directories file tools may reach besides the project root
+    /// (`permissions.additionalDirectories`, `--add-dir`, `/add-dir`).
+    extra_roots: Vec<std::path::PathBuf>,
 }
 
 impl PermissionChecker {
@@ -196,7 +201,26 @@ impl PermissionChecker {
             project_root: None,
             interaction: AtomicU8::new(InteractionMode::Default.to_u8()),
             read_only_mcp: std::sync::Mutex::new(HashSet::new()),
+            rules: crate::rules::RuleSet::default(),
+            extra_roots: Vec::new(),
         }
+    }
+
+    /// Apply `settings.json` permission rules. Deny rules win over ask rules,
+    /// which win over allow rules; an allow rule never overrides the
+    /// sensitive-path, project-root or plan-mode guards.
+    pub fn with_rules(mut self, rules: crate::rules::RuleSet) -> Self {
+        self.rules = rules;
+        self
+    }
+
+    /// Let file tools reach `dirs` as well as the project root.
+    pub fn with_extra_roots(mut self, dirs: Vec<std::path::PathBuf>) -> Self {
+        self.extra_roots = dirs
+            .into_iter()
+            .map(|d| std::fs::canonicalize(&d).unwrap_or(d))
+            .collect();
+        self
     }
 
     /// Record which MCP tools their servers declared read-only, so plan mode
@@ -299,6 +323,13 @@ impl PermissionChecker {
         if tool_name == "exit_plan_mode" && self.mode != PermissionLevel::Deny {
             return PermissionLevel::Allow;
         }
+        // Rules apply in every permission mode, even `allow`.
+        if self.rules.denies(tool_name, input) {
+            return PermissionLevel::Deny;
+        }
+        if self.mode != PermissionLevel::Deny && self.rules.asks(tool_name, input) {
+            return PermissionLevel::Prompt;
+        }
         match self.mode {
             PermissionLevel::Allow => PermissionLevel::Allow,
             PermissionLevel::Deny => PermissionLevel::Deny,
@@ -335,6 +366,18 @@ impl PermissionChecker {
                     return PermissionLevel::Deny;
                 }
                 if listed(&self.allowlist) {
+                    return PermissionLevel::Allow;
+                }
+                if self.rules.allows(tool_name, input) {
+                    // The legacy `denied_commands` list still has the last word.
+                    if let (true, Some(cmd)) = (
+                        tool_name == "bash",
+                        input.get("command").and_then(|v| v.as_str()),
+                    ) {
+                        if self.check_command(cmd) == PermissionLevel::Deny {
+                            return PermissionLevel::Deny;
+                        }
+                    }
                     return PermissionLevel::Allow;
                 }
                 // In agent-decides mode, spawning a sub-agent is delegated to
@@ -561,7 +604,8 @@ impl PermissionChecker {
                 .map(|cwd| cwd.join(p))
                 .unwrap_or_else(|_| p.to_path_buf())
         };
-        normalize_path(&abs).starts_with(root)
+        let abs = normalize_path(&abs);
+        abs.starts_with(root) || self.extra_roots.iter().any(|r| abs.starts_with(r))
     }
 
     pub fn mode(&self) -> PermissionLevel {
@@ -1939,6 +1983,147 @@ mod tests {
         assert_eq!(
             normal.decide_tool("mcp__gh__search", &call),
             PermissionLevel::Prompt
+        );
+    }
+
+    // ── settings.json rules ────────────────────────────────────────────────
+
+    fn with_rules(mode: &str, allow: &[&str], ask: &[&str], deny: &[&str]) -> PermissionChecker {
+        let own = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let (rules, problems) = crate::rules::RuleSet::from_strings(
+            &own(allow),
+            &own(ask),
+            &own(deny),
+            Some(std::path::PathBuf::from("/proj")),
+        );
+        assert!(problems.is_empty());
+        PermissionChecker::new(mode)
+            .with_project_root(std::path::PathBuf::from("/proj"))
+            .with_rules(rules)
+    }
+
+    #[test]
+    fn deny_rules_win_in_every_permission_mode() {
+        for mode in ["allow", "agent", "prompt"] {
+            let c = with_rules(mode, &["Bash"], &[], &["Bash(git push:*)"]);
+            assert_eq!(
+                c.decide_tool("bash", &serde_json::json!({"command": "git push origin"})),
+                PermissionLevel::Deny,
+                "{mode}"
+            );
+        }
+    }
+
+    #[test]
+    fn ask_rules_beat_auto_allow_and_allow_rules() {
+        let c = with_rules("agent", &["Bash(git:*)"], &["Bash(git push:*)"], &[]);
+        let push = serde_json::json!({"command": "git push"});
+        assert_eq!(c.decide_tool("bash", &push), PermissionLevel::Prompt);
+        let status = serde_json::json!({"command": "git status"});
+        assert_eq!(c.decide_tool("bash", &status), PermissionLevel::Allow);
+        // Even `allow` mode asks when a rule says to.
+        let c = with_rules("allow", &[], &["Bash(git push:*)"], &[]);
+        assert_eq!(c.decide_tool("bash", &push), PermissionLevel::Prompt);
+    }
+
+    #[test]
+    fn allow_rules_skip_the_prompt_but_not_the_guards() {
+        let c = with_rules("prompt", &["Bash(make:*)", "Edit"], &[], &[]);
+        assert_eq!(
+            c.decide_tool("bash", &serde_json::json!({"command": "make build"})),
+            PermissionLevel::Allow
+        );
+        assert_eq!(
+            c.decide_tool("edit", &serde_json::json!({"path": "/proj/a.rs"})),
+            PermissionLevel::Allow
+        );
+        // Outside the project root and sensitive paths stay denied.
+        assert_eq!(
+            c.decide_tool("edit", &serde_json::json!({"path": "/elsewhere/a.rs"})),
+            PermissionLevel::Deny
+        );
+        assert_eq!(
+            c.decide_tool("edit", &serde_json::json!({"path": "/proj/.ssh/config"})),
+            PermissionLevel::Deny
+        );
+        // A workdir outside the project is still refused.
+        assert_eq!(
+            c.decide_tool(
+                "bash",
+                &serde_json::json!({"command": "make", "workdir": "/etc"})
+            ),
+            PermissionLevel::Deny
+        );
+    }
+
+    #[test]
+    fn a_legacy_denied_command_beats_an_allow_rule() {
+        let mut c = with_rules("prompt", &["Bash"], &[], &[]);
+        c.add_deny("rm".to_string());
+        assert_eq!(
+            c.decide_tool("bash", &serde_json::json!({"command": "rm x"})),
+            PermissionLevel::Deny
+        );
+    }
+
+    #[test]
+    fn rules_do_not_lift_plan_mode() {
+        let c = with_rules("prompt", &["Bash", "Edit"], &[], &[])
+            .with_interaction_mode(InteractionMode::Plan);
+        assert_eq!(
+            c.decide_tool("edit", &serde_json::json!({"path": "/proj/a.rs"})),
+            PermissionLevel::Deny
+        );
+        assert_eq!(
+            c.decide_tool("bash", &serde_json::json!({"command": "rm -rf x"})),
+            PermissionLevel::Deny
+        );
+    }
+
+    #[test]
+    fn webfetch_and_read_rules_apply() {
+        let c = with_rules(
+            "agent",
+            &["WebFetch(domain:docs.rs)"],
+            &[],
+            &["Read(./.env)"],
+        );
+        assert_eq!(
+            c.decide_tool("fetch", &serde_json::json!({"url": "https://docs.rs/x"})),
+            PermissionLevel::Allow
+        );
+        assert_eq!(
+            c.decide_tool("fetch", &serde_json::json!({"url": "https://evil.io"})),
+            PermissionLevel::Prompt
+        );
+        assert_eq!(
+            c.decide_tool("read", &serde_json::json!({"path": "/proj/.env"})),
+            PermissionLevel::Deny
+        );
+        assert_eq!(
+            c.decide_tool("read", &serde_json::json!({"path": "/proj/src/lib.rs"})),
+            PermissionLevel::Allow
+        );
+    }
+
+    #[test]
+    fn extra_roots_extend_where_file_tools_may_go() {
+        let extra = std::env::temp_dir();
+        let c = PermissionChecker::new("prompt")
+            .with_project_root(std::path::PathBuf::from("/proj"))
+            .with_extra_roots(vec![extra.clone()])
+            .with_allowed_tools(&["read"]);
+        let inside = extra.join("x.txt");
+        assert_ne!(
+            c.decide_tool(
+                "read",
+                &serde_json::json!({"path": inside.to_str().unwrap()})
+            ),
+            PermissionLevel::Deny
+        );
+        assert_eq!(
+            c.decide_tool("read", &serde_json::json!({"path": "/usr/share/x"})),
+            PermissionLevel::Deny
         );
     }
 }

@@ -11,6 +11,7 @@ mod input;
 mod login;
 mod mcp_cmd;
 mod model;
+mod permissions;
 mod status;
 mod stream;
 mod tui;
@@ -35,6 +36,10 @@ struct Cli {
     /// Override the LLM provider/model
     #[arg(long)]
     model: Option<String>,
+
+    /// Let file tools reach this directory too (repeatable)
+    #[arg(long = "add-dir", value_name = "DIR")]
+    add_dir: Vec<std::path::PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -98,6 +103,9 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    for dir in &cli.add_dir {
+        permissions::add_dir(dir)?;
+    }
 
     match cli.command {
         Some(Commands::Session { action }) => handle_session(action).await?,
