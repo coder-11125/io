@@ -8,7 +8,7 @@ use crate::input::{
 use crate::stream::{
     blink_and_print, push_line, LineBuf, PendingPerm, PendingPermission, SCROLL_STEP,
 };
-use crate::{agent, connect, login, mcp_cmd, model, permissions, status};
+use crate::{agent, connect, login, mcp_cmd, memory_cmd, model, permissions, status};
 use io_runtime::types::SessionId;
 use io_runtime::PermissionReply;
 use io_tui::picker;
@@ -146,7 +146,8 @@ async fn build_agent(
     let provider = io_runtime::provider::create_provider(&config, &keys)?;
     let memory = io_runtime::memory::SessionStore::new()?;
     let project_root = detect_project_root();
-    let project_context = io_runtime::load_project_context(&project_root);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| project_root.clone());
+    let (project_context, memory_files) = io_runtime::instructions::load(&project_root, &cwd);
     // Hooks come from the global config only (see `io_runtime::hooks`) and
     // run in the project root.
     let hooks = io_runtime::Hooks::new(config.hooks.clone(), project_root.clone())
@@ -210,6 +211,10 @@ async fn build_agent(
         pricing_override,
     )
     .with_hooks(hooks)
+    .with_nested_memory(
+        project_root,
+        io_runtime::instructions::loaded_set(&memory_files),
+    )
     .with_thinking(config.thinking.clone()))
 }
 
@@ -508,6 +513,9 @@ pub async fn run_interactive(
                     "  /cost          Show API cost summary for current session",
                     "  /context       Fetch real context window, pricing, and tool support",
                     "  /compact       Summarize and compress conversation history",
+                    "  /init          Have the agent write a CLAUDE.md for this project",
+                    "  /memory        Open a memory file (CLAUDE.md) in your editor",
+                    "  #<note>        Save a note to memory (a '#', a space, then the note)",
                     "  /permissions   Show or edit allow/ask/deny rules",
                     "  /mcp           List MCP servers (/mcp reconnect restarts them)",
                     "  /rewind        Restore files to an earlier point in the chat (or Esc Esc)",
@@ -1032,6 +1040,89 @@ pub async fn run_interactive(
                 }
                 continue;
             }
+            "/memory" => {
+                match memory_cmd::edit_menu(&detect_project_root()) {
+                    Ok(Some(msg)) => {
+                        // Rebuild so edits to memory files take effect now.
+                        let sid = agent.session_id().await;
+                        match build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                        {
+                            Ok(new_agent) => agent = new_agent,
+                            Err(e) => {
+                                let _ = draw_prompt_bar(
+                                    &format!("error reloading agent: {e}"),
+                                    current_agent.name,
+                                    agent.provider_id,
+                                    &agent.model_id,
+                                    last_input_tokens,
+                                    agent.context_window(),
+                                    &theme,
+                                );
+                            }
+                        }
+                        let _ = draw_prompt_bar(
+                            &msg,
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = draw_prompt_bar(
+                            &format!("error: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
+                }
+                is_splash = true;
+                continue;
+            }
+            _ if memory_cmd::is_quick_add(&input) => {
+                match memory_cmd::quick_add(&input, &detect_project_root()) {
+                    Ok(Some(msg)) => {
+                        let sid = agent.session_id().await;
+                        if let Ok(new_agent) =
+                            build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                        {
+                            agent = new_agent;
+                        }
+                        let _ = draw_prompt_bar(
+                            &msg,
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = draw_prompt_bar(
+                            &format!("error: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
+                }
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
             _ if input == "/permissions" || input.starts_with("/permissions ") => {
                 let root = detect_project_root();
                 let paths = io_runtime::settings::SettingsPaths::for_project(&root);
@@ -1149,7 +1240,10 @@ pub async fn run_interactive(
             _ => {}
         }
 
-        let (prompt, images) = resolve_at_mentions_with_images(&input);
+        let (mut prompt, images) = resolve_at_mentions_with_images(&input);
+        if input == "/init" {
+            prompt = io_runtime::instructions::INIT_PROMPT.to_string();
+        }
         let image_count = images.len();
         let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         agent.set_cancel(cancel_flag.clone());

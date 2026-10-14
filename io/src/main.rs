@@ -10,6 +10,7 @@ mod cost;
 mod input;
 mod login;
 mod mcp_cmd;
+mod memory_cmd;
 mod model;
 mod permissions;
 mod status;
