@@ -14,7 +14,9 @@ mod memory_cmd;
 mod model;
 mod permissions;
 mod status;
+mod statusline;
 mod stream;
+mod style_cmd;
 mod tui;
 
 #[derive(Parser)]

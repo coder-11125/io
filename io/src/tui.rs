@@ -8,7 +8,9 @@ use crate::input::{
 use crate::stream::{
     blink_and_print, push_line, LineBuf, PendingPerm, PendingPermission, SCROLL_STEP,
 };
-use crate::{agent, connect, login, mcp_cmd, memory_cmd, model, permissions, status};
+use crate::{
+    agent, connect, login, mcp_cmd, memory_cmd, model, permissions, status, statusline, style_cmd,
+};
 use io_runtime::types::SessionId;
 use io_runtime::PermissionReply;
 use io_tui::picker;
@@ -153,6 +155,13 @@ async fn build_agent(
     let hooks = io_runtime::Hooks::new(config.hooks.clone(), project_root.clone())
         .with_session_gate(session_gate());
     let settings = io_runtime::settings::Settings::load(&project_root);
+    let sandbox = settings.sandbox.enabled.then(|| {
+        io_runtime::os_sandbox::SandboxPolicy::new(
+            project_root.clone(),
+            settings.sandbox.network,
+            settings.sandbox.writable_paths.clone(),
+        )
+    });
     let mut checker = permissions::apply(
         io_runtime::sandbox::PermissionChecker::from(&config.permissions)
             .with_project_root(project_root.clone())
@@ -187,8 +196,14 @@ async fn build_agent(
         permissions.clone(),
         project_context.clone(),
     )
-    .with_hooks(&hooks);
+    .with_hooks(&hooks)
+    .with_sandbox(sandbox.clone());
     tools.register(Box::new(spawn_tool));
+    if let Some(policy) = sandbox {
+        tools.register(Box::new(
+            io_runtime::tools::BashTool::new().with_sandbox(policy),
+        ));
+    }
     let mcp = mcp_cmd::manager();
     for tool in mcp.tools() {
         tools.register(tool);
@@ -202,7 +217,14 @@ async fn build_agent(
         tools,
         memory,
         permissions,
-        agent_config.full_system_prompt(),
+        format!(
+            "{}{}",
+            agent_config.full_system_prompt(),
+            io_runtime::output_style::prompt_for(
+                settings.output_style.as_deref(),
+                &io_runtime::output_style::discover(&project_root, dirs::home_dir().as_deref()),
+            )
+        ),
         project_context,
         session_id,
         model_id,
@@ -413,6 +435,26 @@ pub async fn run_interactive(
     let mut is_splash = true;
 
     loop {
+        {
+            let root = detect_project_root();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| root.clone());
+            let session_id = agent.session_id().await.to_string();
+            statusline::refresh(
+                &root,
+                &statusline::Snapshot {
+                    session_id: &session_id,
+                    agent: current_agent.id,
+                    provider: agent.provider_id,
+                    model: &agent.model_id,
+                    mode: agent.interaction_mode().label(),
+                    cwd: &cwd,
+                    project_dir: &root,
+                    context_tokens: last_input_tokens,
+                    context_window: agent.context_window(),
+                },
+            )
+            .await;
+        }
         let full_agents = io_agents::builtin::full_agents();
         let mut tab_current = full_agents
             .iter()
@@ -513,6 +555,7 @@ pub async fn run_interactive(
                     "  /cost          Show API cost summary for current session",
                     "  /context       Fetch real context window, pricing, and tool support",
                     "  /compact       Summarize and compress conversation history",
+                    "  /output-style  Change how the agent talks (concise, explanatory, …)",
                     "  /init          Have the agent write a CLAUDE.md for this project",
                     "  /memory        Open a memory file (CLAUDE.md) in your editor",
                     "  #<note>        Save a note to memory (a '#', a space, then the note)",
@@ -1035,6 +1078,40 @@ pub async fn run_interactive(
                 }
                 lines.extend(mcp_cmd::state_lines(&states));
                 print_info_lines(&lines)?;
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            _ if input == "/output-style" || input.starts_with("/output-style ") => {
+                let result =
+                    style_cmd::run(&input["/output-style".len()..], &detect_project_root());
+                let msg = match result {
+                    Ok(Some(msg)) => {
+                        let sid = agent.session_id().await;
+                        match build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                        {
+                            Ok(new_agent) => {
+                                agent = new_agent;
+                                msg
+                            }
+                            Err(e) => format!("error reloading agent: {e}"),
+                        }
+                    }
+                    Ok(None) => String::new(),
+                    Err(e) => format!("error: {e}"),
+                };
+                if !msg.is_empty() {
+                    let _ = draw_prompt_bar(
+                        &msg,
+                        current_agent.name,
+                        agent.provider_id,
+                        &agent.model_id,
+                        last_input_tokens,
+                        agent.context_window(),
+                        &theme,
+                    );
+                }
                 if from_splash {
                     is_splash = true;
                 }

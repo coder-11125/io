@@ -27,6 +27,10 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
         "Enter plan mode: read-only research, then a plan to approve (or Shift+Tab)",
     ),
     (
+        "/output-style",
+        "Change how the agent talks: /output-style [name]",
+    ),
+    (
         "/init",
         "Have the agent analyze the project and write a CLAUDE.md",
     ),

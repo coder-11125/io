@@ -93,6 +93,8 @@ impl BashJobManager {
 pub struct BashTool {
     jobs: Arc<BashJobManager>,
     cancel: StdMutex<Arc<AtomicBool>>,
+    /// Run commands inside an OS sandbox (see [`crate::os_sandbox`]).
+    sandbox: Option<crate::os_sandbox::SandboxPolicy>,
 }
 
 impl BashTool {
@@ -100,7 +102,15 @@ impl BashTool {
         Self {
             jobs: Arc::new(BashJobManager::new()),
             cancel: StdMutex::new(Arc::new(AtomicBool::new(false))),
+            sandbox: None,
         }
+    }
+
+    /// Confine every command to `policy`. If no sandbox backend is available
+    /// commands fail rather than run unconfined.
+    pub fn with_sandbox(mut self, policy: crate::os_sandbox::SandboxPolicy) -> Self {
+        self.sandbox = Some(policy);
+        self
     }
 
     fn shell() -> String {
@@ -129,7 +139,7 @@ impl BashTool {
         workdir: &str,
         timeout_ms: Option<u64>,
     ) -> CommandOutput {
-        let mut child = match spawn_child(shell, command, workdir) {
+        let mut child = match spawn_child(shell, command, workdir, self.sandbox.as_ref()) {
             Ok(c) => c,
             Err(e) => return CommandOutput::failed(format!("failed to spawn command: {e}")),
         };
@@ -211,7 +221,7 @@ impl BashTool {
         workdir: &str,
         timeout_ms: Option<u64>,
     ) -> Result<String, String> {
-        let mut child = spawn_child(shell, command, workdir)
+        let mut child = spawn_child(shell, command, workdir, self.sandbox.as_ref())
             .map_err(|e| format!("failed to spawn command: {e}"))?;
         let pgid = child.id();
         let (out_buf, err_buf, out_h, err_h) = start_pumps(&mut child);
@@ -580,12 +590,29 @@ impl CommandOutput {
 /// 60 s CPU, 200 MB file size) prepended, piped stdio, and — on Unix — the
 /// child in its own process group so a timeout/cancel can kill the whole
 /// tree, not just the direct shell.
-fn spawn_child(shell: &str, command: &str, workdir: &str) -> std::io::Result<Child> {
+fn spawn_child(
+    shell: &str,
+    command: &str,
+    workdir: &str,
+    sandbox: Option<&crate::os_sandbox::SandboxPolicy>,
+) -> std::io::Result<Child> {
     let guarded = format!("ulimit -v 524288 -t 60 -f 204800 2>/dev/null; {command}");
-    let mut cmd = tokio::process::Command::new(shell);
-    cmd.arg("-c")
-        .arg(&guarded)
-        .current_dir(workdir)
+    let mut cmd = match sandbox {
+        None => {
+            let mut cmd = tokio::process::Command::new(shell);
+            cmd.arg("-c").arg(&guarded);
+            cmd
+        }
+        Some(policy) => {
+            let backend = crate::os_sandbox::find_backend().map_err(std::io::Error::other)?;
+            let (program, args) =
+                crate::os_sandbox::command_line(&backend, policy, shell, &guarded, workdir);
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.args(args);
+            cmd
+        }
+    };
+    cmd.current_dir(workdir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -663,6 +690,29 @@ mod tests {
 
     fn tool() -> BashTool {
         BashTool::new()
+    }
+
+    #[tokio::test]
+    async fn a_sandboxed_bash_never_runs_unconfined() {
+        let policy = crate::os_sandbox::SandboxPolicy::new(std::env::temp_dir(), false, vec![]);
+        let marker = std::env::temp_dir().join(format!("io_sbx_marker_{}", std::process::id()));
+        let out = BashTool::new()
+            .with_sandbox(policy)
+            .execute(input(serde_json::json!({
+                "command": format!("touch '{}'", marker.display())
+            })))
+            .await;
+        match crate::os_sandbox::find_backend() {
+            // No backend: fail closed, and nothing ran.
+            Err(_) => {
+                assert!(!out.success, "{}", out.data);
+                assert!(!marker.exists());
+            }
+            // A backend that works here lets the write through (the temp dir
+            // is the sandbox root); one that cannot start reports a failure.
+            Ok(_) => assert_eq!(out.success, marker.exists(), "{}", out.data),
+        }
+        std::fs::remove_file(&marker).ok();
     }
 
     async fn wait_status(tool: &BashTool, id: &str, expect: &str) -> String {

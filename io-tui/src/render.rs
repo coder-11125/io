@@ -18,6 +18,58 @@ pub fn set_status_badge(badge: &str) {
     }
 }
 
+/// Text from the user's status-line command. When set it replaces the
+/// `agent · model · provider` part of the status row.
+static CUSTOM_STATUS: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Set (or, with an empty string, clear) the custom status text. Control
+/// characters — including escape sequences — are dropped.
+pub fn set_custom_status(text: &str) {
+    if let Ok(mut t) = CUSTOM_STATUS.lock() {
+        *t = sanitize_status(text);
+    }
+}
+
+fn custom_status() -> String {
+    CUSTOM_STATUS.lock().map(|t| t.clone()).unwrap_or_default()
+}
+
+/// Keep printable text only, so a status command can't move the cursor or
+/// otherwise drive the terminal. ANSI escape sequences are removed whole.
+pub fn sanitize_status(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for n in chars.by_ref() {
+                    if ('@'..='~').contains(&n) {
+                        break;
+                    }
+                }
+            } else if chars.peek() == Some(&']') {
+                // OSC (window title and friends): up to BEL or ESC \.
+                chars.next();
+                while let Some(n) = chars.next() {
+                    if n == '\x07' {
+                        break;
+                    }
+                    if n == '\x1b' {
+                        chars.next();
+                        break;
+                    }
+                }
+            } else {
+                chars.next();
+            }
+        } else if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out.trim().to_string()
+}
+
 fn status_badge() -> String {
     STATUS_BADGE.lock().map(|b| b.clone()).unwrap_or_default()
 }
@@ -498,21 +550,35 @@ pub fn draw_prompt_bar(
     }
     let model_display = &model_id[..m_end];
 
-    execute!(
-        std::io::stdout(),
-        cursor::MoveTo(0, status_row),
-        SetForegroundColor(name_color),
-        Print("▌ "),
-        Print(agent_name),
-        SetForegroundColor(theme.muted),
-        Print(dot),
-        ResetColor,
-        Print(model_display),
-        SetForegroundColor(theme.muted),
-        Print(dot),
-        Print(provider_id),
-        ResetColor,
-    )?;
+    let custom = custom_status();
+    if custom.is_empty() {
+        execute!(
+            std::io::stdout(),
+            cursor::MoveTo(0, status_row),
+            SetForegroundColor(name_color),
+            Print("▌ "),
+            Print(agent_name),
+            SetForegroundColor(theme.muted),
+            Print(dot),
+            ResetColor,
+            Print(model_display),
+            SetForegroundColor(theme.muted),
+            Print(dot),
+            Print(provider_id),
+            ResetColor,
+        )?;
+    } else {
+        let budget = (w as usize).saturating_sub(2 + right_cols + 1);
+        let shown: String = custom.chars().take(budget).collect();
+        execute!(
+            std::io::stdout(),
+            cursor::MoveTo(0, status_row),
+            SetForegroundColor(name_color),
+            Print("▌ "),
+            ResetColor,
+            Print(shown),
+        )?;
+    }
 
     // Right-aligned info
     let right_x = w.saturating_sub(right_cols as u16);
@@ -1461,7 +1527,21 @@ fn draw_splash_status_at(
 
 #[cfg(test)]
 mod tests {
-    use super::{get_theme, preview, splash_box_width, tool_body_lines, tool_detail};
+    #[test]
+    fn status_text_loses_control_characters_and_escape_sequences() {
+        assert_eq!(
+            sanitize_status("  main \x1b[32m+2\x1b[0m ok\n"),
+            "main +2 ok"
+        );
+        assert_eq!(sanitize_status("a\x1b]0;title\x07b"), "ab");
+        assert_eq!(sanitize_status("a\x1b]0;t\x1b\\b"), "ab");
+        assert_eq!(sanitize_status("\x07\r\t"), "");
+        assert_eq!(sanitize_status("café ✓"), "café ✓");
+    }
+
+    use super::{
+        get_theme, preview, sanitize_status, splash_box_width, tool_body_lines, tool_detail,
+    };
 
     #[test]
     fn short_input_stays_at_default_width() {
