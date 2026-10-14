@@ -17,9 +17,13 @@ anyhow.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
+chrono.workspace = true
 toml.workspace = true
 indoc.workspace = true
 reqwest.workspace = true
 crossterm.workspace = true
 url = "2"
 termimad = "0.34.1"
+
+[dev-dependencies]
+uuid.workspace = true

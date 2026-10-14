@@ -108,6 +108,10 @@ pub struct Agent {
             std::collections::HashSet<std::path::PathBuf>,
         )>,
     >,
+    /// Most model calls in one turn (`--max-turns`); 0 means the default.
+    max_iterations: std::sync::atomic::AtomicUsize,
+    /// Whether the last turn stopped because it ran out of iterations.
+    hit_iteration_limit: AtomicBool,
 }
 
 /// Appended to the system prompt while plan mode is active.
@@ -166,7 +170,47 @@ impl Agent {
             hooks: Hooks::default(),
             thinking: Mutex::new(ThinkingConfig::default()),
             nested_memory: Mutex::new(None),
+            max_iterations: std::sync::atomic::AtomicUsize::new(0),
+            hit_iteration_limit: AtomicBool::new(false),
         }
+    }
+
+    /// Cap the number of model calls per turn (default 20).
+    pub fn with_max_iterations(self, n: usize) -> Self {
+        self.max_iterations.store(n, Ordering::Relaxed);
+        self
+    }
+
+    /// Whether the most recent turn was cut short by the iteration cap.
+    pub fn hit_iteration_limit(&self) -> bool {
+        self.hit_iteration_limit.load(Ordering::Relaxed)
+    }
+
+    /// A copy of the current session (for export).
+    pub async fn session_snapshot(&self) -> Session {
+        self.session.lock().await.clone()
+    }
+
+    /// Name the current session (shown in `/resume` and `io session list`).
+    pub async fn rename_session(&self, name: &str) -> anyhow::Result<()> {
+        let snapshot = {
+            let mut s = self.session.lock().await;
+            let name = name.trim();
+            s.metadata.name = (!name.is_empty()).then(|| name.to_string());
+            s.clone()
+        };
+        self.memory.save_session(&snapshot).await
+    }
+
+    /// Copy the current session under a new id and return it, leaving this
+    /// one untouched, so the conversation can branch.
+    pub async fn fork_session(&self) -> anyhow::Result<SessionId> {
+        let mut copy = self.session.lock().await.clone();
+        copy.id = SessionId::new();
+        copy.updated_at = chrono::Utc::now();
+        copy.metadata.name = copy.metadata.name.as_ref().map(|n| format!("{n} (fork)"));
+        self.memory.save_session(&copy).await?;
+        Ok(copy.id)
     }
 
     /// Surface `CLAUDE.md` / `AGENTS.md` files in subdirectories of `root` the
@@ -429,14 +473,21 @@ impl Agent {
         // A provider failure mid-turn. Set instead of returning immediately so
         // partial progress (text, executed tools) is still saved to the session.
         let mut turn_error: Option<anyhow::Error> = None;
-        const MAX_ITERATIONS: usize = 20;
+        const DEFAULT_MAX_ITERATIONS: usize = 20;
+        let max_iterations = match self.max_iterations.load(Ordering::Relaxed) {
+            0 => DEFAULT_MAX_ITERATIONS,
+            n => n,
+        };
+        // Cleared by the two ways a turn ends on its own; still set after the
+        // loop means the cap cut it short.
+        let mut exhausted = true;
         // Track files written during this turn to detect write-then-execute sequences.
         let mut written_this_turn: Vec<String> = Vec::new();
 
         // Propagate cancellation to tools (e.g. spawn_agent)
         self.tools.set_cancel(self.cancel.lock().unwrap().clone());
 
-        for _ in 0..MAX_ITERATIONS {
+        for _ in 0..max_iterations {
             if self.cancel.lock().unwrap().load(Ordering::Relaxed) {
                 return Err(Cancelled.into());
             }
@@ -607,10 +658,12 @@ impl Agent {
             // A stream that died mid-response: keep the partial text but do
             // not execute any tool calls parsed from a truncated stream.
             if turn_error.is_some() {
+                exhausted = false;
                 break;
             }
 
             if iter_tool_uses.is_empty() {
+                exhausted = false;
                 break;
             }
 
@@ -681,6 +734,8 @@ impl Agent {
                 content: tool_results,
             });
         }
+
+        self.hit_iteration_limit.store(exhausted, Ordering::Relaxed);
 
         // A failure before anything was produced: fail the turn outright
         // rather than persisting an empty record.

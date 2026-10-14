@@ -10,6 +10,14 @@ pub mod theme;
 pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show available commands"),
     ("/new", "Start a new session"),
+    ("/clear", "Start a new session (clears the conversation)"),
+    ("/resume", "Go back to an earlier session"),
+    ("/rename", "Name this session: /rename <name>"),
+    ("/fork", "Branch this session into a copy"),
+    (
+        "/export",
+        "Write this session to a Markdown file: /export [file]",
+    ),
     ("/agent", "Switch agent mode"),
     ("/connect", "Set up a provider"),
     ("/login", "Sign in with OAuth (ChatGPT / Claude)"),
