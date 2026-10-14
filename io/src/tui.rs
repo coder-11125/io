@@ -9,7 +9,8 @@ use crate::stream::{
     blink_and_print, push_line, LineBuf, PendingPerm, PendingPermission, SCROLL_STEP,
 };
 use crate::{
-    agent, connect, login, mcp_cmd, memory_cmd, model, permissions, status, statusline, style_cmd,
+    agent, connect, doctor, info_cmd, login, mcp_cmd, memory_cmd, model, permissions, status,
+    statusline, style_cmd,
 };
 use io_runtime::types::SessionId;
 use io_runtime::PermissionReply;
@@ -602,6 +603,20 @@ pub async fn run_interactive(
                     "  /context       Fetch real context window, pricing, and tool support",
                     "  /compact       Summarize and compress conversation history",
                     "  /output-style  Change how the agent talks (concise, explanatory, …)",
+                    "  /status        Version, model, mode, settings, rules, memory, MCP",
+                    "  /context       Where the context window is going (/context refresh: re-fetch limits)",
+                    "  /todos         The model's current task list",
+                    "  /hooks         Configured hooks",
+                    "  /agents        Available agents and sub-agents",
+                    "  /doctor        Check the installation and environment",
+                    "  /add-dir <d>   Let file tools reach another directory this session",
+                    "  /logout [p]    Sign out of an OAuth login",
+                    "  /usage         API usage and cost (same as /cost)",
+                    "  /terminal-setup  Multi-line input and image paste setup",
+                    "  /bug           How to report a problem",
+                    "  /review [t]    Review uncommitted changes, a PR number or a branch",
+                    "  /commit [note] Commit the current changes in this repo's style",
+                    "  /pr [note]     Open a pull request for this branch",
                     "  /init          Have the agent write a CLAUDE.md for this project",
                     "  /memory        Open a memory file (CLAUDE.md) in your editor",
                     "  #<note>        Save a note to memory (a '#', a space, then the note)",
@@ -636,7 +651,7 @@ pub async fn run_interactive(
                 }
                 continue;
             }
-            "/context" => {
+            "/context refresh" => {
                 match model::refresh_context_window().await {
                     Ok(msg) => {
                         let sid = agent.session_id().await;
@@ -1282,6 +1297,115 @@ pub async fn run_interactive(
                 }
                 continue;
             }
+            "/status" | "/context" | "/hooks" | "/agents" | "/todos" | "/bug"
+            | "/terminal-setup" | "/doctor" => {
+                let root = detect_project_root();
+                let lines = match input.as_str() {
+                    "/status" => status_report(&agent, &current_agent, &root).await,
+                    "/context" => info_cmd::context_lines(
+                        &agent.context_breakdown().await,
+                        agent.context_window(),
+                        last_input_tokens,
+                    ),
+                    "/hooks" => info_cmd::hooks_lines(
+                        &io_runtime::config::Config::load()
+                            .map(|c| c.hooks)
+                            .unwrap_or_default(),
+                    ),
+                    "/agents" => info_cmd::agents_lines(current_agent.id),
+                    "/todos" => info_cmd::todos_lines(&agent.session_turns().await),
+                    "/bug" => info_cmd::bug_lines(
+                        env!("CARGO_PKG_VERSION"),
+                        agent.provider_id,
+                        &agent.model_id,
+                    ),
+                    "/terminal-setup" => info_cmd::terminal_setup_lines(),
+                    _ => doctor::render(&doctor::run_checks(&root)),
+                };
+                print_info_lines(&lines)?;
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            "/usage" => {
+                if let Err(e) = show_cost_summary(&agent).await {
+                    let _ = draw_prompt_bar(
+                        &format!("error: {e}"),
+                        current_agent.name,
+                        agent.provider_id,
+                        &agent.model_id,
+                        last_input_tokens,
+                        agent.context_window(),
+                        &theme,
+                    );
+                }
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            _ if input == "/logout" || input.starts_with("/logout ") => {
+                let arg = input["/logout".len()..].trim();
+                let msg = match login::logout((!arg.is_empty()).then_some(arg)) {
+                    Ok(msg) => {
+                        let sid = agent.session_id().await;
+                        if let Ok(new_agent) =
+                            build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                        {
+                            agent = new_agent;
+                        }
+                        msg
+                    }
+                    Err(e) => format!("error: {e}"),
+                };
+                let _ = draw_prompt_bar(
+                    &msg,
+                    current_agent.name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    last_input_tokens,
+                    agent.context_window(),
+                    &theme,
+                );
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            _ if input == "/add-dir" || input.starts_with("/add-dir ") => {
+                let arg = input["/add-dir".len()..].trim();
+                let msg = if arg.is_empty() {
+                    "usage: /add-dir <directory>".to_string()
+                } else {
+                    match permissions::add_dir(std::path::Path::new(arg)) {
+                        Ok(dir) => {
+                            let sid = agent.session_id().await;
+                            if let Ok(new_agent) =
+                                build_agent(SessionChoice::Existing(sid), &current_agent, None)
+                                    .await
+                            {
+                                agent = new_agent;
+                            }
+                            format!("Added {} for this session", dir.display())
+                        }
+                        Err(e) => format!("error: {e}"),
+                    }
+                };
+                let _ = draw_prompt_bar(
+                    &msg,
+                    current_agent.name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    last_input_tokens,
+                    agent.context_window(),
+                    &theme,
+                );
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
             "/memory" => {
                 match memory_cmd::edit_menu(&detect_project_root()) {
                     Ok(Some(msg)) => {
@@ -1485,6 +1609,8 @@ pub async fn run_interactive(
         let (mut prompt, images) = resolve_at_mentions_with_images(&input);
         if input == "/init" {
             prompt = io_runtime::instructions::INIT_PROMPT.to_string();
+        } else if let Some(expanded) = crate::git_prompts::expand(&input) {
+            prompt = expanded;
         }
         let image_count = images.len();
         let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1661,6 +1787,75 @@ pub async fn run_interactive(
     agent.end_session("exit").await;
     exit_tui()?;
     Ok(())
+}
+
+/// The `/status` report.
+async fn status_report(
+    agent: &io_runtime::Agent,
+    current_agent: &io_agents::AgentConfig,
+    root: &std::path::Path,
+) -> Vec<String> {
+    let settings = io_runtime::settings::Settings::load(root);
+    let config = io_runtime::config::Config::load().ok();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
+    let home = dirs::home_dir();
+    let styles = io_runtime::output_style::discover(root, home.as_deref());
+    let style = settings
+        .output_style
+        .clone()
+        .filter(|n| styles.iter().any(|s| &s.name == n))
+        .unwrap_or_else(|| "default".to_string());
+    let session = agent.session_snapshot().await;
+    let mcp = mcp_cmd::manager();
+    let thinking = agent.thinking();
+    let sandbox = if settings.sandbox.enabled {
+        if settings.sandbox.network {
+            "on (network allowed)"
+        } else {
+            "on (no network)"
+        }
+    } else {
+        "off"
+    };
+    let count = |list| settings.rules_in(list).len();
+    info_cmd::status_lines(&info_cmd::Status {
+        version: env!("CARGO_PKG_VERSION"),
+        cwd: &cwd.display().to_string(),
+        project_root: &root.display().to_string(),
+        session_id: &session.id.to_string()[..8],
+        session_name: session.metadata.name.as_deref(),
+        turns: session.turns.len(),
+        provider: agent.provider_id,
+        model: &agent.model_id,
+        agent: current_agent.id,
+        mode: agent.interaction_mode().label(),
+        permissions: config
+            .as_ref()
+            .map(|c| c.permissions.default.as_str())
+            .unwrap_or("?"),
+        thinking: &if thinking.enabled {
+            format!("on ({} tokens)", thinking.budget_tokens)
+        } else {
+            "off".to_string()
+        },
+        output_style: &style,
+        settings_files: settings
+            .files
+            .iter()
+            .map(|(scope, _)| scope.label().to_string())
+            .collect(),
+        rule_counts: (
+            count(io_runtime::settings::RuleList::Allow),
+            count(io_runtime::settings::RuleList::Ask),
+            count(io_runtime::settings::RuleList::Deny),
+        ),
+        mcp: (mcp.states().len(), mcp.tool_count()),
+        sandbox,
+        memory_files: io_runtime::instructions::discover(root, &cwd, home.as_deref())
+            .into_iter()
+            .map(|f| f.label)
+            .collect(),
+    })
 }
 
 /// Show `lines` as a block just above the prompt bar (used by /help, /mcp).

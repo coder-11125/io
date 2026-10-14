@@ -6,7 +6,10 @@ mod clipboard;
 mod config_cmd;
 mod connect;
 mod cost;
+mod doctor;
+mod git_prompts;
 mod headless;
+mod info_cmd;
 mod input;
 mod login;
 mod mcp_cmd;
@@ -20,6 +23,8 @@ mod statusline;
 mod stream;
 mod style_cmd;
 mod tui;
+mod update;
+mod worktree;
 
 #[derive(Parser)]
 #[command(name = "io", version, about = "AI coding agent for the terminal")]
@@ -80,6 +85,10 @@ struct Cli {
     #[arg(long = "permission-mode", value_name = "MODE")]
     permission_mode: Option<String>,
 
+    /// Start in a new git worktree (on its own branch) under .io/worktrees
+    #[arg(long, value_name = "NAME", num_args = 0..=1, default_missing_value = "")]
+    worktree: Option<String>,
+
     /// Resume a session by id (see `io session list`)
     #[arg(short = 'r', long = "resume", value_name = "ID")]
     resume: Option<String>,
@@ -106,6 +115,21 @@ enum Commands {
     /// Sign in with OAuth for a provider that offers subscription access
     /// (openai = ChatGPT, anthropic = Claude) instead of an API key
     Login { provider: String },
+    /// Check the installation and environment
+    Doctor,
+    /// Sign out of an OAuth login (openai, anthropic; both when omitted)
+    Logout { provider: Option<String> },
+    /// Check for a newer release
+    Update {
+        /// Install it with cargo
+        #[arg(long)]
+        install: bool,
+    },
+    /// Print a shell completion script
+    Completions {
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Manage MCP (Model Context Protocol) servers
     Mcp {
         #[command(subcommand)]
@@ -170,6 +194,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    if let Some(name) = &cli.worktree {
+        let repo = worktree::repo_root()?;
+        let path = worktree::create(&repo, Some(name.as_str()).filter(|n| !n.is_empty()))?;
+        std::env::set_current_dir(&path)?;
+        eprintln!("Working in {}", path.display());
+    }
     for dir in &cli.add_dir {
         permissions::add_dir(dir)?;
     }
@@ -208,6 +238,21 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Config { action }) => config_cmd::handle_config(action)?,
         Some(Commands::Init) => config_cmd::handle_init()?,
         Some(Commands::Login { provider }) => println!("{}", login::run(&provider).await?),
+        Some(Commands::Doctor) => {
+            let checks = doctor::run_checks(&tui_root());
+            for line in doctor::render(&checks) {
+                println!("{line}");
+            }
+            if doctor::failures(&checks) > 0 {
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Logout { provider }) => println!("{}", login::logout(provider.as_deref())?),
+        Some(Commands::Update { install }) => update::run(install).await?,
+        Some(Commands::Completions { shell }) => {
+            use clap::CommandFactory;
+            clap_complete::generate(shell, &mut Cli::command(), "io", &mut std::io::stdout());
+        }
         Some(Commands::Mcp { action }) => mcp_cmd::handle(action).await?,
         Some(Commands::Model {
             action: ModelAction::Refresh,
@@ -297,4 +342,8 @@ async fn handle_session(action: SessionAction) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn tui_root() -> std::path::PathBuf {
+    tui::detect_project_root()
 }
