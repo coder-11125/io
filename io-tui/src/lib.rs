@@ -27,9 +27,25 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/cost", "Show API cost for current session"),
     (
         "/context",
-        "Fetch real context window, pricing, and tool support from the provider catalog",
+        "Where the context window is going (/context refresh re-fetches model limits)",
     ),
     ("/compact", "Summarize and compress conversation history"),
+    (
+        "/status",
+        "Version, model, mode, settings, rules, memory, MCP",
+    ),
+    ("/todos", "The model's current task list"),
+    ("/hooks", "Configured hooks"),
+    ("/agents", "Available agents and sub-agents"),
+    ("/doctor", "Check the installation and environment"),
+    (
+        "/add-dir",
+        "Let file tools reach another directory: /add-dir <dir>",
+    ),
+    ("/logout", "Sign out of an OAuth login"),
+    ("/usage", "API usage and cost (same as /cost)"),
+    ("/terminal-setup", "Multi-line input and image paste setup"),
+    ("/bug", "How to report a problem"),
     (
         "/plan",
         "Enter plan mode: read-only research, then a plan to approve (or Shift+Tab)",

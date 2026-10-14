@@ -24,6 +24,7 @@ reqwest.workspace = true
 crossterm.workspace = true
 url = "2"
 termimad = "0.34.1"
+clap_complete = "4.6.11"
 
 [dev-dependencies]
 uuid.workspace = true

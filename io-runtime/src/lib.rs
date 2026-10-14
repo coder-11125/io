@@ -20,7 +20,9 @@ pub mod thinking;
 pub mod tools;
 pub mod types;
 
-pub use agent::{Agent, AgentEvent, Cancelled, PermissionReply, PromptBlocked, PromptFn};
+pub use agent::{
+    Agent, AgentEvent, Cancelled, ContextBreakdown, PermissionReply, PromptBlocked, PromptFn,
+};
 pub use compact::CompactResult;
 pub use hooks::{HookEntry, Hooks, HooksConfig};
 pub use pricing::{

@@ -170,6 +170,47 @@ async fn login_anthropic() -> anyhow::Result<String> {
     save_token("anthropic", token)
 }
 
+/// Forget the stored OAuth login for `provider` (or every provider when
+/// `None`) and switch it back to API-key auth. Returns a summary line.
+pub fn logout(provider: Option<&str>) -> anyhow::Result<String> {
+    let targets: Vec<&str> = match provider {
+        Some(p @ ("openai" | "anthropic")) => vec![p],
+        Some(other) => anyhow::bail!("'{other}' has no OAuth login (use openai or anthropic)"),
+        None => vec!["openai", "anthropic"],
+    };
+    let mut store = oauth::OAuthStore::load();
+    let mut config = Config::load()?;
+    let mut signed_out = Vec::new();
+    for p in targets {
+        if store.get(p).is_none() {
+            continue;
+        }
+        store.remove(p);
+        match p {
+            "openai" => {
+                if let Some(c) = config.provider.openai.as_mut() {
+                    c.auth = AuthMethod::ApiKey;
+                }
+            }
+            _ => {
+                if let Some(c) = config.provider.anthropic.as_mut() {
+                    c.auth = AuthMethod::ApiKey;
+                }
+            }
+        }
+        signed_out.push(p);
+    }
+    if signed_out.is_empty() {
+        return Ok("Not signed in with OAuth.".to_string());
+    }
+    store.save()?;
+    config.save()?;
+    Ok(format!(
+        "Signed out of {} — back to API-key auth",
+        signed_out.join(" and ")
+    ))
+}
+
 // ── Shared ───────────────────────────────────────────────────────────────────
 
 /// Persist the token, mark the provider as OAuth-authenticated, and make it

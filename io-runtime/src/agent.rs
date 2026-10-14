@@ -114,6 +114,28 @@ pub struct Agent {
     hit_iteration_limit: AtomicBool,
 }
 
+/// Rough size of what each part of the next request costs, in characters
+/// (about four per token). For `/context`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContextBreakdown {
+    pub system_prompt: usize,
+    pub memory_files: usize,
+    pub tool_definitions: usize,
+    pub summary: usize,
+    pub history: usize,
+}
+
+impl ContextBreakdown {
+    pub fn total_chars(&self) -> usize {
+        self.system_prompt + self.memory_files + self.tool_definitions + self.summary + self.history
+    }
+
+    /// The usual rough conversion; good enough to see what is taking the room.
+    pub fn tokens(chars: usize) -> usize {
+        chars.div_ceil(4)
+    }
+}
+
 /// Appended to the system prompt while plan mode is active.
 const PLAN_MODE_PROMPT: &str = "\n\n## Plan mode is active\n\n\
     You are in plan mode: a read-only research phase. You cannot modify files or run \
@@ -184,6 +206,30 @@ impl Agent {
     /// Whether the most recent turn was cut short by the iteration cap.
     pub fn hit_iteration_limit(&self) -> bool {
         self.hit_iteration_limit.load(Ordering::Relaxed)
+    }
+
+    /// How much of the context each part of the conversation takes.
+    pub async fn context_breakdown(&self) -> ContextBreakdown {
+        let tool_definitions = self
+            .tools
+            .specs()
+            .iter()
+            .map(|t| t.name.len() + t.description.len() + t.input_schema.to_string().len())
+            .sum();
+        let session = self.session.lock().await;
+        ContextBreakdown {
+            system_prompt: self.system_prompt.len(),
+            memory_files: self.project_context.as_deref().map(str::len).unwrap_or(0),
+            tool_definitions,
+            summary: session.summary.as_deref().map(str::len).unwrap_or(0),
+            history: session
+                .turns
+                .iter()
+                .map(|t| {
+                    t.user_message.len() + t.assistant_message.as_deref().map(str::len).unwrap_or(0)
+                })
+                .sum(),
+        }
     }
 
     /// A copy of the current session (for export).
