@@ -9,6 +9,7 @@ mod connect;
 mod cost;
 mod input;
 mod login;
+mod mcp_cmd;
 mod model;
 mod status;
 mod stream;
@@ -53,6 +54,11 @@ enum Commands {
     /// Sign in with OAuth for a provider that offers subscription access
     /// (openai = ChatGPT, anthropic = Claude) instead of an API key
     Login { provider: String },
+    /// Manage MCP (Model Context Protocol) servers
+    Mcp {
+        #[command(subcommand)]
+        action: mcp_cmd::McpAction,
+    },
     /// Model management
     Model {
         #[command(subcommand)]
@@ -98,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Config { action }) => config_cmd::handle_config(action)?,
         Some(Commands::Init) => config_cmd::handle_init()?,
         Some(Commands::Login { provider }) => println!("{}", login::run(&provider).await?),
+        Some(Commands::Mcp { action }) => mcp_cmd::handle(action).await?,
         Some(Commands::Model {
             action: ModelAction::Refresh,
         }) => println!("{}", model::refresh_context_window().await?),

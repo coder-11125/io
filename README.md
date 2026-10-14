@@ -27,6 +27,8 @@
 - **Images & PDFs** — `read` shows images to vision models and extracts PDF text; attach images with `@shot.png`, drag-and-drop, or Ctrl+V from the clipboard
 - **Web search** — `web_search` (DuckDuckGo out of the box; Brave or Tavily with an API key) with domain allow/block lists; `fetch` turns HTML into readable text and can answer a `prompt` about a page
 - **Extended thinking** — `/think`, Alt+T or `[thinking]` config, plus `think` / `think hard` / `ultrathink` keywords, on Anthropic, Bedrock, Gemini and OpenAI reasoning models
+- **MCP servers** — connect any Model Context Protocol server (stdio, streamable HTTP or SSE); its tools appear as `mcp__<server>__<tool>`. Claude-compatible `.mcp.json`, `io mcp add|list|get|remove`, `/mcp`
+- **Hooks** — run your own shell commands around tool calls, prompts, turns, sessions, notifications and compaction; they can veto a call, ask for confirmation, or feed context back to the model
 - **Cost tracking** — Built-in API cost calculation with `/cost` command for supported providers
 - **Interactive & single-shot modes** — Full-screen REPL with splash screen, prompt bar, and scrollback
 - **Color themes** — 12 built-in themes (dark/light) with live `/theme` switcher
@@ -150,6 +152,7 @@ Launches an interactive session with a streaming agent loop. Commands:
 | `/theme` | Switch UI color theme (12 themes) |
 | `/cost` | Show API cost summary for the current session |
 | `/compact` | Summarize and compress conversation history |
+| `/mcp` (`/mcp reconnect`) | List MCP servers and their status; restart them |
 | `/rewind` (or press Esc twice) | Restore files to an earlier point in the chat |
 | `/plan` | Enter or leave plan mode |
 | `/think [on\|off\|low\|medium\|high\|<tokens>]` | Toggle extended thinking, or set its token budget |
@@ -256,6 +259,8 @@ enabled = false         # reason before answering on every turn (/think, Alt+T)
 budget_tokens = 8000    # token budget for that reasoning
 keywords = true         # "think" / "think hard" / "ultrathink" raise it for one turn
 
+# Hooks and MCP servers are described in their own sections below.
+
 # Optional: theme = "ocean"  (default, ocean, rose, forest, sunset, mono, breeze, ink, dawn, sand, mint, dusk)
 ```
 
@@ -266,6 +271,93 @@ may rate-limit). For a dependable backend export `BRAVE_API_KEY` (Brave Search)
 or `TAVILY_API_KEY` (Tavily); `IO_SEARCH_BACKEND=duckduckgo|brave|tavily`
 forces one. Like `fetch`, it prompts unless `permissions.allow_network_fetch`
 is on in agent mode.
+
+### Hooks
+
+Hooks are shell commands that run (with `sh -c`, in the project root) at points
+in the agent's life. They are read from the **global** `~/.io/config.toml` only —
+a cloned repo can never plant a command that runs on your machine.
+
+```toml
+[[hooks.pre_tool_use]]
+matcher = "bash|mcp__github__*"   # tool names joined by "|", `*` globs; omit = all tools
+command = "./scripts/guard.sh"    # exit 2 blocks the call; stderr is shown to the model
+timeout_ms = 10000                # optional, default 30000
+
+[[hooks.post_tool_use]]
+matcher = "write|edit"
+command = "cargo fmt"             # stdout is appended to the tool result
+
+[[hooks.user_prompt_submit]]
+command = "git status --short"    # stdout becomes extra context; exit 2 rejects the prompt
+
+[[hooks.stop]]                    # after a turn completes
+command = "notify-send 'io finished'"
+
+[[hooks.session_start]]           # once per session; stdout becomes context for the first prompt
+command = "git log --oneline -5"
+
+[[hooks.session_end]]             # /new, exit, or the end of a single-shot run
+command = "./scripts/cleanup.sh"
+
+[[hooks.notification]]            # fire-and-forget: io is waiting for a permission answer
+command = "notify-send 'io needs you'"
+
+[[hooks.pre_compact]]             # before /compact or auto-compact; exit 2 cancels,
+command = "echo 'Keep the list of failing tests'"   # stdout guides the summary
+```
+
+Each hook receives a JSON description of the event on stdin (plus `IO_HOOK_EVENT`
+and `IO_TOOL_NAME` in the environment). Exit `0` is success, exit `2` blocks, and
+any other failure (crash, timeout) is logged and ignored, so a broken guard fails
+open. A hook may instead print JSON on stdout:
+
+| Field | Effect |
+|---|---|
+| `"decision": "block"` (or `"deny"`) + `"reason"` | Block, as with exit 2 |
+| `"decision": "ask"` | Force a permission prompt even if the call would auto-run |
+| `"decision": "allow"` | No effect — a hook can never grant permission the sandbox withholds |
+| `"additionalContext"` | Extra text for the model |
+| `"continue": false` + `"stopReason"` | Stop the turn |
+
+`pre_tool_use` runs before the permission check and can only restrict. Sub-agents
+inherit the parent's tool hooks, so delegating can't sidestep a guard.
+
+### MCP servers
+
+[Model Context Protocol](https://modelcontextprotocol.io) servers add tools from
+outside io. Servers are configured in the Claude-compatible `mcpServers` format:
+
+```json
+{
+  "mcpServers": {
+    "github": { "type": "http", "url": "https://api.example.com/mcp",
+                "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" } },
+    "files":  { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+                "env": { "LOG": "${LOG_LEVEL:-info}" } }
+  }
+}
+```
+
+- **User scope** — `~/.io/mcp.json`; **project scope** — `.mcp.json` in the project root.
+- `type` is `stdio`, `http` or `sse` (inferred from `command` / `url`). `${VAR}` and `${VAR:-default}` are expanded in commands, args, env, URLs and headers.
+- **Project servers need approval.** `.mcp.json` is untrusted input that can name any command, so io asks once per server at startup (approve and remember / skip / never). Changing a server's definition asks again. Non-interactive runs skip unapproved servers.
+
+```bash
+io mcp add files npx -y @modelcontextprotocol/server-filesystem .   # stdio (options go before the name)
+io mcp add -t http --scope project -H "Authorization: Bearer ${TOKEN}" api https://x.dev/mcp
+io mcp add -e API_KEY=abc server ./server-binary
+io mcp list      # connects and shows status / tool counts
+io mcp get files # configuration, secrets masked
+io mcp remove files
+```
+
+Tools are named `mcp__<server>__<tool>`. They prompt by default; control them with
+`permissions.allowed_commands` / `denied_commands` — `mcp__github` or `mcp__github__*` covers a whole
+server, `mcp__github__search_issues` one tool, and deny wins. In plan mode only
+tools their server marks `readOnlyHint` run. Hooks see MCP calls like any other
+tool. Timeouts: `IO_MCP_STARTUP_TIMEOUT_MS` (20 s) and `IO_MCP_TOOL_TIMEOUT_MS`
+(60 s). `/mcp` lists servers; `/mcp reconnect` restarts them.
 
 ### API Keys
 
@@ -316,6 +408,10 @@ io config set permissions.default allow
 # Initialize io in the current project
 io init
 
+# Manage MCP servers
+io mcp add <name> <command-or-url> …
+io mcp list
+
 # OAuth sign-in (ChatGPT / Claude subscription)
 io login openai
 io login anthropic
@@ -349,6 +445,7 @@ io/
 │       ├── clipboard.rs         # Clipboard image paste (Ctrl+V) and dropped image paths
 │       ├── cost.rs              # /cost report
 │       ├── config_cmd.rs        # `io config …` and `io init` handlers
+│       ├── mcp_cmd.rs           # `io mcp …`, shared MCP manager, project-server trust prompt
 │       ├── agent.rs             # Agent switching (/agent command)
 │       ├── connect.rs           # Interactive provider setup wizard (13 providers)
 │       └── model.rs             # Provider switching (/model command)
@@ -365,12 +462,16 @@ io/
 ├── io-runtime/                  # Core engine (library crate)
 │   ├── Cargo.toml
 │   ├── tests/
-│   │   └── agent_loop.rs        # 44 integration tests against a scripted mock provider
+│   │   ├── agent_loop.rs        # integration tests against a scripted mock provider
+│   │   ├── mcp.rs               # MCP integration tests against a Python mock server
+│   │   └── fixtures/            # mock_mcp_server.py
 │   └── src/
 │       ├── lib.rs               # Crate root — re-exports public API + load_project_context()
 │       ├── agent.rs             # Agent loop: LLM completion + tool execution (sync & streaming)
 │       ├── compact.rs           # /compact + auto-compact summarization
 │       ├── rewind.rs            # /rewind — restore files to an earlier point in the chat
+│       ├── hooks.rs             # Lifecycle hooks: shell commands around tool calls, prompts, sessions
+│       ├── mcp/                 # MCP client: config + trust, stdio/HTTP/SSE transports, tools
 │       ├── config.rs            # Config/schema (TOML), KeyStore, provider config structs
 │       ├── types.rs             # Core data types — Session, Turn, ToolCallRecord, TurnUsage
 │       ├── memory.rs            # SQLite-backed session persistence (CRUD)
@@ -468,6 +569,8 @@ Agent.run_turn() / run_turn_streaming()
 | **`exit_plan_mode`** | Present a plan for approval while plan mode is active |
 | **`spawn_agent`** | Delegate a scoped task to a restricted sub-agent |
 
+MCP servers contribute further tools named `mcp__<server>__<tool>`.
+
 All tools implement the `Tool` trait with a JSON input schema exposed to the LLM, allowing autonomous discovery and use of parameters.
 
 ## Development
@@ -480,7 +583,7 @@ cargo build
 cargo run -- "your prompt"
 cargo run --
 
-# Run tests (379 unit tests + 44 integration tests)
+# Run tests (434 unit tests + 66 integration tests; the MCP tests need `python3`)
 cargo test
 
 # Add a new provider

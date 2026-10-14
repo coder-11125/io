@@ -8,7 +8,7 @@ use crate::input::{
 use crate::stream::{
     blink_and_print, push_line, LineBuf, PendingPerm, PendingPermission, SCROLL_STEP,
 };
-use crate::{agent, connect, login, model, status};
+use crate::{agent, connect, login, mcp_cmd, model, status};
 use io_runtime::types::SessionId;
 use io_runtime::PermissionReply;
 use io_tui::picker;
@@ -61,7 +61,7 @@ async fn login_flow() -> anyhow::Result<String> {
 
 // ── Project root detection ─────────────────────────────────────────────────────
 
-fn detect_project_root() -> std::path::PathBuf {
+pub(crate) fn detect_project_root() -> std::path::PathBuf {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let mut dir = cwd.clone();
     loop {
@@ -169,6 +169,11 @@ async fn build_agent(
     )
     .with_hooks(&hooks);
     tools.register(Box::new(spawn_tool));
+    let mcp = mcp_cmd::manager();
+    for tool in mcp.tools() {
+        tools.register(tool);
+    }
+    permissions.mark_read_only(&mcp.read_only_tool_names());
 
     status::update_badge(status::current_mode(), &config.thinking);
 
@@ -312,6 +317,9 @@ pub async fn run_single_shot(prompt: &str, model_override: Option<&str>) -> anyh
         );
     }
 
+    for note in mcp_cmd::start(false, &detect_project_root()).await {
+        eprintln!("{note}");
+    }
     let build_config = io_agents::builtin::by_id("build").expect("build agent must exist");
     let agent = build_agent(SessionChoice::New, &build_config, model_override).await?;
     agent.set_prompt_fn(std::sync::Arc::new(prompt_on_stdin));
@@ -354,6 +362,11 @@ pub async fn run_interactive(
             .yellow()
         );
         println!();
+    }
+
+    // Before the TUI takes the screen: project servers may need a y/n.
+    for note in mcp_cmd::start(true, &detect_project_root()).await {
+        println!("{note}");
     }
 
     let mut current_agent = io_agents::builtin::by_id("build").expect("build agent must exist");
@@ -456,8 +469,7 @@ pub async fn run_interactive(
         match input.as_str() {
             "/exit" | "/quit" | "/q" => break,
             "/help" => {
-                clear_rows_above(0)?;
-                let help_lines = [
+                print_info_lines(&[
                     "Commands:",
                     "  /exit, /quit   Exit",
                     "  /help          Show this help",
@@ -471,25 +483,14 @@ pub async fn run_interactive(
                     "  /cost          Show API cost summary for current session",
                     "  /context       Fetch real context window, pricing, and tool support",
                     "  /compact       Summarize and compress conversation history",
+                    "  /mcp           List MCP servers (/mcp reconnect restarts them)",
                     "  /rewind        Restore files to an earlier point in the chat (or Esc Esc)",
                     "  /plan          Enter or leave plan mode (read-only research, then approve a plan)",
                     "  /think [x]     Extended thinking: on|off|low|medium|high|<tokens> (or Alt+T)",
                     "  !<cmd>         Run a shell command",
                     "  Shift+Tab      Cycle mode: default → accept edits → plan",
                     "  Ctrl+V         Attach an image from the clipboard (or @image.png)",
-                ];
-                let (_, h) = crossterm::terminal::size()?;
-                let start_row = h.saturating_sub(PROMPT_BAR_HEIGHT + 1 + help_lines.len() as u16);
-                for (i, line) in help_lines.iter().enumerate() {
-                    use crossterm::{cursor, execute, style::Print, terminal};
-                    execute!(
-                        std::io::stdout(),
-                        cursor::MoveTo(0, start_row + i as u16),
-                        terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
-                        Print(line),
-                    )?;
-                }
-                std::io::stdout().flush()?;
+                ])?;
                 if from_splash {
                     is_splash = true;
                 }
@@ -984,6 +985,27 @@ pub async fn run_interactive(
                 }
                 continue;
             }
+            _ if input == "/mcp" || input == "/mcp reconnect" => {
+                let mut lines = Vec::new();
+                if input == "/mcp reconnect" {
+                    lines.extend(mcp_cmd::start(false, &detect_project_root()).await);
+                    let sid = agent.session_id().await;
+                    match build_agent(SessionChoice::Existing(sid), &current_agent, None).await {
+                        Ok(new_agent) => agent = new_agent,
+                        Err(e) => lines.push(format!("error reloading agent: {e}")),
+                    }
+                }
+                let states = mcp_cmd::manager().states().to_vec();
+                if states.is_empty() {
+                    lines.push("No MCP servers configured — add one with `io mcp add`.".into());
+                }
+                lines.extend(mcp_cmd::state_lines(&states));
+                print_info_lines(&lines)?;
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
             "/plan" => {
                 let target = if agent.interaction_mode() == io_runtime::InteractionMode::Plan {
                     io_runtime::InteractionMode::Default
@@ -1255,6 +1277,29 @@ pub async fn run_interactive(
 
     agent.end_session("exit").await;
     exit_tui()?;
+    Ok(())
+}
+
+/// Show `lines` as a block just above the prompt bar (used by /help, /mcp).
+fn print_info_lines<S: AsRef<str>>(lines: &[S]) -> anyhow::Result<()> {
+    use crossterm::{cursor, execute, style::Print, terminal};
+    clear_rows_above(0)?;
+    let (w, h) = terminal::size()?;
+    let start_row = h.saturating_sub(PROMPT_BAR_HEIGHT + 1 + lines.len() as u16);
+    for (i, line) in lines.iter().enumerate() {
+        let line: String = line
+            .as_ref()
+            .chars()
+            .take(w.saturating_sub(1) as usize)
+            .collect();
+        execute!(
+            std::io::stdout(),
+            cursor::MoveTo(0, start_row + i as u16),
+            terminal::Clear(terminal::ClearType::CurrentLine),
+            Print(line),
+        )?;
+    }
+    std::io::stdout().flush()?;
     Ok(())
 }
 
