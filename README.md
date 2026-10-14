@@ -29,6 +29,13 @@
 - **Extended thinking** — `/think`, Alt+T or `[thinking]` config, plus `think` / `think hard` / `ultrathink` keywords, on Anthropic, Bedrock, Gemini and OpenAI reasoning models
 - **MCP servers** — connect any Model Context Protocol server (stdio, streamable HTTP or SSE); its tools appear as `mcp__<server>__<tool>`. Claude-compatible `.mcp.json`, `io mcp add|list|get|remove`, `/mcp`
 - **Hooks** — run your own shell commands around tool calls, prompts, turns, sessions, notifications and compaction; they can veto a call, ask for confirmation, or feed context back to the model
+- **Rule-based permissions** — `allow` / `ask` / `deny` rules such as `Bash(npm run test:*)`, `Read(./.env)` and `WebFetch(domain:docs.rs)` in layered `settings.json` files (user, project, local, managed), plus `/permissions` and `--add-dir`
+- **Memory** — `CLAUDE.md` / `AGENTS.md` at user, project, nested and local levels, `@import`s, `# note` quick-add, `/memory` and `/init`
+- **OS sandbox** — optional bubblewrap (Linux) / Seatbelt (macOS) confinement for `bash`: read-only filesystem, hidden credentials, no network
+- **Output styles & status line** — `/output-style` (concise, explanatory, learning, or your own) and a user-supplied status-line command
+- **Headless mode** — `io -p "prompt"` with stdin piping, `--output-format text|json|stream-json`, `--max-turns`, `--allowedTools`, `--permission-mode`
+- **Sessions** — `/resume`, `--resume <id>`, `/rename`, `/fork`, `/export`, `/clear`; git helpers `/review`, `/commit`, `/pr` and `io --worktree`
+- **Prompt editing** — history (Up/Down, Ctrl+R), multi-line input, Vim mode, Ctrl+O transcript, Ctrl+B to background a command, messages queued while the model works
 - **Cost tracking** — Built-in API cost calculation with `/cost` command for supported providers
 - **Interactive & single-shot modes** — Full-screen REPL with splash screen, prompt bar, and scrollback
 - **Color themes** — 12 built-in themes (dark/light) with live `/theme` switcher
@@ -144,7 +151,11 @@ Launches an interactive session with a streaming agent loop. Commands:
 | Command | Description |
 |---|---|---|
 | `/help` | Show available commands |
-| `/new` | Start a new session |
+| `/new`, `/clear` | Start a new session |
+| `/resume` | Go back to an earlier session (shows its last turns) |
+| `/rename <name>` | Name this session |
+| `/fork` | Branch this session into a copy and continue on it |
+| `/export [file]` | Write this session to a Markdown file |
 | `/agent` | Switch agent mode (build, plan, debug, refactor) |
 | `/connect` | Set up a provider interactively (with live model fetching) |
 | `/login` | Sign in with OAuth (ChatGPT / Claude) |
@@ -152,6 +163,24 @@ Launches an interactive session with a streaming agent loop. Commands:
 | `/theme` | Switch UI color theme (12 themes) |
 | `/cost` | Show API cost summary for the current session |
 | `/compact` | Summarize and compress conversation history |
+| `/status` | Version, model, mode, settings files, rules, memory files, MCP, sandbox |
+| `/context` | Where the context window is going (`/context refresh` re-fetches model limits) |
+| `/todos` | The model's current task list |
+| `/hooks` | Configured hooks |
+| `/agents` | Built-in agents and sub-agents |
+| `/permissions [allow\|ask\|deny <rule> \| remove <rule>]` | Show or edit permission rules |
+| `/add-dir <dir>` | Let file tools reach another directory this session |
+| `/memory` | Open a memory file (`CLAUDE.md`…) in `$VISUAL` / `$EDITOR` |
+| `/init` | Have the agent analyze the project and write a `CLAUDE.md` |
+| `/output-style [name]` | Change how the agent talks |
+| `/review [PR number\|branch]` | Review uncommitted changes, a PR or a branch |
+| `/commit [note]`, `/pr [note]` | Commit in this repository's own style; open a pull request |
+| `/doctor` | Check the installation and environment |
+| `/vim` | Toggle Vim-style prompt editing |
+| `/logout [provider]` | Sign out of an OAuth login |
+| `/usage` | Same as `/cost` |
+| `/terminal-setup` | Multi-line input and image paste setup |
+| `/bug` | How to report a problem |
 | `/mcp` (`/mcp reconnect`) | List MCP servers and their status; restart them |
 | `/rewind` (or press Esc twice) | Restore files to an earlier point in the chat |
 | `/plan` | Enter or leave plan mode |
@@ -166,6 +195,15 @@ Launches an interactive session with a streaming agent loop. Commands:
 | Alt+T | Toggle extended thinking |
 | Ctrl+V | Attach an image from the clipboard (needs `pngpaste`, `wl-paste` or `xclip`) |
 | Esc Esc | Open `/rewind` |
+| Up / Down | Browse earlier prompts |
+| Ctrl+R | Search earlier prompts |
+| Alt+Enter, Ctrl+J, `\` at end of line | New line (Shift+Enter too, in terminals with the kitty keyboard protocol) |
+| Ctrl+O | Full transcript with tool calls (scrollable) |
+| Ctrl+B | Move the running `bash` command to a background job |
+| `# note` | Save a note to memory |
+
+Anything typed while the model is working is queued and sent, in order, when
+the turn finishes (Esc cancels the turn and drops the queue).
 
 Type `@path/to/file` to expand file or directory contents inline; image files
 (`@shot.png`, or `@"path with spaces.png"`) are attached to the message
@@ -205,12 +243,40 @@ io "summarize the changes in src/"
 
 Runs one turn and prints the response, then exits.
 
+### Headless
+
+```bash
+io -p "summarize the changes in src/"                  # prompt as an argument
+git diff | io -p "review this diff"                    # piped input comes first
+io -p "run the tests" --allowedTools "Bash(cargo test:*) Read" --max-turns 5
+io -p "list the TODOs" --output-format json            # one JSON object with the result
+io -p "fix the lint errors" --output-format stream-json # one JSON event per line
+```
+
+Nothing can answer a permission prompt in headless mode, so anything that would
+ask is denied: pre-approve what the run needs with `--allowedTools`,
+`settings.json` rules, or `--permission-mode acceptEdits|bypassPermissions`.
+`json` output has `type`, `subtype` (`success`, `error_max_turns`,
+`error_during_execution`), `is_error`, `result`, `session_id`, `num_tool_calls`,
+`total_cost_usd` and `usage`; `stream-json` emits `system`/`init`, `text`,
+`thinking`, `tool_use`, `tool_result`, `permission_denied`, `usage` events and a
+final `result`. The exit code is 1 on error. With a prompt argument and a
+silent open stdin (cron, CI) io stops waiting for piped input after 3 seconds.
+
 ### Flags
 
 ```bash
-io --new              # Start a fresh session (ignore history)
-io --continue         # Resume the last session
-io --model anthropic  # Override the default provider
+io --new                         # Start a fresh session (ignore history)
+io --continue                    # Resume the last session
+io --resume <id>                 # Resume a session by id or unique prefix
+io --model anthropic             # Override the default provider
+io --add-dir ../shared           # Let file tools reach another directory
+io --permission-mode plan        # default | acceptEdits | plan | bypassPermissions
+io --allowedTools "Bash(git log:*) Read"   # pre-approve rules
+io --disallowedTools "Bash(rm:*)"          # refuse rules
+io --append-system-prompt "Answer in French."
+io --max-turns 10                # cap model calls per turn (default 20)
+io --worktree [name]             # start in a new git worktree on its own branch
 ```
 
 ## Supported Providers
@@ -359,6 +425,73 @@ tools their server marks `readOnlyHint` run. Hooks see MCP calls like any other
 tool. Timeouts: `IO_MCP_STARTUP_TIMEOUT_MS` (20 s) and `IO_MCP_TOOL_TIMEOUT_MS`
 (60 s). `/mcp` lists servers; `/mcp reconnect` restarts them.
 
+### settings.json and permission rules
+
+Permission rules, the default working mode, output style, status line and the
+bash sandbox live in `settings.json` files, merged lowest to highest precedence:
+
+| Scope | File |
+|---|---|
+| user | `~/.io/settings.json` |
+| project (shared) | `.io/settings.json` |
+| local (personal) | `.io/settings.local.json` — add it to `.gitignore` |
+| managed | `$IO_MANAGED_SETTINGS`, else `/etc/io/managed-settings.json` (`/Library/Application Support/io/managed-settings.json` on macOS) |
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(npm run test:*)", "Bash(git status)", "Edit(src/**)", "WebFetch(domain:docs.rs)"],
+    "ask":   ["Bash(git push:*)"],
+    "deny":  ["Read(./.env)", "Read(**/*.pem)", "Bash(rm:*)", "mcp__github__delete_repo"],
+    "additionalDirectories": ["../shared"],
+    "defaultMode": "acceptEdits"
+  },
+  "outputStyle": "concise",
+  "editorMode": "vim",
+  "statusLine": { "type": "command", "command": "~/.io/statusline.sh" },
+  "sandbox": { "enabled": true, "network": false, "writablePaths": ["~/.cargo"] }
+}
+```
+
+- **Rules** are `Tool` or `Tool(specifier)`. `Bash(prefix:*)` matches a command and its arguments at a word boundary, `Bash(exact command)` matches exactly, `*` is a wildcard. `Read(...)` covers `read`/`glob`/`grep` and `Edit(...)` (alias `Write`) covers `write`/`edit`/`multi_edit`/`notebook_edit`; paths are `./rel` or `/rel` (project root), `~/…`, `//absolute`, or a bare pattern like `*.env` that matches at any depth. `WebFetch(domain:x.com)` covers the domain and its subdomains. MCP tools: `mcp__server`, `mcp__server__*`, or an exact name.
+- **Precedence is deny > ask > allow**, in every permission mode — `permissions.default = "allow"` still honours deny and ask rules. A deny or ask rule fires if it matches *any* part of a compound command (`a && b`, pipes, `$(…)`, backticks, env-prefixed or `/bin/`-qualified forms); an allow rule must cover *every* part and never applies to a command with expansions or redirections. Allow rules never lift plan mode, the sensitive-path or project-root guards, or `denied_commands`.
+- **The shared project file is untrusted** (a cloned repository can ship one), so it may only *restrict*: `deny`/`ask` rules, an output style and `sandbox.enabled: true`. `allow` rules, `additionalDirectories`, `defaultMode`, `statusLine` and the rest of `sandbox` come from the user, local and managed files only. The managed file can also set `"allowManagedPermissionRulesOnly": true` to make its rules the only ones in force.
+- `/permissions allow|ask|deny <rule>` and `/permissions remove <rule>` edit `settings.local.json`; `--add-dir` and `/add-dir` add directories for one run.
+
+### Memory
+
+io starts each conversation with your instructions: `~/.io/CLAUDE.md` (or
+`AGENTS.md`), the project root's `AGENTS.md`, `CLAUDE.md` and `.io/CLAUDE.md`,
+the same files in each directory down to where you started io, and
+`CLAUDE.local.md` for personal notes (keep it out of version control). Files in
+directories *below* the working directory are surfaced the first time the model
+reads or edits a file there. A line like `@docs/style.md` imports another file
+(five levels deep; code blocks and cycles are skipped); imports are confined —
+project files can only import from the project, user files from your home
+directory, and key/token/env files never. `# always run clippy` saves a note
+(you pick which file), `/memory` opens one in your editor and `/init` has the
+agent write a `CLAUDE.md` for the project.
+
+### OS sandbox
+
+With `"sandbox": {"enabled": true}` the `bash` tool (and sub-agents' bash) runs
+under bubblewrap on Linux (`bwrap` must be installed) or Seatbelt on macOS: the
+filesystem is read-only except the project, the temp directory and
+`sandbox.writablePaths`; `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.io` and similar are
+hidden; and there is no network unless `sandbox.network` is true. If the sandbox
+is enabled but unavailable, bash refuses to run rather than running unconfined.
+`io doctor` shows which.
+
+### Output styles and status line
+
+`/output-style` switches between `default`, `concise`, `explanatory` and
+`learning`, or your own: a markdown file in `~/.io/output-styles/` or
+`.io/output-styles/` (optional `name:`/`description:` front matter, the body is
+added to the system prompt). `statusLine` runs a command before each prompt with
+a JSON description of the session on stdin (`model`, `mode`, `cwd`, `context`, …);
+its first output line replaces the `agent · model · provider` part of the status
+row (escape sequences are stripped; two-second timeout).
+
 ### API Keys
 
 Keys are stored in `~/.io/keys.toml` (with `chmod 600` on Unix). You can also use environment variables:
@@ -408,6 +541,12 @@ io config set permissions.default allow
 # Initialize io in the current project
 io init
 
+# Health check (non-zero exit if something is broken), updates, completions
+io doctor
+io update [--install]
+io completions bash|zsh|fish|powershell|elvish
+io logout [openai|anthropic]
+
 # Manage MCP servers
 io mcp add <name> <command-or-url> …
 io mcp list
@@ -426,7 +565,10 @@ io session list
 # Show session details
 io session show <id>
 
-# Delete a session
+# Name, export (Markdown), fork or delete one — <id> may be a unique prefix
+io session rename <id> "refactor of the parser"
+io session export <id> [file.md]
+io session fork <id>
 io session delete <id>
 ```
 
@@ -446,6 +588,20 @@ io/
 │       ├── cost.rs              # /cost report
 │       ├── config_cmd.rs        # `io config …` and `io init` handlers
 │       ├── mcp_cmd.rs           # `io mcp …`, shared MCP manager, project-server trust prompt
+│       ├── headless.rs          # `io -p`: one turn without the TUI, text/json/stream-json
+│       ├── run_opts.rs          # Per-run flags (--allowedTools, --append-system-prompt, …)
+│       ├── permissions.rs       # settings.json rules → PermissionChecker, /permissions, --add-dir
+│       ├── memory_cmd.rs        # `# note` quick-add and /memory
+│       ├── style_cmd.rs         # /output-style
+│       ├── statusline.rs        # the user's status-line command
+│       ├── session_cmd.rs       # /resume, /export, short ids, replay and transcript lines
+│       ├── info_cmd.rs          # /status /context /hooks /agents /todos /bug reports
+│       ├── doctor.rs            # `io doctor` / /doctor checks
+│       ├── git_prompts.rs       # /review /commit /pr prompts
+│       ├── worktree.rs          # `io --worktree`
+│       ├── update.rs            # `io update`
+│       ├── history.rs           # prompt history (Up/Down, Ctrl+R)
+│       ├── vim.rs               # Vim-style prompt editing
 │       ├── agent.rs             # Agent switching (/agent command)
 │       ├── connect.rs           # Interactive provider setup wizard (13 providers)
 │       └── model.rs             # Provider switching (/model command)
@@ -457,6 +613,7 @@ io/
 │       ├── render.rs            # Terminal rendering: markdown, diffs, splash, prompt bar, scrollback
 │       ├── picker.rs            # Terminal interactive picker (arrow keys, viewport)
 │       ├── readline.rs          # Custom readline with slash commands
+│       ├── pager.rs             # Scrollable full-screen viewer (Ctrl+O transcript)
 │       └── theme.rs             # Interactive theme picker
 │
 ├── io-runtime/                  # Core engine (library crate)
@@ -471,6 +628,12 @@ io/
 │       ├── compact.rs           # /compact + auto-compact summarization
 │       ├── rewind.rs            # /rewind — restore files to an earlier point in the chat
 │       ├── hooks.rs             # Lifecycle hooks: shell commands around tool calls, prompts, sessions
+│       ├── settings.rs          # Layered settings.json (user/project/local/managed)
+│       ├── rules.rs             # allow/ask/deny rules: Bash(…), Read(…), Edit(…), WebFetch(domain:…)
+│       ├── instructions.rs      # Memory files: CLAUDE.md/AGENTS.md discovery, @imports, nested loading
+│       ├── os_sandbox.rs        # bubblewrap / Seatbelt wrapper for bash
+│       ├── output_style.rs      # Output styles (built-in and custom markdown)
+│       ├── export.rs            # Session → Markdown
 │       ├── mcp/                 # MCP client: config + trust, stdio/HTTP/SSE transports, tools
 │       ├── config.rs            # Config/schema (TOML), KeyStore, provider config structs
 │       ├── types.rs             # Core data types — Session, Turn, ToolCallRecord, TurnUsage
@@ -583,7 +746,7 @@ cargo build
 cargo run -- "your prompt"
 cargo run --
 
-# Run tests (434 unit tests + 66 integration tests; the MCP tests need `python3`)
+# Run tests (551 unit tests + 69 integration tests; the MCP tests need `python3`)
 cargo test
 
 # Add a new provider

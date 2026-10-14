@@ -14,6 +14,9 @@ This document provides comprehensive guidance for AI agents and developers worki
 - Vision input (`read` on images, `@image.png`, Ctrl+V clipboard paste) and extended thinking (`/think`, Alt+T, `think`/`ultrathink` keywords)
 - Built-in agent roles (`io-agents` crate): full agents (build, plan, debug, refactor) and restricted sub-agents (explore, review, test, security, docs, git, …)
 - Hooks (shell commands at eight lifecycle points) and an MCP client (stdio / streamable HTTP / SSE servers; their tools run as `mcp__<server>__<tool>`)
+- Layered `settings.json` with allow/ask/deny permission rules, memory files (`CLAUDE.md` nesting, `@import`), an optional OS sandbox for bash, output styles and a status-line command
+- Headless mode (`io -p`), session management (`/resume`, `/fork`, `/export`, …), git helpers (`/review`, `/commit`, `/pr`, `--worktree`), `io doctor`/`update`/`completions`
+- Prompt editing: history, Ctrl+R, multi-line, Vim mode, Ctrl+O transcript, Ctrl+B background, queued messages
 - Full-screen TUI and single-shot modes
 - Permission sandboxing (allow/deny/prompt modes)
 - SQLite-backed session persistence
@@ -40,6 +43,20 @@ io/
 │       ├── clipboard.rs       # Ctrl+V clipboard image paste, dropped image paths → @mentions
 │       ├── cost.rs            # /cost report
 │       ├── mcp_cmd.rs         # `io mcp …`, shared McpManager, project-server trust prompt
+│       ├── headless.rs        # `io -p`: one turn without the TUI; text / json / stream-json
+│       ├── run_opts.rs        # Per-run flags (--allowedTools, --append-system-prompt, --max-turns, …)
+│       ├── permissions.rs     # settings.json rules → PermissionChecker; /permissions; --add-dir
+│       ├── memory_cmd.rs      # `# note` quick-add, /memory
+│       ├── style_cmd.rs       # /output-style
+│       ├── statusline.rs      # the user's statusLine command
+│       ├── session_cmd.rs     # /resume picker, short ids, export names, replay + transcript lines
+│       ├── info_cmd.rs        # /status /context /hooks /agents /todos /bug /terminal-setup reports
+│       ├── doctor.rs          # `io doctor` / /doctor
+│       ├── git_prompts.rs     # /review /commit /pr → prompts
+│       ├── worktree.rs        # `io --worktree`
+│       ├── update.rs          # `io update`
+│       ├── history.rs         # prompt history + Up/Down browsing
+│       ├── vim.rs             # Vim-style editing state machine
 │       ├── config_cmd.rs      # `io config …` and `io init` handlers
 │       ├── agent.rs           # Agent switching (/agent command)
 │       ├── connect.rs         # Interactive provider setup wizard
@@ -51,6 +68,7 @@ io/
 │       ├── render.rs          # Terminal rendering: markdown, diffs, tool calls, status line
 │       ├── picker.rs          # Terminal interactive picker (typed Dismissed errors)
 │       ├── readline.rs        # Custom readline with slash commands
+│       ├── pager.rs           # Scrollable full-screen viewer (Ctrl+O)
 │       └── theme.rs           # Interactive theme picker
 ├── io-runtime/                # Core engine (library crate)
 │   ├── Cargo.toml
@@ -66,6 +84,12 @@ io/
 │       ├── hooks.rs           # Lifecycle hooks: user shell commands around tool calls, prompts, turns
 │       ├── mcp/               # MCP client: config.rs (files, trust), transport.rs (stdio/HTTP/SSE JSON-RPC),
 │       │                      #   sse.rs, client.rs (McpClient), tool.rs (McpTool), mod.rs (McpManager)
+│       ├── settings.rs        # Layered settings.json (user / project / local / managed)
+│       ├── rules.rs           # allow/ask/deny rules and their matching
+│       ├── instructions.rs    # Memory files: discovery, @imports, nested loading, notes
+│       ├── os_sandbox.rs      # bubblewrap / Seatbelt command wrapper
+│       ├── output_style.rs    # Output styles
+│       ├── export.rs          # Session → Markdown
 │       ├── config.rs          # Configuration schema, loading, provider lookups
 │       ├── pricing.rs         # Per-model cost tables
 │       ├── types.rs           # Core data types (Session, Turn, etc.)
@@ -426,6 +450,111 @@ Startup / per-call timeouts: `IO_MCP_STARTUP_TIMEOUT_MS` (20 s),
   [-H "K: V"] <name> <command…|url>` (options before the name), `list`
   (connects and shows status), `get` (secrets masked), `remove`. Files are
   written `0600`. `/mcp` lists servers; `/mcp reconnect` restarts them.
+
+**Settings and permission rules** (`settings.rs`, `rules.rs`, `io/src/permissions.rs`):
+`settings.json` files merge user → project → local → managed (managed path:
+`IO_MANAGED_SETTINGS`, else `/etc/io/managed-settings.json` /
+`/Library/Application Support/io/managed-settings.json`). Lists accumulate,
+scalars take the highest layer that sets them, and a managed file with
+`allowManagedPermissionRulesOnly` drops every other layer's rules. **The shared
+project file is untrusted**, so `Settings::apply` honours only `deny`/`ask`
+rules, `outputStyle`, `editorMode` and `sandbox.enabled = true` from it;
+`allow` rules, `additionalDirectories`, `defaultMode`, `statusLine` and the
+other sandbox keys come from user/local/managed (a dropped `allow` is reported
+in `Settings::problems`). Rules are `Tool` / `Tool(specifier)`:
+`Bash(prefix:*)` (word-boundary prefix), `Bash(exact)`, `*` wildcards;
+`Read(...)` → read/glob/grep and `Edit(...)`/`Write(...)` →
+`FILE_WRITE_TOOLS`, path specifiers `./x`, `/x` (project root), `~/x`, `//abs`,
+bare `*.env` (any depth) and a rule on a directory covers its contents
+(symlinks are resolved); `WebFetch(domain:x.com)` (subdomains on a dot
+boundary; `fetch` only); anything else matches a tool name, `mcp__…` through
+`mcp_rule_covers`. `PermissionChecker::decide_tool` evaluates, right after the
+plan-mode gate and in every permission mode: deny rule → `Deny`; ask rule →
+`Prompt` (beats session approvals and `allow` mode); then, at the
+`allowed_commands` position (after the sensitive-path / project-root guards),
+allow rule → `Allow`, except that a rule-allowed bash command still goes
+through `check_command` so the legacy `denied_commands` list wins. Deny/ask
+match *any* piece of a compound command (split on `&& || ; | & newline`,
+quote-aware, with `$(…)`, backticks and subshells split too, env-assignments
+stripped, command word reduced to its basename); allow must cover *every*
+piece and never applies when the command contains `$`, `` ` ``, `(` or `>`.
+`with_extra_roots` backs `additionalDirectories`, `--add-dir` and `/add-dir`
+(`is_in_project`). `/permissions allow|ask|deny|remove` edits
+`settings.local.json`; `build_agent` reloads settings on every rebuild, so
+edits take effect immediately. Note the read tool names its argument
+`file_path` (the others use `path`): rules and nested-memory loading accept
+both.
+
+**Memory** (`instructions.rs`): `discover(root, cwd, home)` returns, lowest
+precedence first, `~/.io/{AGENTS,CLAUDE}.md`, the root's `AGENTS.md`,
+`CLAUDE.md`, `.io/CLAUDE.md`, the same names in each directory between the root
+and cwd, then `CLAUDE.local.md`; `render` keeps the established
+`<project-context>` block format and `load_project_context(root)` is a thin
+wrapper. `@path` tokens (path-like only: `~/`, `/`, `./`, `../`, or containing
+`/`; not in fenced/inline code) import files after their importer, five levels
+deep, cycle-safe, ≤ 20 files of ≤ 100 KB, **confined** to the importer's
+scope (project files → the project, user files → `$HOME`) and never secrets
+(`.ssh`, `.env`, `id_rsa`, `keys.toml`, …). Files in directories *below* cwd
+load lazily: `Agent::with_nested_memory(root, loaded)` + `nested_memory_for`
+append `<nested-instructions>` to the result of a successful
+read/write/edit/multi_edit/notebook_edit on a file under them, once each.
+`# note` appends a bullet (`append_note`), `/memory` opens a file in
+`$VISUAL`/`$EDITOR` (leaving the alternate screen), `/init` sends
+`INIT_PROMPT` as a normal turn.
+
+**OS sandbox** (`os_sandbox.rs`, `BashTool::with_sandbox`,
+`SpawnAgentTool::with_sandbox`): `sandbox.enabled` wraps bash in `bwrap`
+(`--ro-bind / /`, `/tmp` and the project root and `writablePaths` writable,
+secret dirs under `$HOME` as tmpfs, `--unshare-pid/ipc/uts`, `--unshare-net`
+unless `sandbox.network`, `--die-with-parent`) or `sandbox-exec` with a
+generated Seatbelt profile (later rules win: deny writes, then allow the
+workspace). The ulimit prelude and the process-group kill still apply. No
+backend → bash returns an error (fail closed); sub-agents get the same policy.
+The real-bwrap test skips itself where user namespaces are unavailable.
+
+**Output styles and status line** (`output_style.rs`, `statusline.rs`): styles
+are prompt text appended to the system prompt in `build_agent`; custom ones are
+`*.md` files in `~/.io/output-styles` and `<root>/.io/output-styles` (project
+overrides user overrides built-in). `/output-style` writes `outputStyle` to
+`settings.local.json`. The status line runs the `statusLine` command before each
+prompt (2 s timeout, JSON on stdin), takes the first non-empty line, strips
+control characters and escape sequences (`render::sanitize_status`) and shows
+it via `render::set_custom_status`, replacing the `agent · model · provider`
+part of the status row.
+
+**Headless mode** (`headless.rs`, `run_opts.rs`): `io -p` composes the prompt
+from piped stdin (first) and the argument, builds a `build` agent, runs one turn
+and prints per `--output-format`. No prompt callback is set, so calls that would
+prompt are denied (stream-json answers `PermissionRequest` with a denial and
+emits `permission_denied`). Flags land in the process-wide `run_opts::RunOpts`
+read by `build_agent` (`--allowedTools`/`--disallowedTools` become extra rules
+in `permissions::apply`, `--append-system-prompt`, `--permission-mode`
+(`bypassPermissions` = `permissions.default = "allow"`; an explicit mode beats
+`defaultMode`), `--max-turns` → `Agent::with_max_iterations`;
+`Agent::hit_iteration_limit` feeds the `error_max_turns` subtype). An open,
+silent stdin is abandoned after 3 s when a prompt argument exists.
+
+**Sessions** (`session_cmd.rs`, `memory.rs`): `SessionMetadata.name` (optional,
+`/rename`); `list_sessions` reads title / turn count / model with SQLite JSON
+functions. `/resume` picks a session, replays its last turns into the
+scrollback and re-fires `session_start`; ids may be unique prefixes
+(`resolve_id`). `/fork` = `Agent::fork_session` (copy under a new id),
+`/export` = `export::to_markdown`, `/clear` = `/new`. `Agent::context_breakdown`
+feeds `/context`.
+
+**Prompt editing** (`input.rs`, `history.rs`, `vim.rs`): Up/Down browse
+`History` (`~/.io/history.jsonl`), Ctrl+R is an incremental search, Alt+Enter /
+Ctrl+J / trailing `\` insert a newline (on the splash screen they return
+`CONTINUE_MARKER` + text so the REPL carries it into the full prompt; Shift+Enter
+works where the kitty keyboard protocol is pushed — `render::enter_tui` does so
+only for known terminals), Ctrl+O returns the internal `/transcript` command
+(pager). Vim mode is the pure `Vim` state machine (the prompt feeds it keys in
+Normal mode; paste blocks and open popups bypass it). While a turn streams, the
+key-listener thread queues typed lines (`pending_inputs`), redraws the prompt
+bar under the stdout lock with the cursor saved/restored, and on Ctrl+B sets
+the bash tool's `background_handle` flag: `run_foreground` then hands the live
+child, pipes and waiter to a background job (`spawn_waiter`) and returns
+immediately.
 
 **Agent Loop**:
 1. Build message history from session (system prompt, then optional project-context synthetic message pair, then prior turns, then current user input). `user_prompt_submit` hooks run first and may reject the prompt or add context
@@ -879,9 +1008,12 @@ struct Cli {
   `permissions.denied_commands`, `thinking.enabled`, `thinking.budget_tokens`,
   `thinking.keywords`, `theme`
 - `io mcp {add|list|get|remove}` - MCP server management (see **MCP** above)
+- `io session {list|show|rename|export|fork|delete}` - ids may be unique prefixes
+- `io doctor` (exit 1 on a failed check), `io update [--install]`, `io completions <shell>`, `io logout [provider]`
+- Flags: `-p/--print`, `--output-format`, `--max-turns`, `--allowedTools`, `--disallowedTools`, `--append-system-prompt`, `--permission-mode`, `-r/--resume`, `--add-dir`, `--worktree [name]`
 - `io init` - Initialize project-level config
 
-**TUI slash commands**: `/help`, `/new`, `/agent`, `/connect`, `/model`, `/theme`, `/cost`, `/compact`, `/mcp` (`/mcp reconnect`), `/rewind` (also triggered by pressing Esc twice within 500 ms at the idle prompt), `/plan` (toggle plan mode), `/think [on|off|low|medium|high|<tokens>]` (persists to `[thinking]`), `/exit` (also `/quit`, `/q`).
+**TUI slash commands**: `/help`, `/new`, `/agent`, `/connect`, `/model`, `/theme`, `/cost`, `/compact`, `/mcp` (`/mcp reconnect`), `/resume`, `/clear`, `/rename`, `/fork`, `/export`, `/status`, `/context` (`/context refresh` = the old catalog lookup), `/todos`, `/hooks`, `/agents`, `/permissions`, `/add-dir`, `/memory`, `/init`, `/output-style`, `/review`, `/commit`, `/pr`, `/doctor`, `/vim`, `/logout`, `/usage`, `/terminal-setup`, `/bug`, `/rewind` (also triggered by pressing Esc twice within 500 ms at the idle prompt), `/plan` (toggle plan mode), `/think [on|off|low|medium|high|<tokens>]` (persists to `[thinking]`), `/exit` (also `/quit`, `/q`).
 Key bindings: Shift+Tab cycles the working mode, Alt+T toggles extended thinking,
 Ctrl+V attaches a clipboard image (`pngpaste`, `wl-paste` or `xclip`), Tab at the
 empty prompt cycles agents. A pasted path to an image file (drag-and-drop) is
@@ -1011,8 +1143,8 @@ Message history is built inline in `Agent::run_turn_inner`:
 
 ## Testing
 
-The project has 434 unit tests (393 in `io-runtime`, 31 in `io`, 9 in `io-tui`, 1 in
-`io-agents`) plus 66 integration tests (14 in `io-runtime/tests/mcp.rs`, described below, and 52 in
+The project has 551 unit tests (456 in `io-runtime`, 81 in `io`, 13 in `io-tui`, 1 in
+`io-agents`) plus 69 integration tests (14 in `io-runtime/tests/mcp.rs`, described below, and 55 in
 `io-runtime/tests/agent_loop.rs` — full agent-loop runs
 against a scripted mock provider, covering tool execution, permission
 prompting/denial, streaming events, usage tracking, session resumption,
@@ -1023,7 +1155,7 @@ counting toward the compaction threshold — a rewind that restores a file and
 truncates the session, and hooks: pre-tool veto that permissions can't
 override, fail-open on a crashing hook, post-tool feedback, prompt rejection
 and context injection, stop-hook firing only on success, and sub-agents
-inheriting tool hooks, plus the Phase 2 hooks (session_start once per session with context, session_end, notification on permission prompts, pre_compact cancel/guidance, JSON `ask`/`block` decisions, `allow` being a no-op); and for the Phase 1 features: edit-before-read
+inheriting tool hooks, nested memory files surfacing once, the iteration cap, session rename / fork, plus the Phase 2 hooks (session_start once per session with context, session_end, notification on permission prompts, pre_compact cancel/guidance, JSON `ask`/`block` decisions, `allow` being a no-op); and for the Phase 1 features: edit-before-read
 and stale-file refusals, multi_edit rewind, todo_write, the plan-mode flow —
 edits blocked until the plan is approved, approve-once vs accept-edits, rejection,
 read-only research, exit_plan_mode outside plan mode — accept-edits mode, tool-returned
@@ -1052,6 +1184,14 @@ Run with `cargo test`.
 | `io-runtime/tests/mcp.rs` | against a Python mock MCP server (needs `python3`): stdio, env, HTTP JSON/SSE replies, headers + 401, legacy SSE, multi-server, slow-tool timeout, server crash, startup failures with stderr, agent sees tools, allow/deny rules, plan mode honouring `readOnlyHint` |
 | `io/src/mcp_cmd.rs` | `--env`/`--header` parsing, building stdio/http/sse configs from CLI args, rejecting mismatched options, secret masking |
 | `sandbox.rs` (MCP) | `mcp__server`, `mcp__server__*` and exact rules; deny wins; default prompt; plan mode + `readOnlyHint` |
+| `rules.rs`, `settings.rs` | rule parsing; prefix / exact / glob bash rules; compound commands for deny, ask and allow; expansions, env prefixes, `/bin/` and escaped forms; path rules (root, home, absolute, any-depth, `..`, symlink-free, `file_path`); domain rules; layer merging, trust restrictions on the shared project file, managed-only rules, editing |
+| `sandbox.rs` (rules) | deny > ask > allow in every mode; allow never beats guards, plan mode or `denied_commands`; extra roots |
+| `instructions.rs` | discovery order, nested directories, block format, `@import` nesting / cycles / code / depth / confinement / secrets, lazy nested files, notes |
+| `os_sandbox.rs`, `tools/bash.rs` | bwrap and Seatbelt command lines, network flag, quoting, fail-closed bash, real bwrap run (skipped without it), Ctrl+B backgrounding |
+| `output_style.rs`, `io/src/{statusline,style_cmd}.rs`, `render.rs` (status) | built-in and file styles and overrides; status command JSON, first line, timeout; sanitising |
+| `memory.rs`, `export.rs`, `io/src/session_cmd.rs` | summaries (title / turns / model), old sessions load, Markdown export, prefix ids, export names, replay and transcript lines |
+| `io/src/{headless,run_opts,info_cmd,doctor,git_prompts,worktree,update,history,vim,permissions,memory_cmd}.rs` | prompt composition, stream-json events, tool-list splitting, report builders, doctor rendering, command expansion, worktree creation (real git), version comparison, history persistence / search / browsing, the whole Vim command set, `/permissions` editing |
+| `io-tui/src/pager.rs` | scroll clamping and visible window |
 | `config.rs` | default config, roundtrip serialization, schema upgrade (incl. `prompt_cache` / `[hooks]` / `[thinking]`), hooks + prompt_cache + thinking parsing |
 | `tools/file_state.rs` | unread / unchanged / stale / re-recorded / forgotten paths |
 | `tools/{edit,write,multi_edit,notebook}.rs` | read-before-edit and stale-file refusals, `replace_all`, all-or-nothing multi-edit, notebook replace/insert/delete by id and index, Jupyter-style serialization |

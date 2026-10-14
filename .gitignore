@@ -7,3 +7,7 @@ Cargo.lock
 .DS_Store
 node_modules/
 dist/
+# Personal, per-project settings and notes
+.io/settings.local.json
+CLAUDE.local.md
+.io/worktrees/
