@@ -22,7 +22,7 @@ use std::io::Write;
 
 // ── Session choice ─────────────────────────────────────────────────────────────
 
-enum SessionChoice {
+pub(crate) enum SessionChoice {
     New,
     Continue,
     Existing(SessionId),
@@ -113,9 +113,9 @@ fn apply_model_spec(config: &mut io_runtime::config::Config, spec: &str) {
 /// but must not re-announce the session. `/new` resets it.
 /// Read `settings.json` once at startup: report anything unusable and start in
 /// `permissions.defaultMode`.
-fn apply_startup_settings(root: &std::path::Path) -> Vec<String> {
+pub(crate) fn apply_startup_settings(root: &std::path::Path) -> Vec<String> {
     let settings = io_runtime::settings::Settings::load(root);
-    if let Some(mode) = settings.default_mode {
+    if let (Some(mode), false) = (settings.default_mode, crate::run_opts::get().explicit_mode) {
         status::set_initial_mode(mode);
     }
     settings
@@ -131,7 +131,7 @@ fn session_gate() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
     GATE.get_or_init(Default::default).clone()
 }
 
-async fn build_agent(
+pub(crate) async fn build_agent(
     session: SessionChoice,
     agent_config: &io_agents::AgentConfig,
     model_override: Option<&str>,
@@ -139,6 +139,10 @@ async fn build_agent(
     let mut config = io_runtime::config::Config::load()?;
     if let Some(spec) = model_override {
         apply_model_spec(&mut config, spec);
+    }
+    let run_opts = crate::run_opts::get();
+    if run_opts.bypass_permissions {
+        config.permissions.default = "allow".to_string();
     }
     let keys = io_runtime::config::KeyStore::load();
     let model_id = config.provider.active_model();
@@ -218,8 +222,13 @@ async fn build_agent(
         memory,
         permissions,
         format!(
-            "{}{}",
+            "{}{}{}",
             agent_config.full_system_prompt(),
+            run_opts
+                .append_system_prompt
+                .as_deref()
+                .map(|extra| format!("\n\n{extra}"))
+                .unwrap_or_default(),
             io_runtime::output_style::prompt_for(
                 settings.output_style.as_deref(),
                 &io_runtime::output_style::discover(&project_root, dirs::home_dir().as_deref()),
@@ -233,6 +242,7 @@ async fn build_agent(
         pricing_override,
     )
     .with_hooks(hooks)
+    .with_max_iterations(run_opts.max_turns.unwrap_or(0))
     .with_nested_memory(
         project_root,
         io_runtime::instructions::loaded_set(&memory_files),
@@ -381,9 +391,28 @@ pub async fn run_single_shot(prompt: &str, model_override: Option<&str>) -> anyh
 
 // ── Interactive REPL ───────────────────────────────────────────────────────────
 
+/// Show the tail of a resumed conversation in the scrollback.
+fn show_replay(
+    turns: &[io_runtime::types::Turn],
+    line_buf: &LineBuf,
+    theme: &io_tui::render::Theme,
+) -> anyhow::Result<()> {
+    line_buf.lock().unwrap().clear();
+    for line in crate::session_cmd::replay_lines(turns, 6) {
+        push_line(line_buf, line);
+    }
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+    )?;
+    render_scroll_view(&line_buf.lock().unwrap(), 0, theme, PROMPT_BAR_HEIGHT)?;
+    Ok(())
+}
+
 pub async fn run_interactive(
     new_session: bool,
     continue_session: bool,
+    resume: Option<&str>,
     model: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut config = io_runtime::config::Config::load()?;
@@ -422,17 +451,30 @@ pub async fn run_interactive(
     }
 
     let mut current_agent = io_agents::builtin::by_id("build").expect("build agent must exist");
-    let startup_session = if continue_session && !new_session {
+    let startup_session = if let Some(id) = resume {
+        SessionChoice::Existing(crate::session_cmd::resolve_id(
+            &io_runtime::memory::SessionStore::new()?,
+            id,
+        )?)
+    } else if continue_session && !new_session {
         SessionChoice::Continue
     } else {
         SessionChoice::New
     };
+    let resuming = resume.is_some() || (continue_session && !new_session);
     let mut agent = build_agent(startup_session, &current_agent, model).await?;
 
     enter_tui()?;
 
     let mut last_input_tokens: u32 = 0;
     let mut is_splash = true;
+    if resuming {
+        let turns = agent.session_turns().await;
+        if !turns.is_empty() {
+            show_replay(&turns, &line_buf, &theme)?;
+            is_splash = false;
+        }
+    }
 
     loop {
         {
@@ -545,7 +587,11 @@ pub async fn run_interactive(
                     "Commands:",
                     "  /exit, /quit   Exit",
                     "  /help          Show this help",
-                    "  /new           Start a new session",
+                    "  /new, /clear   Start a new session",
+                    "  /resume        Go back to an earlier session",
+                    "  /rename <n>    Name this session",
+                    "  /fork          Branch this session into a copy",
+                    "  /export [f]    Write this session to a Markdown file",
                     "  /agent         Switch agent mode",
                     "  /connect       Set up a provider interactively",
                     "  /login         Sign in with OAuth (ChatGPT / Claude)",
@@ -972,7 +1018,7 @@ pub async fn run_interactive(
                 }
                 continue;
             }
-            "/new" => {
+            "/new" | "/clear" => {
                 agent.end_session("new").await;
                 session_gate().store(false, std::sync::atomic::Ordering::SeqCst);
                 match build_agent(SessionChoice::New, &current_agent, None).await {
@@ -1112,6 +1158,125 @@ pub async fn run_interactive(
                         &theme,
                     );
                 }
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            "/resume" => {
+                let current = agent.session_id().await;
+                let picked = io_runtime::memory::SessionStore::new()
+                    .and_then(|store| crate::session_cmd::pick_session(&store, current));
+                let msg = match picked {
+                    Ok(Some(id)) => {
+                        agent.end_session("resume").await;
+                        session_gate().store(false, std::sync::atomic::Ordering::SeqCst);
+                        match build_agent(SessionChoice::Existing(id), &current_agent, None).await {
+                            Ok(new_agent) => {
+                                agent = new_agent;
+                                last_input_tokens = 0;
+                                let turns = agent.session_turns().await;
+                                show_replay(&turns, &line_buf, &theme)?;
+                                is_splash = false;
+                                format!("Resumed session {}", crate::session_cmd::short_id(id))
+                            }
+                            Err(e) => format!("error: {e}"),
+                        }
+                    }
+                    Ok(None) => "No other sessions to resume.".to_string(),
+                    Err(e) if e.is::<picker::Dismissed>() => String::new(),
+                    Err(e) => format!("error: {e}"),
+                };
+                if !msg.is_empty() {
+                    let _ = draw_prompt_bar(
+                        &msg,
+                        current_agent.name,
+                        agent.provider_id,
+                        &agent.model_id,
+                        last_input_tokens,
+                        agent.context_window(),
+                        &theme,
+                    );
+                }
+                if from_splash && is_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            _ if input == "/export" || input.starts_with("/export ") => {
+                let session = agent.session_snapshot().await;
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let path =
+                    crate::session_cmd::export_path(&input["/export".len()..], &session, &cwd);
+                let msg = match std::fs::write(&path, io_runtime::export::to_markdown(&session)) {
+                    Ok(()) => format!("Exported to {}", path.display()),
+                    Err(e) => format!("error: {}: {e}", path.display()),
+                };
+                let _ = draw_prompt_bar(
+                    &msg,
+                    current_agent.name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    last_input_tokens,
+                    agent.context_window(),
+                    &theme,
+                );
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            _ if input == "/rename" || input.starts_with("/rename ") => {
+                let name = input["/rename".len()..].trim().to_string();
+                let msg = if name.is_empty() {
+                    "usage: /rename <name>".to_string()
+                } else {
+                    match agent.rename_session(&name).await {
+                        Ok(()) => format!("Session renamed to \"{name}\""),
+                        Err(e) => format!("error: {e}"),
+                    }
+                };
+                let _ = draw_prompt_bar(
+                    &msg,
+                    current_agent.name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    last_input_tokens,
+                    agent.context_window(),
+                    &theme,
+                );
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            "/fork" => {
+                let original = agent.session_id().await;
+                let msg = match agent.fork_session().await {
+                    Ok(id) => {
+                        match build_agent(SessionChoice::Existing(id), &current_agent, None).await {
+                            Ok(new_agent) => {
+                                agent = new_agent;
+                                format!(
+                                    "Forked: now on {} (the original is {})",
+                                    crate::session_cmd::short_id(id),
+                                    crate::session_cmd::short_id(original)
+                                )
+                            }
+                            Err(e) => format!("error: {e}"),
+                        }
+                    }
+                    Err(e) => format!("error: {e}"),
+                };
+                let _ = draw_prompt_bar(
+                    &msg,
+                    current_agent.name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    last_input_tokens,
+                    agent.context_window(),
+                    &theme,
+                );
                 if from_splash {
                     is_splash = true;
                 }

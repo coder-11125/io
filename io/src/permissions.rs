@@ -33,10 +33,16 @@ fn runtime_dirs() -> Vec<PathBuf> {
 
 /// Layer `settings` (and any `--add-dir`s) onto `checker`.
 pub fn apply(checker: PermissionChecker, settings: &Settings, root: &Path) -> PermissionChecker {
+    // `--allowedTools` / `--disallowedTools` add to what settings.json says.
+    let flags = crate::run_opts::get();
+    let mut allow = settings.rules_in(RuleList::Allow);
+    allow.extend(flags.allowed_tools);
+    let mut deny = settings.rules_in(RuleList::Deny);
+    deny.extend(flags.disallowed_tools);
     let (rules, _) = RuleSet::from_strings(
-        &settings.rules_in(RuleList::Allow),
+        &allow,
         &settings.rules_in(RuleList::Ask),
-        &settings.rules_in(RuleList::Deny),
+        &deny,
         Some(root.to_path_buf()),
     );
     let mut dirs = settings.additional_directories.clone();

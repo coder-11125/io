@@ -1,18 +1,20 @@
 use clap::{Parser, Subcommand};
 use io_runtime::types::SessionId;
-use std::str::FromStr;
 
 mod agent;
 mod clipboard;
 mod config_cmd;
 mod connect;
 mod cost;
+mod headless;
 mod input;
 mod login;
 mod mcp_cmd;
 mod memory_cmd;
 mod model;
 mod permissions;
+mod run_opts;
+mod session_cmd;
 mod status;
 mod statusline;
 mod stream;
@@ -39,6 +41,48 @@ struct Cli {
     /// Override the LLM provider/model
     #[arg(long)]
     model: Option<String>,
+
+    /// Headless mode: run the prompt (argument and/or piped stdin), print the
+    /// result and exit
+    #[arg(short = 'p', long = "print")]
+    print: bool,
+
+    /// Headless output: text, json, or stream-json
+    #[arg(
+        long = "output-format",
+        value_enum,
+        default_value = "text",
+        requires = "print"
+    )]
+    output_format: headless::OutputFormat,
+
+    /// Most model calls per turn (default 20)
+    #[arg(long = "max-turns", value_name = "N")]
+    max_turns: Option<usize>,
+
+    /// Rules to pre-approve, e.g. "Bash(git log:*) Read" (commas or spaces)
+    #[arg(long = "allowedTools", alias = "allowed-tools", value_name = "RULES")]
+    allowed_tools: Option<String>,
+
+    /// Rules to refuse outright
+    #[arg(
+        long = "disallowedTools",
+        alias = "disallowed-tools",
+        value_name = "RULES"
+    )]
+    disallowed_tools: Option<String>,
+
+    /// Extra text for the end of the system prompt
+    #[arg(long = "append-system-prompt", value_name = "TEXT")]
+    append_system_prompt: Option<String>,
+
+    /// default, acceptEdits, plan or bypassPermissions
+    #[arg(long = "permission-mode", value_name = "MODE")]
+    permission_mode: Option<String>,
+
+    /// Resume a session by id (see `io session list`)
+    #[arg(short = 'r', long = "resume", value_name = "ID")]
+    resume: Option<String>,
 
     /// Let file tools reach this directory too (repeatable)
     #[arg(long = "add-dir", value_name = "DIR")]
@@ -84,9 +128,29 @@ enum ModelAction {
 
 #[derive(Subcommand)]
 enum SessionAction {
+    /// List recent sessions (id, last used, title, turns, model)
     List,
-    Show { id: String },
-    Delete { id: String },
+    /// Print a session's conversation
+    Show {
+        id: String,
+    },
+    Delete {
+        id: String,
+    },
+    /// Give a session a name
+    Rename {
+        id: String,
+        name: String,
+    },
+    /// Write a session as Markdown (to FILE, or a generated name)
+    Export {
+        id: String,
+        file: Option<String>,
+    },
+    /// Copy a session under a new id and print it
+    Fork {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -109,6 +173,35 @@ async fn main() -> anyhow::Result<()> {
     for dir in &cli.add_dir {
         permissions::add_dir(dir)?;
     }
+    let mut opts = run_opts::RunOpts {
+        allowed_tools: cli
+            .allowed_tools
+            .as_deref()
+            .map(run_opts::split_tool_list)
+            .unwrap_or_default(),
+        disallowed_tools: cli
+            .disallowed_tools
+            .as_deref()
+            .map(run_opts::split_tool_list)
+            .unwrap_or_default(),
+        append_system_prompt: cli.append_system_prompt.clone(),
+        bypass_permissions: false,
+        max_turns: cli.max_turns.filter(|n| *n > 0),
+        explicit_mode: cli.permission_mode.is_some(),
+    };
+    if let Some(word) = &cli.permission_mode {
+        match run_opts::parse_permission_mode(word).map_err(anyhow::Error::msg)? {
+            run_opts::ModeFlag::Default => {
+                status::set_initial_mode(io_runtime::InteractionMode::Default)
+            }
+            run_opts::ModeFlag::AcceptEdits => {
+                status::set_initial_mode(io_runtime::InteractionMode::AcceptEdits)
+            }
+            run_opts::ModeFlag::Plan => status::set_initial_mode(io_runtime::InteractionMode::Plan),
+            run_opts::ModeFlag::Bypass => opts.bypass_permissions = true,
+        }
+    }
+    run_opts::set(opts);
 
     match cli.command {
         Some(Commands::Session { action }) => handle_session(action).await?,
@@ -119,11 +212,28 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Model {
             action: ModelAction::Refresh,
         }) => println!("{}", model::refresh_context_window().await?),
+        None if cli.print => {
+            let code = headless::run(headless::Args {
+                prompt: cli.prompt,
+                format: cli.output_format,
+                model: cli.model,
+                continue_session: cli.r#continue,
+                resume: cli.resume,
+            })
+            .await?;
+            std::process::exit(code);
+        }
         None => {
             if let Some(prompt) = cli.prompt {
                 tui::run_single_shot(&prompt, cli.model.as_deref()).await?;
             } else {
-                tui::run_interactive(cli.new, cli.r#continue, cli.model.as_deref()).await?;
+                tui::run_interactive(
+                    cli.new,
+                    cli.r#continue,
+                    cli.resume.as_deref(),
+                    cli.model.as_deref(),
+                )
+                .await?;
             }
         }
     }
@@ -138,20 +248,17 @@ async fn handle_session(action: SessionAction) -> anyhow::Result<()> {
             let sessions = store.list_sessions()?;
             if sessions.is_empty() {
                 println!("No sessions found.");
-            } else {
-                for s in sessions {
-                    println!(
-                        "{}  (created: {}, updated: {})",
-                        s.id, s.created_at, s.updated_at
-                    );
-                }
+            }
+            for s in sessions {
+                println!("{}", session_cmd::list_line(&s));
             }
         }
         SessionAction::Show { id } => {
-            let session_id =
-                SessionId::from_str(&id).map_err(|_| anyhow::anyhow!("invalid session id"))?;
-            let session = store.load_session(session_id)?;
+            let session = store.load_session(session_cmd::resolve_id(&store, &id)?)?;
             println!("Session: {}", session.id);
+            if let Some(name) = &session.metadata.name {
+                println!("Name: {name}");
+            }
             println!("Created: {}", session.created_at);
             println!("Turns: {}", session.turns.len());
             for (i, turn) in session.turns.iter().enumerate() {
@@ -163,10 +270,30 @@ async fn handle_session(action: SessionAction) -> anyhow::Result<()> {
             }
         }
         SessionAction::Delete { id } => {
-            let session_id =
-                SessionId::from_str(&id).map_err(|_| anyhow::anyhow!("invalid session id"))?;
+            let session_id = session_cmd::resolve_id(&store, &id)?;
             store.delete_session(session_id)?;
-            println!("Session {id} deleted.");
+            println!("Session {session_id} deleted.");
+        }
+        SessionAction::Rename { id, name } => {
+            let mut session = store.load_session(session_cmd::resolve_id(&store, &id)?)?;
+            session.metadata.name = Some(name.trim().to_string()).filter(|n| !n.is_empty());
+            store.save_session(&session).await?;
+            println!("Session {} renamed.", session_cmd::short_id(session.id));
+        }
+        SessionAction::Export { id, file } => {
+            let session = store.load_session(session_cmd::resolve_id(&store, &id)?)?;
+            let cwd = std::env::current_dir()?;
+            let path = session_cmd::export_path(file.as_deref().unwrap_or(""), &session, &cwd);
+            std::fs::write(&path, io_runtime::export::to_markdown(&session))?;
+            println!("Wrote {}", path.display());
+        }
+        SessionAction::Fork { id } => {
+            let mut session = store.load_session(session_cmd::resolve_id(&store, &id)?)?;
+            session.id = SessionId::new();
+            session.updated_at = chrono::Utc::now();
+            session.metadata.name = session.metadata.name.map(|n| format!("{n} (fork)"));
+            store.save_session(&session).await?;
+            println!("{}", session.id);
         }
     }
     Ok(())

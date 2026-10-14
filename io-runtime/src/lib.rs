@@ -2,6 +2,7 @@ pub mod agent;
 pub mod command_safety;
 pub mod compact;
 pub mod config;
+pub mod export;
 pub mod hooks;
 pub mod instructions;
 pub mod mcp;
