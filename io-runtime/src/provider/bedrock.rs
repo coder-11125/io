@@ -158,7 +158,10 @@ impl CompletionModel for BedrockProvider {
         let mut body = serde_json::json!({
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": request.max_tokens.unwrap_or(16384),
-            "messages": build_messages(&request),
+            // Prompt caching is Anthropic-direct only for now: which Bedrock
+            // models accept `cache_control` varies, and a rejected marker
+            // fails the whole request.
+            "messages": build_messages(&request, false),
         });
         if let Some(temp) = request.temperature {
             body["temperature"] = serde_json::json!(temp);
@@ -169,7 +172,7 @@ impl CompletionModel for BedrockProvider {
                 "name": t.name, "description": t.description, "input_schema": t.input_schema,
             })).collect::<Vec<_>>());
         }
-        if let Some(ref system) = request.system_prompt {
+        if let Some(system) = request.system_text() {
             body["system"] = serde_json::json!(system);
         }
 
@@ -193,7 +196,10 @@ impl CompletionModel for BedrockProvider {
         let mut body = serde_json::json!({
             "anthropic_version": "bedrock-2023-05-31",
             "max_tokens": request.max_tokens.unwrap_or(16384),
-            "messages": build_messages(&request),
+            // Prompt caching is Anthropic-direct only for now: which Bedrock
+            // models accept `cache_control` varies, and a rejected marker
+            // fails the whole request.
+            "messages": build_messages(&request, false),
         });
         if let Some(temp) = request.temperature {
             body["temperature"] = serde_json::json!(temp);
@@ -204,7 +210,7 @@ impl CompletionModel for BedrockProvider {
                 "name": t.name, "description": t.description, "input_schema": t.input_schema,
             })).collect::<Vec<_>>());
         }
-        if let Some(ref system) = request.system_prompt {
+        if let Some(system) = request.system_text() {
             body["system"] = serde_json::json!(system);
         }
 

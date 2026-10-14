@@ -162,7 +162,7 @@ fn build_request_body(request: &CompletionRequest) -> serde_json::Value {
     let contents = build_contents(request);
     let mut body = serde_json::json!({ "contents": contents });
 
-    if let Some(ref system) = request.system_prompt {
+    if let Some(system) = request.system_text() {
         body["systemInstruction"] = serde_json::json!({ "parts": [{ "text": system }] });
     }
 
@@ -276,6 +276,19 @@ struct GeminiUsage {
     prompt_token_count: Option<u32>,
     #[serde(rename = "candidatesTokenCount")]
     candidates_token_count: Option<u32>,
+    /// How much of `promptTokenCount` came from Gemini's implicit cache.
+    #[serde(rename = "cachedContentTokenCount", default)]
+    cached_content_token_count: Option<u32>,
+}
+
+impl From<&GeminiUsage> for Usage {
+    fn from(u: &GeminiUsage) -> Self {
+        Usage::from_prompt_total(
+            u.prompt_token_count.unwrap_or(0),
+            u.candidates_token_count.unwrap_or(0),
+            u.cached_content_token_count,
+        )
+    }
 }
 
 fn convert_response(data: GeminiResponse) -> CompletionResponse {
@@ -304,10 +317,7 @@ fn convert_response(data: GeminiResponse) -> CompletionResponse {
         }
     }
 
-    let usage = data.usage_metadata.map(|u| Usage {
-        input_tokens: u.prompt_token_count.unwrap_or(0),
-        output_tokens: u.candidates_token_count.unwrap_or(0),
-    });
+    let usage = data.usage_metadata.as_ref().map(Usage::from);
 
     CompletionResponse {
         content,
@@ -322,11 +332,8 @@ fn convert_response_to_stream_event(data: GeminiResponse) -> StreamEvent {
     let mut stop_reason = None;
     let mut usage = None;
 
-    if let Some(u) = data.usage_metadata {
-        usage = Some(Usage {
-            input_tokens: u.prompt_token_count.unwrap_or(0),
-            output_tokens: u.candidates_token_count.unwrap_or(0),
-        });
+    if let Some(ref u) = data.usage_metadata {
+        usage = Some(Usage::from(u));
     }
 
     for candidate in data.candidates.unwrap_or_default() {
@@ -358,5 +365,83 @@ fn convert_response_to_stream_event(data: GeminiResponse) -> StreamEvent {
         content_block,
         stop_reason,
         usage,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::Message;
+
+    fn usage_of(json: &str) -> Usage {
+        convert_response(serde_json::from_str(json).unwrap())
+            .usage
+            .unwrap()
+    }
+
+    #[test]
+    fn cached_content_tokens_are_split_out_of_the_prompt_count() {
+        let u = usage_of(
+            r#"{"candidates":[],"usageMetadata":{"promptTokenCount":1000,
+                "candidatesTokenCount":40,"cachedContentTokenCount":750}}"#,
+        );
+        assert_eq!(u.input_tokens, 250);
+        assert_eq!(u.cache_read_tokens, 750);
+        assert_eq!(u.output_tokens, 40);
+        assert_eq!(u.context_tokens(), 1000, "context is the whole prompt");
+    }
+
+    #[test]
+    fn usage_without_cached_content_is_all_uncached() {
+        let u = usage_of(
+            r#"{"candidates":[],"usageMetadata":{"promptTokenCount":1000,
+                "candidatesTokenCount":40}}"#,
+        );
+        assert_eq!((u.input_tokens, u.cache_read_tokens), (1000, 0));
+    }
+
+    #[test]
+    fn streaming_chunk_reports_cached_tokens() {
+        let chunk: GeminiResponse = serde_json::from_str(
+            r#"{"usageMetadata":{"promptTokenCount":600,"candidatesTokenCount":5,
+                "cachedContentTokenCount":500}}"#,
+        )
+        .unwrap();
+        let u = convert_response_to_stream_event(chunk).usage.unwrap();
+        assert_eq!((u.input_tokens, u.cache_read_tokens), (100, 500));
+    }
+
+    #[test]
+    fn system_message_is_sent_as_system_instruction() {
+        // Regression: the agent supplies its prompt as a Role::System
+        // message, which used to be dropped on the way to Gemini.
+        let request = CompletionRequest {
+            messages: vec![
+                Message {
+                    role: Role::System,
+                    content: vec![ContentBlock::Text {
+                        text: "You are a test agent.".to_string(),
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text {
+                        text: "hello".to_string(),
+                    }],
+                },
+            ],
+            tools: vec![],
+            system_prompt: None,
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+        };
+        let body = build_request_body(&request);
+        assert_eq!(
+            body["systemInstruction"]["parts"][0]["text"],
+            "You are a test agent."
+        );
+        // The system text is not duplicated into the conversation contents.
+        assert_eq!(body["contents"].as_array().unwrap().len(), 1);
     }
 }

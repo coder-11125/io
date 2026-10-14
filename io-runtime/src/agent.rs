@@ -55,7 +55,7 @@ pub type PromptFn = Arc<dyn Fn(&str, &serde_json::Value) -> PermissionReply + Se
 
 use crate::memory::SessionStore;
 use crate::pricing::ModelPricing;
-use crate::provider::{CompletionModel, CompletionRequest, ContentBlock, StreamEvent};
+use crate::provider::{CompletionModel, CompletionRequest, ContentBlock, StreamEvent, Usage};
 use crate::provider::{Message, Role};
 use crate::sandbox::{PermissionChecker, PermissionLevel};
 use crate::tools::{ToolInput, ToolRegistry};
@@ -251,11 +251,10 @@ impl Agent {
         let mut all_text = String::new();
         let mut all_tool_calls: Vec<ToolCallRecord> = Vec::new();
         // Billing-accurate sums across loop iterations (each API call bills
-        // its own input), vs. the last reported input which reflects the
-        // current full context and drives the context bar and auto-compact.
-        let mut summed_input_tokens = 0u32;
-        let mut summed_output_tokens = 0u32;
-        let mut last_input_tokens = 0u32;
+        // its own input), vs. the last reported context size which reflects
+        // the current full context and drives the context bar and
+        // auto-compact. Cache reads/writes count toward the context size.
+        let mut tally = UsageTally::default();
         // A provider failure mid-turn. Set instead of returning immediately so
         // partial progress (text, executed tools) is still saved to the session.
         let mut turn_error: Option<anyhow::Error> = None;
@@ -304,13 +303,7 @@ impl Agent {
                         // Capture usage whenever present — may co-occur with
                         // stop_reason so extract it before the dispatch match.
                         if let Some(ref u) = ev.usage {
-                            if u.input_tokens > 0 {
-                                last_input_tokens = u.input_tokens;
-                                summed_input_tokens += u.input_tokens;
-                            }
-                            if u.output_tokens > 0 {
-                                summed_output_tokens += u.output_tokens;
-                            }
+                            tally.add(u);
                         }
                         match ev {
                             StreamEvent {
@@ -358,11 +351,7 @@ impl Agent {
                     };
 
                     if let Some(ref u) = response.usage {
-                        if u.input_tokens > 0 {
-                            last_input_tokens = u.input_tokens;
-                            summed_input_tokens += u.input_tokens;
-                        }
-                        summed_output_tokens += u.output_tokens;
+                        tally.add(u);
                     }
 
                     let mut iter_text = String::new();
@@ -487,27 +476,25 @@ impl Agent {
         }
 
         if let Some(tx) = token_tx {
-            if last_input_tokens > 0 || summed_output_tokens > 0 {
+            if tally.last_context_tokens > 0 || tally.output_tokens > 0 {
                 let _ = tx
                     .send(AgentEvent::Usage {
-                        input_tokens: last_input_tokens,
-                        output_tokens: summed_output_tokens,
+                        input_tokens: tally.last_context_tokens,
+                        output_tokens: tally.output_tokens,
                     })
                     .await;
             }
         }
 
-        let usage = if summed_input_tokens > 0 || summed_output_tokens > 0 {
-            Some(
-                TurnUsage::new(summed_input_tokens, summed_output_tokens).with_cost(
+        let usage = tally.any().then(|| {
+            TurnUsage::new(tally.input_tokens, tally.output_tokens)
+                .with_cache(tally.cache_read_tokens, tally.cache_write_tokens)
+                .with_cost(
                     self.provider_id,
                     &self.model_id,
                     self.pricing_override.clone(),
-                ),
-            )
-        } else {
-            None
-        };
+                )
+        });
 
         let turn = Turn {
             id: uuid::Uuid::new_v4(),
@@ -534,9 +521,9 @@ impl Agent {
             return Err(e);
         }
 
-        if self.auto_compact && last_input_tokens > 0 {
+        if self.auto_compact && tally.last_context_tokens > 0 {
             let threshold = (self.context_window() as f64 * 0.8) as u32;
-            if last_input_tokens >= threshold {
+            if tally.last_context_tokens >= threshold {
                 match crate::compact::run(&self.session, &self.provider, &self.memory).await {
                     Ok(r) if r.turns_compacted > 0 => match token_tx {
                         Some(tx) => {
@@ -669,6 +656,40 @@ impl Agent {
         turn_index: usize,
     ) -> anyhow::Result<crate::rewind::RewindResult> {
         crate::rewind::run(&self.session, &self.memory, turn_index).await
+    }
+}
+
+/// Token usage accumulated across the model calls of one turn.
+#[derive(Default)]
+struct UsageTally {
+    /// Sums over every call (each call bills its own input). `input_tokens`
+    /// is uncached input only; cache traffic is summed separately.
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_tokens: u32,
+    cache_write_tokens: u32,
+    /// Full context size (uncached + cache reads + cache writes) reported by
+    /// the most recent call — what the context bar and auto-compact use.
+    last_context_tokens: u32,
+}
+
+impl UsageTally {
+    fn add(&mut self, u: &Usage) {
+        let context = u.context_tokens();
+        if context > 0 {
+            self.last_context_tokens = context;
+        }
+        self.input_tokens = self.input_tokens.saturating_add(u.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(u.output_tokens);
+        self.cache_read_tokens = self.cache_read_tokens.saturating_add(u.cache_read_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.saturating_add(u.cache_write_tokens);
+    }
+
+    fn any(&self) -> bool {
+        self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cache_read_tokens > 0
+            || self.cache_write_tokens > 0
     }
 }
 

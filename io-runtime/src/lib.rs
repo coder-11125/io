@@ -14,7 +14,8 @@ pub mod types;
 pub use agent::{Agent, AgentEvent, Cancelled, PermissionReply, PromptFn};
 pub use compact::CompactResult;
 pub use pricing::{
-    get_pricing_for_model, get_provider_pricing_category, ModelPricing, ProviderPricingCategory,
+    cache_rates_for_model, get_pricing_for_model, get_provider_pricing_category, CacheRates,
+    ModelPricing, ProviderPricingCategory,
 };
 pub use rewind::RewindResult;
 pub use tools::SpawnAgentTool;

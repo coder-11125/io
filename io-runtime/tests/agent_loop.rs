@@ -121,6 +121,7 @@ fn text_response(text: &str) -> CompletionResponse {
         usage: Some(Usage {
             input_tokens: 100,
             output_tokens: 10,
+            ..Usage::default()
         }),
     }
 }
@@ -138,6 +139,7 @@ fn text_response_with_usage(
         usage: Some(Usage {
             input_tokens,
             output_tokens,
+            ..Usage::default()
         }),
     }
 }
@@ -153,6 +155,7 @@ fn tool_response(name: &str, input: serde_json::Value) -> CompletionResponse {
         usage: Some(Usage {
             input_tokens: 100,
             output_tokens: 10,
+            ..Usage::default()
         }),
     }
 }
@@ -727,4 +730,86 @@ async fn rewind_restores_file_and_truncates_session() {
         1,
         "rewound turn should be dropped from the session"
     );
+}
+
+// ── Prompt-cache accounting ───────────────────────────────────────────────────
+
+fn text_response_with_cache(
+    text: &str,
+    input_tokens: u32,
+    cache_read_tokens: u32,
+    cache_write_tokens: u32,
+) -> CompletionResponse {
+    CompletionResponse {
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+        stop_reason: Some("end_turn".to_string()),
+        usage: Some(Usage {
+            input_tokens,
+            output_tokens: 10,
+            cache_read_tokens,
+            cache_write_tokens,
+        }),
+    }
+}
+
+#[tokio::test]
+async fn cache_tokens_count_toward_context_size_and_auto_compact() {
+    // Only 100 tokens are uncached, but 850 more were served from the cache:
+    // the context is 950/1000 = 95%, past the 80% threshold. Measuring
+    // `input_tokens` alone (10%) would silently never compact.
+    let provider = MockProvider::new(vec![
+        text_response_with_cache("task done", 100, 850, 0),
+        text_response_with_usage("summary of the session", 50, 20),
+    ]);
+    provider.set_context_window(1000);
+    let db = temp_path("io-test", ".db");
+    let agent = make_auto_compact_agent(
+        provider.clone(),
+        PermissionChecker::new("allow"),
+        db.clone(),
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(16);
+    let consumer = tokio::spawn(async move {
+        let mut context_tokens = None;
+        let mut compacted = false;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                AgentEvent::Usage { input_tokens, .. } => context_tokens = Some(input_tokens),
+                AgentEvent::AutoCompact { .. } => compacted = true,
+                _ => {}
+            }
+        }
+        (context_tokens, compacted)
+    });
+
+    agent.run_turn_streaming("do the task", tx).await.unwrap();
+    let (context_tokens, compacted) = consumer.await.unwrap();
+    assert_eq!(
+        context_tokens,
+        Some(950),
+        "the Usage event reports the full context, cache reads included"
+    );
+    assert!(
+        compacted,
+        "auto-compact must see the cache-inclusive context"
+    );
+}
+
+#[tokio::test]
+async fn turn_usage_records_cache_traffic_separately_from_input() {
+    let provider = MockProvider::new(vec![text_response_with_cache("ok", 40, 900, 60)]);
+    let db = temp_path("io-test", ".db");
+    let agent = make_agent_at(provider, PermissionChecker::new("allow"), db.clone(), None);
+
+    agent.run_turn("hi").await.unwrap();
+
+    let store = SessionStore::with_path(db).unwrap();
+    let session = store.load_session(agent.session_id().await).unwrap();
+    let usage = session.turns[0].usage.as_ref().unwrap();
+    assert_eq!(usage.input_tokens, 40, "input_tokens stays uncached-only");
+    assert_eq!(usage.cache_read_tokens, 900);
+    assert_eq!(usage.cache_write_tokens, 60);
 }

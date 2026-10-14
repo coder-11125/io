@@ -241,6 +241,12 @@ pub struct AnthropicConfig {
     /// Authentication method: API key (default) or OAuth subscription login.
     #[serde(default)]
     pub auth: AuthMethod,
+    /// Mark the tools, system prompt and conversation prefix as cacheable so
+    /// repeated requests are billed at the (much lower) cache-read rate.
+    /// On by default; turn off for proxies or models that reject
+    /// `cache_control`.
+    #[serde(default = "default_true")]
+    pub prompt_cache: bool,
 }
 
 impl Default for AnthropicConfig {
@@ -254,6 +260,7 @@ impl Default for AnthropicConfig {
             cost_input_per_1k: None,
             cost_output_per_1k: None,
             auth: AuthMethod::ApiKey,
+            prompt_cache: true,
         }
     }
 }
@@ -981,6 +988,39 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), rewritten);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn schema_upgrade_adds_prompt_cache_without_touching_user_values() {
+        let path = temp_config_path("cache-upgrade");
+        let contents = r#"
+            [provider]
+            default = "anthropic"
+
+            [provider.anthropic]
+            model = "claude-sonnet-4-20250514"
+        "#;
+        std::fs::write(&path, contents).unwrap();
+
+        let config = Config::load_with_schema_upgrade(&path, contents).unwrap();
+        assert!(config.provider.anthropic.as_ref().unwrap().prompt_cache);
+
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(rewritten.contains("prompt_cache = true"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prompt_cache_can_be_turned_off_in_a_user_config() {
+        let config: Config = toml::from_str(
+            r#"
+            [provider.anthropic]
+            prompt_cache = false
+            "#,
+        )
+        .unwrap();
+        assert!(!config.provider.anthropic.as_ref().unwrap().prompt_cache);
     }
 
     #[test]

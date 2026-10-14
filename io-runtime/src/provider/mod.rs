@@ -83,6 +83,32 @@ pub struct CompletionRequest {
     pub stream: bool,
 }
 
+impl CompletionRequest {
+    /// The full system prompt: the explicit `system_prompt` followed by the
+    /// text of any `Role::System` messages. The agent supplies its prompt as
+    /// a system message, so providers whose wire format keeps the system
+    /// prompt outside the message list (Anthropic, Bedrock, Gemini) must use
+    /// this rather than reading `system_prompt` alone.
+    pub fn system_text(&self) -> Option<String> {
+        let mut parts: Vec<&str> = Vec::new();
+        if let Some(ref s) = self.system_prompt {
+            parts.push(s);
+        }
+        for msg in &self.messages {
+            if !matches!(msg.role, Role::System) {
+                continue;
+            }
+            for block in &msg.content {
+                if let ContentBlock::Text { text } = block {
+                    parts.push(text);
+                }
+            }
+        }
+        parts.retain(|p| !p.trim().is_empty());
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
+    }
+}
+
 #[derive(Debug)]
 pub struct CompletionResponse {
     pub content: Vec<ContentBlock>,
@@ -90,10 +116,56 @@ pub struct CompletionResponse {
     pub usage: Option<Usage>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Token usage for one model call.
+///
+/// `input_tokens` is the input billed at the full rate. Providers with
+/// prompt caching (Anthropic) report cached tokens separately, so the real
+/// size of the context sent is [`Usage::context_tokens`], not `input_tokens`.
+/// Providers without separate cache accounting leave the cache fields at 0
+/// and report their whole prompt in `input_tokens`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// Input tokens served from the prompt cache (billed at a discount).
+    #[serde(default)]
+    pub cache_read_tokens: u32,
+    /// Input tokens written to the prompt cache (billed at a premium).
+    #[serde(default)]
+    pub cache_write_tokens: u32,
+}
+
+impl Usage {
+    /// Build a `Usage` from a provider that reports its *whole* prompt size
+    /// with the cached portion as a subset of it (OpenAI's `prompt_tokens`
+    /// with `cached_tokens`, Gemini's `promptTokenCount` with
+    /// `cachedContentTokenCount`). The cached tokens are split out so
+    /// `input_tokens` keeps meaning "billed at the full rate", and
+    /// [`context_tokens`](Self::context_tokens) still equals the prompt total.
+    pub fn from_prompt_total(
+        prompt_tokens: u32,
+        output_tokens: u32,
+        cached_tokens: Option<u32>,
+    ) -> Self {
+        // A cached count larger than the prompt would be nonsense; clamp
+        // rather than underflow.
+        let cached = cached_tokens.unwrap_or(0).min(prompt_tokens);
+        Self {
+            input_tokens: prompt_tokens - cached,
+            output_tokens,
+            cache_read_tokens: cached,
+            cache_write_tokens: 0,
+        }
+    }
+
+    /// Total input tokens in the request's context: uncached, cache reads
+    /// and cache writes. This is what the context window and auto-compact
+    /// threshold must be measured against.
+    pub fn context_tokens(&self) -> u32 {
+        self.input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+    }
 }
 
 #[derive(Debug)]
@@ -579,6 +651,7 @@ pub fn create_provider(
                 context_window: ctx_override,
                 cost_input_per_1k: None,
                 cost_output_per_1k: None,
+                prompt_cache: cfg.prompt_cache,
             }))
         }
         "gemini" => {
@@ -755,6 +828,85 @@ mod tests {
             assert_eq!(provider.provider_name(), id);
             assert!(provider.context_window() > 0);
         }
+    }
+
+    fn text_message(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    fn request(system_prompt: Option<&str>, messages: Vec<Message>) -> CompletionRequest {
+        CompletionRequest {
+            messages,
+            tools: vec![],
+            system_prompt: system_prompt.map(str::to_string),
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+        }
+    }
+
+    #[test]
+    fn system_text_collects_system_messages_and_explicit_prompt() {
+        let req = request(
+            Some("explicit"),
+            vec![
+                text_message(Role::System, "from message"),
+                text_message(Role::User, "hello"),
+            ],
+        );
+        assert_eq!(
+            req.system_text().as_deref(),
+            Some("explicit\n\nfrom message")
+        );
+
+        let only_message = request(None, vec![text_message(Role::System, "sys")]);
+        assert_eq!(only_message.system_text().as_deref(), Some("sys"));
+    }
+
+    #[test]
+    fn system_text_is_none_without_a_system_prompt() {
+        let req = request(None, vec![text_message(Role::User, "hello")]);
+        assert_eq!(req.system_text(), None);
+        // Blank system text counts as absent.
+        let blank = request(Some("  "), vec![text_message(Role::System, "")]);
+        assert_eq!(blank.system_text(), None);
+    }
+
+    #[test]
+    fn usage_from_prompt_total_splits_cached_tokens_out_of_the_prompt() {
+        let u = Usage::from_prompt_total(1000, 50, Some(800));
+        assert_eq!((u.input_tokens, u.cache_read_tokens), (200, 800));
+        assert_eq!(u.output_tokens, 50);
+        assert_eq!(u.cache_write_tokens, 0);
+        // The context is still the whole prompt.
+        assert_eq!(u.context_tokens(), 1000);
+
+        // No cache info, or zero: everything is uncached input.
+        for cached in [None, Some(0)] {
+            let u = Usage::from_prompt_total(1000, 50, cached);
+            assert_eq!((u.input_tokens, u.cache_read_tokens), (1000, 0));
+        }
+        // A bogus cached count larger than the prompt is clamped.
+        let u = Usage::from_prompt_total(100, 5, Some(500));
+        assert_eq!((u.input_tokens, u.cache_read_tokens), (0, 100));
+        assert_eq!(u.context_tokens(), 100);
+    }
+
+    #[test]
+    fn usage_context_tokens_includes_cache_traffic() {
+        let u = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 900,
+            cache_write_tokens: 90,
+        };
+        assert_eq!(u.context_tokens(), 1000);
+        assert_eq!(Usage::default().context_tokens(), 0);
     }
 
     #[test]

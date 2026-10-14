@@ -11,6 +11,8 @@ pub async fn show_cost_summary(agent: &io_runtime::Agent) -> anyhow::Result<()> 
 
     let mut total_input_tokens: u32 = 0;
     let mut total_output_tokens: u32 = 0;
+    let mut total_cache_read_tokens: u32 = 0;
+    let mut total_cache_write_tokens: u32 = 0;
     let mut total_cost: f64 = 0.0;
     let mut priced_turns: usize = 0;
     let mut missing_cost_turns: usize = 0;
@@ -45,11 +47,22 @@ pub async fn show_cost_summary(agent: &io_runtime::Agent) -> anyhow::Result<()> 
             Some(usage) => {
                 total_input_tokens += usage.input_tokens;
                 total_output_tokens += usage.output_tokens;
+                total_cache_read_tokens += usage.cache_read_tokens;
+                total_cache_write_tokens += usage.cache_write_tokens;
+                // Prompt-cache traffic is billed apart from "in", so show it.
+                let cache_note = if usage.cache_read_tokens > 0 || usage.cache_write_tokens > 0 {
+                    format!(
+                        " [cache: {} read, {} write]",
+                        usage.cache_read_tokens, usage.cache_write_tokens
+                    )
+                } else {
+                    String::new()
+                };
                 if let Some(cost) = usage.cost {
                     total_cost += cost;
                     priced_turns += 1;
                     println!(
-                        "Turn {:>3}: {:>7} in + {:>7} out = ${:.6}",
+                        "Turn {:>3}: {:>7} in + {:>7} out = ${:.6}{cache_note}",
                         i + 1,
                         usage.input_tokens,
                         usage.output_tokens,
@@ -62,7 +75,7 @@ pub async fn show_cost_summary(agent: &io_runtime::Agent) -> anyhow::Result<()> 
                         missing_cost_turns += 1;
                     }
                     println!(
-                        "Turn {:>3}: {:>7} in + {:>7} out  ({})",
+                        "Turn {:>3}: {:>7} in + {:>7} out  ({}){cache_note}",
                         i + 1,
                         usage.input_tokens,
                         usage.output_tokens,
@@ -77,6 +90,10 @@ pub async fn show_cost_summary(agent: &io_runtime::Agent) -> anyhow::Result<()> 
     println!("--- Totals ---");
     println!("Input tokens:  {total_input_tokens}");
     println!("Output tokens: {total_output_tokens}");
+    if total_cache_read_tokens > 0 || total_cache_write_tokens > 0 {
+        println!("Cache read:    {total_cache_read_tokens} (discounted vs. input)");
+        println!("Cache write:   {total_cache_write_tokens}");
+    }
 
     match pricing_category {
         io_runtime::ProviderPricingCategory::Free => {

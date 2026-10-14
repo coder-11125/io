@@ -153,6 +153,7 @@ pub async fn run() -> anyhow::Result<String> {
                     context_window: None,
                     cost_input_per_1k: None,
                     cost_output_per_1k: None,
+                    prompt_cache: true,
                 });
             } else {
                 let key_input = ask_key(p.default_key_env)?;
@@ -171,6 +172,7 @@ pub async fn run() -> anyhow::Result<String> {
                     context_window: None,
                     cost_input_per_1k: None,
                     cost_output_per_1k: None,
+                    prompt_cache: true,
                 });
             }
         }

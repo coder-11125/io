@@ -231,8 +231,19 @@ pub struct Agent {
 Both run methods share one implementation (`run_turn_inner`); the optional
 event channel selects streaming vs. blocking mode. Per-turn usage records
 sum input tokens across loop iterations (billing-accurate), while the
-`Usage` event and auto-compact threshold use the last reported input
-(context-accurate).
+`Usage` event and auto-compact threshold use the last reported context size
+(context-accurate). Both are tracked by `UsageTally`; "context size" is
+`Usage::context_tokens()` = uncached input + prompt-cache reads + cache
+writes. Anthropic reports `input_tokens` *excluding* cached tokens, so
+measuring `input_tokens` alone would make the context bar read near-zero and
+silently stop auto-compact from ever triggering once caching is on.
+`TurnUsage.input_tokens` stays uncached-only; `cache_read_tokens` /
+`cache_write_tokens` are recorded beside it and priced by
+`ModelPricing::calculate_cost_with_cache` using per-provider
+`pricing::cache_rates_for_model` (approximate multiples of the input rate:
+Anthropic reads 0.1× / writes 1.25×; OpenAI reads 0.1–0.5× by model; Gemini
+2.x reads 0.25×; unknown models `CacheRates::NONE` = plain input rate, so
+cost is never understated). `/cost` shows the cache totals.
 
 **Replay policy**: prior turns are replayed into context as user/assistant
 text only — tool calls and results are deliberately dropped (token-heavy,
@@ -304,6 +315,40 @@ implementation notes:
   `bedrock.rs`; each `chunk` event base64-decodes to the same Anthropic SSE
   event JSON, which is then processed by the shared `AnthropicStreamState`.
 - **OpenAI / compat providers** — OpenAI SSE protocol with `stream_options.include_usage`.
+
+**System prompt delivery**: the agent supplies its system prompt (plus any
+compaction summary) as a `Role::System` message with `system_prompt: None`.
+OpenAI-protocol providers read it from the message list; Anthropic, Bedrock
+and Gemini keep the system prompt in a separate wire field, so they must use
+`CompletionRequest::system_text()` (explicit `system_prompt` + all system
+messages). Reading `request.system_prompt` alone silently drops the prompt —
+this was a bug on those three providers before `system_text()` existed.
+
+**Prompt caching (Anthropic)**: with `provider.anthropic.prompt_cache = true`
+(default) `AnthropicProvider::build_body` — shared by `complete` and
+`complete_stream` so both always send identical markers — sends `system` as a
+single text block with `cache_control: ephemeral` (the request order is
+tools → system → messages, so that breakpoint also caches the tool
+definitions) and puts a second breakpoint on the last content block of the
+last message. Within a turn each tool-loop request then reuses everything
+before the newest tool result; across turns the replayed history (tool
+traffic dropped) is a stable prefix. Cached tokens come back as
+`Usage.cache_read_tokens` / `cache_write_tokens` (`AnthropicStreamState`
+reads them from `message_start`, and `message_delta` when present). Prompts
+under the model's minimum cacheable size are silently not cached by the API.
+Bedrock sends no `cache_control` (support varies by model and a rejected
+marker fails the request).
+
+**Implicit caching (OpenAI, Gemini)**: these cache long repeated prefixes
+server-side with no request markup, so there is nothing to enable — we only
+report it. OpenAI (and compatible providers that mirror it) return
+`usage.prompt_tokens_details.cached_tokens`; Gemini returns
+`usageMetadata.cachedContentTokenCount`. In both, the cached count is a
+*subset* of the prompt total, so `Usage::from_prompt_total` splits it out
+(`input_tokens` = prompt − cached, `cache_read_tokens` = cached) — keeping
+`input_tokens` uncached-only everywhere and `context_tokens()` equal to the
+real prompt size. Providers that don't send the field (e.g. DeepSeek, which
+uses `prompt_cache_hit_tokens`) simply report 0 cached.
 
 **Adding a New Provider** (OpenAI-compatible — the common case):
 1. Add a config struct in `io-runtime/src/config.rs` and a field on `ProviderConfig`
@@ -527,6 +572,7 @@ default = "anthropic"
 model = "claude-sonnet-4-20250514"
 base_url = "https://api.anthropic.com/v1"
 api_key_env = "ANTHROPIC_API_KEY"
+prompt_cache = true           # mark system prompt + conversation prefix cacheable
 
 [session]
 auto_compact = true
@@ -727,14 +773,16 @@ Message history is built inline in `Agent::run_turn_inner`:
 
 ## Testing
 
-The project has 212 unit tests (199 in `io-runtime`, 9 in `io`, 4 in `io-tui`) plus 13
+The project has 240 unit tests (227 in `io-runtime`, 9 in `io`, 4 in `io-tui`) plus 15
 integration tests (`io-runtime/tests/agent_loop.rs` — full agent-loop runs
 against a scripted mock provider, covering tool execution, permission
 prompting/denial, streaming events, usage tracking, session resumption,
 sub-agent permission inheritance, partial-progress persistence on
 mid-turn provider failure, auto-compact triggering — including a second
-compaction pass folding the prior summary into the new one — and a rewind
-that restores a file and truncates the session). Run with `cargo test`.
+compaction pass folding the prior summary into the new one, and cache reads
+counting toward the compaction threshold and cache traffic recorded
+separately on the turn — and a rewind that restores a file and truncates the
+session). Run with `cargo test`.
 
 | Module | Tests |
 |---|---|
@@ -748,9 +796,13 @@ that restores a file and truncates the session). Run with `cargo test`.
 | `tools/grep.rs` | missing arg, invalid regex, matches with line numbers, no matches |
 | `tools/fetch.rs` | missing url, invalid URL, unsupported scheme, blocked localhost/private/link-local/metadata hosts, response truncation |
 | `sandbox.rs` | allow/deny/prompt modes, denylist, allowlist requires every command head, env-assignment skipping, safe-command auto-allow, decide_tool prompting, session approvals, fetch-tool network lenience |
-| `provider/mod.rs` | retry classification by HTTP status, unknown-provider rejection, compat provider resolution, context-window tuning |
-| `config.rs` | default config, roundtrip serialization |
-| `pricing.rs` | cost calculation, known models, free/subscription/passthrough providers |
+| `provider/mod.rs` | retry classification by HTTP status, unknown-provider rejection, compat provider resolution, context-window tuning, `system_text()` collection, `Usage::context_tokens()`, `Usage::from_prompt_total` (split, no-cache, clamped) |
+| `provider/anthropic.rs` | system prompt sent from a system message, cache markers (system + last message block, none elsewhere), caching off = no markers, streaming/blocking bodies identical, last-tool breakpoint when no system, cache usage parsing (stream + blocking, nulls) |
+| `provider/gemini.rs` | system message sent as `systemInstruction`; `cachedContentTokenCount` split out of the prompt count (blocking + streaming, absent = uncached) |
+| `provider/openai.rs` | `cached_tokens` split out of `prompt_tokens` (blocking + streaming); missing/null/empty details = uncached |
+| `config.rs` | default config, roundtrip serialization, schema upgrade (incl. `prompt_cache`), prompt_cache parsing |
+| `pricing.rs` | cost calculation (incl. cache read/write rates), per-provider cache rates (Anthropic/Bedrock-Claude/OpenAI/Gemini/unknown), known models, free/subscription/passthrough providers |
+| `types.rs` | `TurnUsage` cost with cache traffic (Anthropic and OpenAI rates, unknown-model fallback), serde of cache fields (omitted at 0, old records load) |
 | `io/src/stream.rs` | ThinkParser: plain text, think blocks, tags split across deltas, unterminated blocks, multibyte boundaries |
 | `io-tui/src/render.rs` | `splash_box_width`: default width for short input, growth for long input, clamping at the terminal-width cap, narrow-terminal floor |
 

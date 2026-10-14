@@ -46,6 +46,68 @@ impl AnthropicProvider {
     fn url(&self, path: &str) -> String {
         format!("{}/{}", self.config.base_url.trim_end_matches('/'), path)
     }
+
+    /// The `/messages` request body, shared by the blocking and streaming
+    /// paths so both always send identical content and cache markers.
+    fn build_body(&self, request: &CompletionRequest, stream: bool) -> serde_json::Value {
+        let cache = self.config.prompt_cache;
+        let mut body = serde_json::json!({
+            "model": self.config.model,
+            "max_tokens": request.max_tokens.unwrap_or(16384),
+            "messages": build_messages(request, cache),
+        });
+        if stream {
+            body["stream"] = serde_json::json!(true);
+        }
+        if let Some(temp) = request.temperature {
+            body["temperature"] = serde_json::json!(temp);
+        }
+        let system = build_system(request, cache);
+        // Request order is tools → system → messages, so a breakpoint on the
+        // system block caches the tool definitions too. Without a system
+        // prompt, mark the last tool instead.
+        if !request.tools.is_empty() {
+            body["tools"] = build_tools(request, cache && system.is_none());
+        }
+        if let Some(system) = system {
+            body["system"] = system;
+        }
+        body
+    }
+}
+
+/// Anthropic's prompt-cache breakpoint marker (5-minute TTL).
+fn cache_marker() -> serde_json::Value {
+    serde_json::json!({ "type": "ephemeral" })
+}
+
+/// The `system` field. With caching on it is a single text block carrying a
+/// cache breakpoint; otherwise a plain string.
+fn build_system(request: &CompletionRequest, cache: bool) -> Option<serde_json::Value> {
+    let text = request.system_text()?;
+    Some(if cache {
+        serde_json::json!([{ "type": "text", "text": text, "cache_control": cache_marker() }])
+    } else {
+        serde_json::json!(text)
+    })
+}
+
+fn build_tools(request: &CompletionRequest, cache_last: bool) -> serde_json::Value {
+    let mut tools: Vec<serde_json::Value> = request
+        .tools
+        .iter()
+        .map(|t| {
+            serde_json::json!({
+                "name": t.name, "description": t.description, "input_schema": t.input_schema,
+            })
+        })
+        .collect();
+    if cache_last {
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = cache_marker();
+        }
+    }
+    serde_json::json!(tools)
 }
 
 /// Stateful parser for Anthropic's server-sent event stream.
@@ -53,6 +115,8 @@ impl AnthropicProvider {
 /// Anthropic event JSON inside AWS event-stream binary frames).
 pub(crate) struct AnthropicStreamState {
     input_tokens: u32,
+    cache_read_tokens: u32,
+    cache_write_tokens: u32,
     // index → (id, name, accumulated_json_args)
     tool_blocks: std::collections::HashMap<u32, (String, String, String)>,
 }
@@ -61,6 +125,8 @@ impl AnthropicStreamState {
     pub fn new() -> Self {
         Self {
             input_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             tool_blocks: Default::default(),
         }
     }
@@ -76,9 +142,11 @@ impl AnthropicStreamState {
 
         match event["type"].as_str().unwrap_or("") {
             "message_start" => {
-                if let Some(t) = event["message"]["usage"]["input_tokens"].as_u64() {
+                let usage = &event["message"]["usage"];
+                if let Some(t) = usage["input_tokens"].as_u64() {
                     self.input_tokens = t as u32;
                 }
+                self.record_cache_usage(usage);
             }
             "content_block_start" => {
                 let idx = event["index"].as_u64().unwrap_or(0) as u32;
@@ -135,6 +203,8 @@ impl AnthropicStreamState {
             "message_delta" => {
                 let stop_reason = event["delta"]["stop_reason"].as_str().map(str::to_string);
                 let output_tokens = event["usage"]["output_tokens"].as_u64().unwrap_or(0) as u32;
+                // Newer API versions repeat the (final) cache counters here.
+                self.record_cache_usage(&event["usage"]);
                 events.push(StreamEvent {
                     delta: None,
                     content_block: None,
@@ -142,6 +212,8 @@ impl AnthropicStreamState {
                     usage: Some(Usage {
                         input_tokens: self.input_tokens,
                         output_tokens,
+                        cache_read_tokens: self.cache_read_tokens,
+                        cache_write_tokens: self.cache_write_tokens,
                     }),
                 });
             }
@@ -152,6 +224,16 @@ impl AnthropicStreamState {
         }
 
         Ok((events, done))
+    }
+
+    /// Take the cache counters from a `usage` object, when it carries them.
+    fn record_cache_usage(&mut self, usage: &serde_json::Value) {
+        if let Some(n) = usage["cache_read_input_tokens"].as_u64() {
+            self.cache_read_tokens = n as u32;
+        }
+        if let Some(n) = usage["cache_creation_input_tokens"].as_u64() {
+            self.cache_write_tokens = n as u32;
+        }
     }
 }
 
@@ -169,25 +251,7 @@ impl CompletionModel for AnthropicProvider {
 
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse> {
         let (auth_header, auth_value) = self.auth_header().await?;
-
-        let mut body = serde_json::json!({
-            "model": self.config.model,
-            "max_tokens": request.max_tokens.unwrap_or(16384),
-            "messages": build_messages(&request),
-        });
-
-        if let Some(temp) = request.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        if !request.tools.is_empty() {
-            body["tools"] =
-                serde_json::json!(request.tools.iter().map(|t| serde_json::json!({
-                "name": t.name, "description": t.description, "input_schema": t.input_schema,
-            })).collect::<Vec<_>>());
-        }
-        if let Some(ref system) = request.system_prompt {
-            body["system"] = serde_json::json!(system);
-        }
+        let body = self.build_body(&request, false);
 
         let resp = self
             .client
@@ -212,25 +276,7 @@ impl CompletionModel for AnthropicProvider {
         request: CompletionRequest,
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<StreamEvent>>> {
         let (auth_header, auth_value) = self.auth_header().await?;
-
-        let mut body = serde_json::json!({
-            "model": self.config.model,
-            "max_tokens": request.max_tokens.unwrap_or(16384),
-            "messages": build_messages(&request),
-            "stream": true,
-        });
-        if let Some(temp) = request.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        if !request.tools.is_empty() {
-            body["tools"] =
-                serde_json::json!(request.tools.iter().map(|t| serde_json::json!({
-                "name": t.name, "description": t.description, "input_schema": t.input_schema,
-            })).collect::<Vec<_>>());
-        }
-        if let Some(ref system) = request.system_prompt {
-            body["system"] = serde_json::json!(system);
-        }
+        let body = self.build_body(&request, true);
 
         let resp = self
             .client
@@ -303,8 +349,13 @@ impl CompletionModel for AnthropicProvider {
     }
 }
 
-pub(crate) fn build_messages(request: &CompletionRequest) -> Vec<serde_json::Value> {
-    request
+/// Convert the conversation to Anthropic's `messages` array. System messages
+/// are skipped here — they travel in the separate `system` field. With
+/// `cache` on, the last content block of the last message gets a cache
+/// breakpoint, so each request in the agent's tool loop (and the next turn)
+/// can reuse everything before it.
+pub(crate) fn build_messages(request: &CompletionRequest, cache: bool) -> Vec<serde_json::Value> {
+    let mut messages: Vec<serde_json::Value> = request
         .messages
         .iter()
         .filter_map(|msg| {
@@ -341,7 +392,22 @@ pub(crate) fn build_messages(request: &CompletionRequest) -> Vec<serde_json::Val
 
             Some(serde_json::json!({ "role": role, "content": content }))
         })
-        .collect()
+        .collect();
+
+    if cache {
+        let last_block = messages
+            .last_mut()
+            .and_then(|m| m["content"].as_array_mut())
+            .and_then(|blocks| blocks.last_mut());
+        if let Some(block) = last_block {
+            // The API rejects a cache breakpoint on an empty text block.
+            let empty_text = block["type"] == "text" && block["text"] == "";
+            if !empty_text {
+                block["cache_control"] = cache_marker();
+            }
+        }
+    }
+    messages
 }
 
 #[derive(serde::Deserialize)]
@@ -368,6 +434,11 @@ enum AnthropicContentBlock {
 struct AnthropicUsage {
     input_tokens: u32,
     output_tokens: u32,
+    // `null` or absent when the request used no caching.
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
 }
 
 pub(crate) fn parse_and_convert_response(text: &str) -> anyhow::Result<CompletionResponse> {
@@ -390,10 +461,259 @@ fn convert_response(data: AnthropicResponse) -> CompletionResponse {
     let usage = data.usage.map(|u| Usage {
         input_tokens: u.input_tokens,
         output_tokens: u.output_tokens,
+        cache_read_tokens: u.cache_read_input_tokens.unwrap_or(0),
+        cache_write_tokens: u.cache_creation_input_tokens.unwrap_or(0),
     });
     CompletionResponse {
         content,
         stop_reason: data.stop_reason,
         usage,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::Message;
+    use crate::tools::ToolSpec;
+
+    fn msg(role: Role, content: Vec<ContentBlock>) -> Message {
+        Message { role, content }
+    }
+
+    fn text(t: &str) -> ContentBlock {
+        ContentBlock::Text {
+            text: t.to_string(),
+        }
+    }
+
+    fn sample_request() -> CompletionRequest {
+        CompletionRequest {
+            messages: vec![
+                msg(Role::System, vec![text("You are a test agent.")]),
+                msg(Role::User, vec![text("first question")]),
+                msg(Role::Assistant, vec![text("first answer")]),
+                msg(
+                    Role::User,
+                    vec![
+                        text("second question"),
+                        ContentBlock::ToolResult {
+                            tool_use_id: "call_1".to_string(),
+                            content: "result".to_string(),
+                            is_error: None,
+                        },
+                    ],
+                ),
+            ],
+            tools: vec![
+                ToolSpec {
+                    name: "read".to_string(),
+                    description: "read a file".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                ToolSpec {
+                    name: "bash".to_string(),
+                    description: "run a command".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+            ],
+            system_prompt: None,
+            max_tokens: Some(1024),
+            temperature: None,
+            stream: false,
+        }
+    }
+
+    fn provider(prompt_cache: bool) -> AnthropicProvider {
+        AnthropicProvider::new(AnthropicConfig {
+            prompt_cache,
+            ..AnthropicConfig::default()
+        })
+    }
+
+    #[test]
+    fn system_prompt_from_system_message_is_sent() {
+        // Regression: the agent supplies its prompt as a Role::System
+        // message, which used to be dropped on the way to Anthropic.
+        let body = provider(false).build_body(&sample_request(), false);
+        assert_eq!(body["system"], "You are a test agent.");
+        // …and is not duplicated into the messages array.
+        let roles: Vec<&str> = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+    }
+
+    #[test]
+    fn cache_on_marks_system_and_last_message_block_only() {
+        let body = provider(true).build_body(&sample_request(), false);
+
+        // System becomes a single cached text block.
+        let system = body["system"].as_array().expect("system is a block array");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0]["text"], "You are a test agent.");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+
+        // The breakpoint sits on the last block of the last message…
+        let messages = body["messages"].as_array().unwrap();
+        let last_blocks = messages.last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(
+            last_blocks.last().unwrap()["cache_control"]["type"],
+            "ephemeral"
+        );
+        // …and nowhere else in the conversation.
+        let marked = messages
+            .iter()
+            .flat_map(|m| m["content"].as_array().unwrap())
+            .filter(|b| b.get("cache_control").is_some())
+            .count();
+        assert_eq!(marked, 1);
+
+        // Tools are covered by the system breakpoint, not marked themselves.
+        assert!(body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t.get("cache_control").is_none()));
+    }
+
+    #[test]
+    fn cache_off_sends_no_cache_markers() {
+        let body = provider(false).build_body(&sample_request(), true);
+        assert!(!body.to_string().contains("cache_control"));
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn streaming_and_blocking_bodies_match_apart_from_the_stream_flag() {
+        let p = provider(true);
+        let mut streaming = p.build_body(&sample_request(), true);
+        let blocking = p.build_body(&sample_request(), false);
+        assert!(blocking.get("stream").is_none());
+        streaming.as_object_mut().unwrap().remove("stream");
+        assert_eq!(streaming, blocking);
+    }
+
+    #[test]
+    fn without_a_system_prompt_the_last_tool_carries_the_breakpoint() {
+        let mut req = sample_request();
+        req.messages.remove(0);
+        let body = provider(true).build_body(&req, false);
+        assert!(body.get("system").is_none());
+        let tools = body["tools"].as_array().unwrap();
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn empty_trailing_text_block_is_not_marked() {
+        let req = CompletionRequest {
+            messages: vec![msg(Role::User, vec![text("")])],
+            tools: vec![],
+            system_prompt: None,
+            max_tokens: None,
+            temperature: None,
+            stream: false,
+        };
+        let messages = build_messages(&req, true);
+        assert!(messages[0]["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn stream_state_reports_cache_usage_from_message_start() {
+        let mut state = AnthropicStreamState::new();
+        state
+            .process_event(&serde_json::json!({
+                "type": "message_start",
+                "message": { "usage": {
+                    "input_tokens": 12,
+                    "cache_read_input_tokens": 800,
+                    "cache_creation_input_tokens": 30,
+                }}
+            }))
+            .unwrap();
+        let (events, _) = state
+            .process_event(&serde_json::json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": { "output_tokens": 55 }
+            }))
+            .unwrap();
+        let usage = events[0].usage.as_ref().unwrap();
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.output_tokens, 55);
+        assert_eq!(usage.cache_read_tokens, 800);
+        assert_eq!(usage.cache_write_tokens, 30);
+        assert_eq!(usage.context_tokens(), 842);
+    }
+
+    #[test]
+    fn stream_state_without_cache_fields_reports_zero_cache_usage() {
+        let mut state = AnthropicStreamState::new();
+        state
+            .process_event(&serde_json::json!({
+                "type": "message_start",
+                "message": { "usage": { "input_tokens": 100 } }
+            }))
+            .unwrap();
+        let (events, _) = state
+            .process_event(&serde_json::json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": { "output_tokens": 5 }
+            }))
+            .unwrap();
+        let usage = events[0].usage.as_ref().unwrap();
+        assert_eq!((usage.cache_read_tokens, usage.cache_write_tokens), (0, 0));
+        assert_eq!(usage.context_tokens(), 100);
+    }
+
+    #[test]
+    fn message_delta_cache_counters_override_message_start() {
+        let mut state = AnthropicStreamState::new();
+        state
+            .process_event(&serde_json::json!({
+                "type": "message_start",
+                "message": { "usage": { "input_tokens": 5, "cache_read_input_tokens": 1 } }
+            }))
+            .unwrap();
+        let (events, _) = state
+            .process_event(&serde_json::json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "end_turn" },
+                "usage": { "output_tokens": 9, "cache_read_input_tokens": 700 }
+            }))
+            .unwrap();
+        assert_eq!(events[0].usage.as_ref().unwrap().cache_read_tokens, 700);
+    }
+
+    #[test]
+    fn blocking_response_parses_cache_usage_including_nulls() {
+        let with_cache = parse_and_convert_response(
+            r#"{"content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn",
+                "usage":{"input_tokens":4,"output_tokens":2,
+                         "cache_read_input_tokens":500,"cache_creation_input_tokens":20}}"#,
+        )
+        .unwrap();
+        let u = with_cache.usage.unwrap();
+        assert_eq!((u.cache_read_tokens, u.cache_write_tokens), (500, 20));
+
+        let nulls = parse_and_convert_response(
+            r#"{"content":[],"stop_reason":"end_turn",
+                "usage":{"input_tokens":4,"output_tokens":2,
+                         "cache_read_input_tokens":null,"cache_creation_input_tokens":null}}"#,
+        )
+        .unwrap();
+        let u = nulls.usage.unwrap();
+        assert_eq!((u.cache_read_tokens, u.cache_write_tokens), (0, 0));
+
+        let absent = parse_and_convert_response(
+            r#"{"content":[],"usage":{"input_tokens":4,"output_tokens":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(absent.usage.unwrap().context_tokens(), 4);
     }
 }

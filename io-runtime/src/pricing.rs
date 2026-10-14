@@ -34,6 +34,77 @@ impl ModelPricing {
         (input_tokens as f64 / 1000.0) * self.input_cost_per_1k
             + (output_tokens as f64 / 1000.0) * self.output_cost_per_1k
     }
+
+    /// Like [`calculate_cost`](Self::calculate_cost) but also prices prompt-cache
+    /// traffic: `input_tokens` is the uncached input, and `cache_read_tokens` /
+    /// `cache_write_tokens` are billed at `rates` times the input rate.
+    pub fn calculate_cost_with_cache(
+        &self,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read_tokens: u32,
+        cache_write_tokens: u32,
+        rates: CacheRates,
+    ) -> f64 {
+        self.calculate_cost(input_tokens, output_tokens)
+            + (cache_read_tokens as f64 / 1000.0) * self.input_cost_per_1k * rates.read
+            + (cache_write_tokens as f64 / 1000.0) * self.input_cost_per_1k * rates.write
+    }
+}
+
+/// What prompt-cache traffic costs, as multiples of the model's input rate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CacheRates {
+    /// Multiplier for tokens served from the cache.
+    pub read: f64,
+    /// Multiplier for tokens written to the cache.
+    pub write: f64,
+}
+
+impl CacheRates {
+    /// No discount or premium: cache traffic costs the plain input rate. The
+    /// safe default for a model whose cache pricing is unknown — it can
+    /// overstate the bill, never understate it.
+    pub const NONE: CacheRates = CacheRates {
+        read: 1.0,
+        write: 1.0,
+    };
+}
+
+/// Cache pricing for a (provider, model) pair.
+///
+/// Approximate multipliers of the input rate, like the rest of this file —
+/// verify against the provider's pricing page. Providers that cache
+/// implicitly (OpenAI, Gemini) charge nothing extra to write the cache, so
+/// only their read discount differs from 1.0. Unrecognised models get
+/// [`CacheRates::NONE`].
+pub fn cache_rates_for_model(provider: &str, model: &str) -> CacheRates {
+    let m = model.to_lowercase();
+    let read_only = |read: f64| CacheRates { read, write: 1.0 };
+    // Anthropic: reads 0.1x; writes (5-minute TTL) 1.25x.
+    let anthropic = CacheRates {
+        read: 0.1,
+        write: 1.25,
+    };
+    match provider {
+        "anthropic" => anthropic,
+        "bedrock" if m.contains("anthropic.") || m.contains("claude") => anthropic,
+        "openai" => {
+            if m.contains("gpt-5") {
+                read_only(0.1)
+            } else if m.contains("gpt-4.1") || m.contains("o4-mini") {
+                read_only(0.25)
+            } else if m.contains("o3-mini") || m.contains("o1") || m.contains("gpt-4o") {
+                read_only(0.5)
+            } else if m.contains("o3") {
+                read_only(0.25)
+            } else {
+                CacheRates::NONE
+            }
+        }
+        "gemini" if m.contains("gemini-2.5") || m.contains("gemini-2.0") => read_only(0.25),
+        _ => CacheRates::NONE,
+    }
 }
 
 /// Returns the billing category for a (provider, model) pair.
@@ -301,6 +372,55 @@ mod tests {
         let cost = pricing.calculate_cost(1000, 500);
         // (1.0 * 0.003) + (0.5 * 0.015) = 0.003 + 0.0075 = 0.0105
         assert!((cost - 0.0105).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cost_with_cache_prices_reads_and_writes_at_multiples_of_input() {
+        let pricing = ModelPricing::new(0.003, 0.015);
+        // 1k uncached in, 0.5k out, 10k cache reads, 2k cache writes:
+        //   0.003 + 0.0075 + 10*0.003*0.1 + 2*0.003*1.25
+        // = 0.003 + 0.0075 + 0.003 + 0.0075 = 0.021
+        let rates = cache_rates_for_model("anthropic", "claude-sonnet-4-20250514");
+        let cost = pricing.calculate_cost_with_cache(1000, 500, 10_000, 2_000, rates);
+        assert!((cost - 0.021).abs() < 1e-9, "got {cost}");
+        // With no cache traffic it equals the plain calculation.
+        assert!(
+            (pricing.calculate_cost_with_cache(1000, 500, 0, 0, rates)
+                - pricing.calculate_cost(1000, 500))
+            .abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn test_cache_rates_per_provider() {
+        let rates = |p, m| cache_rates_for_model(p, m);
+        // Anthropic (and Claude on Bedrock): cheap reads, premium writes.
+        assert_eq!(
+            rates("anthropic", "claude-opus-4-20250514"),
+            CacheRates {
+                read: 0.1,
+                write: 1.25
+            }
+        );
+        assert_eq!(
+            rates("bedrock", "anthropic.claude-3-5-sonnet-20241022-v2:0"),
+            rates("anthropic", "x")
+        );
+        // OpenAI: model-dependent read discount, no write premium.
+        assert_eq!(rates("openai", "gpt-4o").read, 0.5);
+        assert_eq!(rates("openai", "gpt-4o-mini").read, 0.5);
+        assert_eq!(rates("openai", "gpt-4.1-mini").read, 0.25);
+        assert_eq!(rates("openai", "o3").read, 0.25);
+        assert_eq!(rates("openai", "o3-mini").read, 0.5);
+        assert_eq!(rates("openai", "gpt-4o").write, 1.0);
+        // Gemini implicit caching.
+        assert_eq!(rates("gemini", "gemini-2.5-pro").read, 0.25);
+        // Unknown models / providers: no discount, so cost is never understated.
+        assert_eq!(rates("openai", "gpt-3.5-turbo"), CacheRates::NONE);
+        assert_eq!(rates("gemini", "gemini-1.5-pro"), CacheRates::NONE);
+        assert_eq!(rates("bedrock", "amazon.nova-pro-v1:0"), CacheRates::NONE);
+        assert_eq!(rates("groq", "llama-3.3-70b"), CacheRates::NONE);
     }
 
     #[test]

@@ -166,10 +166,7 @@ impl CompletionModel for OpenAIProvider {
                                                 delta: None,
                                                 content_block: None,
                                                 stop_reason: None,
-                                                usage: Some(Usage {
-                                                    input_tokens: u.prompt_tokens,
-                                                    output_tokens: u.completion_tokens,
-                                                }),
+                                                usage: Some(u.into()),
                                             }))
                                             .await
                                             .is_err()
@@ -435,6 +432,27 @@ struct ChatFunction {
 struct ChatUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
+    /// Present on OpenAI and most compatible providers; absent otherwise.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+#[derive(serde::Deserialize)]
+struct PromptTokensDetails {
+    /// How much of `prompt_tokens` was served from the automatic prompt cache.
+    #[serde(default)]
+    cached_tokens: Option<u32>,
+}
+
+impl From<&ChatUsage> for Usage {
+    fn from(u: &ChatUsage) -> Self {
+        Usage::from_prompt_total(
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.prompt_tokens_details
+                .as_ref()
+                .and_then(|d| d.cached_tokens),
+        )
+    }
 }
 
 fn convert_chat_response(data: ChatResponse) -> CompletionResponse {
@@ -457,10 +475,7 @@ fn convert_chat_response(data: ChatResponse) -> CompletionResponse {
             }
         }
     }
-    let usage = data.usage.map(|u| Usage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-    });
+    let usage = data.usage.as_ref().map(Usage::from);
     CompletionResponse {
         content,
         stop_reason: None,
@@ -531,14 +546,65 @@ fn convert_chunk(chunk: ChatChunk) -> StreamEvent {
         }
     }
 
-    let usage = chunk.usage.map(|u| Usage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-    });
+    let usage = chunk.usage.as_ref().map(Usage::from);
     StreamEvent {
         delta,
         content_block,
         stop_reason,
         usage,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blocking_response_splits_cached_tokens_from_the_prompt() {
+        let resp = parse_and_convert_chat_response(
+            r#"{"choices":[{"message":{"content":"hi"}}],
+                "usage":{"prompt_tokens":2006,"completion_tokens":300,
+                         "prompt_tokens_details":{"cached_tokens":1920}}}"#,
+        )
+        .unwrap();
+        let u = resp.usage.unwrap();
+        assert_eq!(u.input_tokens, 86);
+        assert_eq!(u.cache_read_tokens, 1920);
+        assert_eq!(u.output_tokens, 300);
+        assert_eq!(u.context_tokens(), 2006, "context is the whole prompt");
+    }
+
+    #[test]
+    fn streaming_chunk_splits_cached_tokens_too() {
+        let ev = parse_and_convert_chunk(
+            r#"{"choices":[],"usage":{"prompt_tokens":500,"completion_tokens":20,
+                "prompt_tokens_details":{"cached_tokens":400}}}"#,
+        )
+        .unwrap();
+        let u = ev.usage.unwrap();
+        assert_eq!((u.input_tokens, u.cache_read_tokens), (100, 400));
+    }
+
+    #[test]
+    fn usage_without_details_is_all_uncached() {
+        // Providers that don't report cache info (or send null/empty details).
+        for usage_json in [
+            r#"{"prompt_tokens":300,"completion_tokens":10}"#,
+            r#"{"prompt_tokens":300,"completion_tokens":10,"prompt_tokens_details":null}"#,
+            r#"{"prompt_tokens":300,"completion_tokens":10,"prompt_tokens_details":{}}"#,
+            r#"{"prompt_tokens":300,"completion_tokens":10,
+                "prompt_tokens_details":{"cached_tokens":null}}"#,
+        ] {
+            let body = format!(r#"{{"choices":[],"usage":{usage_json}}}"#);
+            let u = parse_and_convert_chat_response(&body)
+                .unwrap()
+                .usage
+                .unwrap();
+            assert_eq!(
+                (u.input_tokens, u.cache_read_tokens),
+                (300, 0),
+                "{usage_json}"
+            );
+        }
     }
 }
