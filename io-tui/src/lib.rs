@@ -23,6 +23,14 @@ pub const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/compact", "Summarize and compress conversation history"),
     (
+        "/plan",
+        "Enter plan mode: read-only research, then a plan to approve (or Shift+Tab)",
+    ),
+    (
+        "/think",
+        "Extended thinking: /think [on|off|low|medium|high|<tokens>] (or Alt+T)",
+    ),
+    (
         "/rewind",
         "Restore files to an earlier point in the chat (or press Esc twice)",
     ),

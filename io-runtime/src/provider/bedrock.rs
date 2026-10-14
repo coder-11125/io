@@ -1,4 +1,7 @@
-use super::anthropic::{build_messages, parse_and_convert_response, AnthropicStreamState};
+use super::anthropic::{
+    build_messages, cap_output_tokens, model_supports_thinking, parse_and_convert_response,
+    thinking_param, AnthropicStreamState,
+};
 use super::{CompletionModel, CompletionRequest, CompletionResponse, StreamEvent};
 use crate::config::BedrockConfig;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -129,6 +132,43 @@ impl BedrockProvider {
     }
 }
 
+/// The Anthropic-format request body Bedrock expects, shared by the blocking
+/// and streaming paths.
+fn build_body(request: &CompletionRequest, model: &str) -> serde_json::Value {
+    let max_tokens = cap_output_tokens(
+        model,
+        request.max_tokens.unwrap_or(16384),
+        request.thinking.is_some(),
+    );
+    let mut body = serde_json::json!({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": max_tokens,
+        // Prompt caching is Anthropic-direct only for now: which Bedrock
+        // models accept `cache_control` varies, and a rejected marker
+        // fails the whole request.
+        "messages": build_messages(request, false),
+    });
+    if let Some(temp) = request.temperature {
+        body["temperature"] = serde_json::json!(temp);
+    }
+    if let Some(thinking) = thinking_param(request, max_tokens) {
+        body["thinking"] = thinking;
+    }
+    if !request.tools.is_empty() {
+        body["tools"] = serde_json::json!(request
+            .tools
+            .iter()
+            .map(|t| serde_json::json!({
+                "name": t.name, "description": t.description, "input_schema": t.input_schema,
+            }))
+            .collect::<Vec<_>>());
+    }
+    if let Some(system) = request.system_text() {
+        body["system"] = serde_json::json!(system);
+    }
+    body
+}
+
 fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
@@ -152,29 +192,15 @@ impl CompletionModel for BedrockProvider {
             .unwrap_or_else(|| super::context_window_for_model(&self.config.model))
     }
 
+    fn supports_thinking(&self) -> bool {
+        let m = self.config.model.to_lowercase();
+        m.contains("claude") && model_supports_thinking(&m)
+    }
+
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse> {
         let path = format!("/model/{}/invoke", self.config.model);
 
-        let mut body = serde_json::json!({
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": request.max_tokens.unwrap_or(16384),
-            // Prompt caching is Anthropic-direct only for now: which Bedrock
-            // models accept `cache_control` varies, and a rejected marker
-            // fails the whole request.
-            "messages": build_messages(&request, false),
-        });
-        if let Some(temp) = request.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        if !request.tools.is_empty() {
-            body["tools"] =
-                serde_json::json!(request.tools.iter().map(|t| serde_json::json!({
-                "name": t.name, "description": t.description, "input_schema": t.input_schema,
-            })).collect::<Vec<_>>());
-        }
-        if let Some(system) = request.system_text() {
-            body["system"] = serde_json::json!(system);
-        }
+        let body = build_body(&request, &self.config.model);
 
         let payload = serde_json::to_vec(&body)?;
         let req = self.build_signed_request(&path, payload)?;
@@ -193,26 +219,7 @@ impl CompletionModel for BedrockProvider {
     ) -> anyhow::Result<tokio::sync::mpsc::Receiver<anyhow::Result<StreamEvent>>> {
         let path = format!("/model/{}/invoke-with-response-stream", self.config.model);
 
-        let mut body = serde_json::json!({
-            "anthropic_version": "bedrock-2023-05-31",
-            "max_tokens": request.max_tokens.unwrap_or(16384),
-            // Prompt caching is Anthropic-direct only for now: which Bedrock
-            // models accept `cache_control` varies, and a rejected marker
-            // fails the whole request.
-            "messages": build_messages(&request, false),
-        });
-        if let Some(temp) = request.temperature {
-            body["temperature"] = serde_json::json!(temp);
-        }
-        if !request.tools.is_empty() {
-            body["tools"] =
-                serde_json::json!(request.tools.iter().map(|t| serde_json::json!({
-                "name": t.name, "description": t.description, "input_schema": t.input_schema,
-            })).collect::<Vec<_>>());
-        }
-        if let Some(system) = request.system_text() {
-            body["system"] = serde_json::json!(system);
-        }
+        let body = build_body(&request, &self.config.model);
 
         let payload = serde_json::to_vec(&body)?;
         let req = self.build_signed_request(&path, payload)?;
@@ -399,4 +406,68 @@ fn urlencode_segment(seg: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::{ContentBlock, Message, Role, ThinkingRequest};
+
+    fn request(thinking: Option<u32>, max_tokens: u32) -> CompletionRequest {
+        CompletionRequest {
+            messages: vec![
+                Message {
+                    role: Role::System,
+                    content: vec![ContentBlock::Text {
+                        text: "sys".to_string(),
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    content: vec![
+                        ContentBlock::Image {
+                            media_type: "image/png".to_string(),
+                            data: "QUJD".to_string(),
+                        },
+                        ContentBlock::Text {
+                            text: "what is this?".to_string(),
+                        },
+                    ],
+                },
+            ],
+            max_tokens: Some(max_tokens),
+            thinking: thinking.map(|budget_tokens| ThinkingRequest { budget_tokens }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn body_carries_system_images_and_no_cache_markers() {
+        let body = build_body(
+            &request(None, 4096),
+            "anthropic.claude-sonnet-4-20250514-v1:0",
+        );
+        assert_eq!(body["anthropic_version"], "bedrock-2023-05-31");
+        assert_eq!(body["system"], "sys");
+        assert_eq!(body["messages"][0]["content"][0]["type"], "image");
+        assert!(!body.to_string().contains("cache_control"));
+        assert!(body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn body_requests_thinking_within_the_token_limit() {
+        let body = build_body(
+            &request(Some(4000), 16000),
+            "anthropic.claude-sonnet-4-20250514-v1:0",
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 4000);
+        // Too little output room: thinking is skipped rather than rejected.
+        assert!(build_body(
+            &request(Some(4000), 1500),
+            "anthropic.claude-sonnet-4-20250514-v1:0"
+        )
+        .get("thinking")
+        .is_none());
+    }
 }

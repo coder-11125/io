@@ -24,9 +24,21 @@ const TOGGLES: &[Toggle] = &[
     },
     Toggle {
         label: "Auto-allow network fetch",
-        desc: "In agent mode, auto-run read-only curl/wget GETs without prompting",
+        desc: "In agent mode, auto-run read-only curl/wget GETs, fetch and web_search without prompting",
         get: |c| c.permissions.allow_network_fetch,
         set: |c, v| c.permissions.allow_network_fetch = v,
+    },
+    Toggle {
+        label: "Extended thinking",
+        desc: "Let the model reason before answering on every turn (also /think, Alt+T)",
+        get: |c| c.thinking.enabled,
+        set: |c, v| c.thinking.enabled = v,
+    },
+    Toggle {
+        label: "Thinking keywords",
+        desc: "\"think\", \"think hard\" and \"ultrathink\" in a prompt turn thinking on for that turn",
+        get: |c| c.thinking.keywords,
+        set: |c, v| c.thinking.keywords = v,
     },
 ];
 

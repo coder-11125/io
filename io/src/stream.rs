@@ -2,7 +2,7 @@
 
 use io_runtime::AgentEvent;
 use io_tui::render::{
-    render_markdown_lines, render_tool_done, render_tool_start, tool_detail, Theme,
+    render_markdown_lines, render_tool_done, render_tool_start, tool_body_lines, tool_detail, Theme,
 };
 use std::collections::VecDeque;
 use std::io::Write;
@@ -120,6 +120,10 @@ fn process_ev(
                 format!("  ╭ {name}  {detail}")
             };
             push_line(line_buf, entry);
+            // The live todo checklist / proposed plan under the header.
+            for line in tool_body_lines(&name, &input, &theme) {
+                push_line(line_buf, format!("\x01    {line}\x1b[0m"));
+            }
         }
         AgentEvent::ToolDone {
             name,

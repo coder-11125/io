@@ -60,6 +60,10 @@ impl CompletionModel for OpenAIProvider {
             .unwrap_or_else(|| super::context_window_for_model(&self.config.model))
     }
 
+    fn supports_thinking(&self) -> bool {
+        is_reasoning_model(&self.config.model)
+    }
+
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse> {
         let token = self.bearer_token().await?;
         let body = build_chat_body(&self.config, &request, false);
@@ -175,6 +179,15 @@ impl CompletionModel for OpenAIProvider {
                                         }
                                     }
                                     for choice in chunk.choices {
+                                        if let Some(r) = choice.delta.reasoning_text() {
+                                            if tx
+                                                .send(Ok(StreamEvent::thinking_delta(r)))
+                                                .await
+                                                .is_err()
+                                            {
+                                                break 'outer;
+                                            }
+                                        }
                                         if let Some(ref c) = choice.delta.content {
                                             if !c.is_empty()
                                                 && tx
@@ -275,11 +288,21 @@ fn build_chat_body(
     if stream {
         body["stream_options"] = serde_json::json!({ "include_usage": true });
     }
+    let reasoning = is_reasoning_model(&config.model);
     if let Some(max_tokens) = request.max_tokens {
-        body["max_tokens"] = serde_json::json!(max_tokens);
+        // OpenAI's reasoning models reject `max_tokens`.
+        let key = if reasoning {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        };
+        body[key] = serde_json::json!(max_tokens);
     }
     if let Some(temp) = request.temperature {
         body["temperature"] = serde_json::json!(temp);
+    }
+    if let (true, Some(thinking)) = (reasoning, request.thinking) {
+        body["reasoning_effort"] = serde_json::json!(reasoning_effort(thinking.budget_tokens));
     }
     if !request.tools.is_empty() {
         let tools: Vec<serde_json::Value> = request.tools.iter().map(|t| serde_json::json!({
@@ -297,6 +320,33 @@ fn build_chat_body(
         }
     }
     body
+}
+
+/// OpenAI models that reason before answering (o-series, GPT-5) and so take
+/// `reasoning_effort` / `max_completion_tokens`. Provider prefixes such as
+/// OpenRouter's `openai/` are ignored.
+pub(crate) fn is_reasoning_model(model: &str) -> bool {
+    let m = model.rsplit('/').next().unwrap_or(model).to_lowercase();
+    (m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") || m.starts_with("gpt-5"))
+        && !m.contains("chat")
+}
+
+/// Map a thinking-token budget onto OpenAI's coarse effort levels, which
+/// line up with the `think` / `think hard` / `ultrathink` budget tiers.
+fn reasoning_effort(budget_tokens: u32) -> &'static str {
+    match budget_tokens {
+        0..=4_000 => "low",
+        4_001..=12_000 => "medium",
+        _ => "high",
+    }
+}
+
+/// An `image_url` content part carrying an inline base64 image.
+fn image_part(media_type: &str, data: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "image_url",
+        "image_url": { "url": format!("data:{media_type};base64,{data}") },
+    })
 }
 
 /// Convert our internal message list to OpenAI wire format.
@@ -339,16 +389,38 @@ fn convert_messages(messages: &[Message]) -> Vec<serde_json::Value> {
                             }));
                         }
                     }
+                    // `role: tool` messages are text-only, so images a tool
+                    // returned (e.g. `read` on a screenshot) follow as a
+                    // user message.
+                    let images: Vec<serde_json::Value> = msg
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Image { media_type, data } => {
+                                Some(image_part(media_type, data))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    if !images.is_empty() {
+                        let mut parts = vec![
+                            serde_json::json!({"type": "text", "text": "Image(s) returned by the tool call above:"}),
+                        ];
+                        parts.extend(images);
+                        out.push(serde_json::json!({ "role": "user", "content": parts }));
+                    }
                 } else {
                     let content: Vec<serde_json::Value> = msg
                         .content
                         .iter()
-                        .filter_map(|b| {
-                            if let ContentBlock::Text { text } = b {
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => {
                                 Some(serde_json::json!({"type": "text", "text": text}))
-                            } else {
-                                None
                             }
+                            ContentBlock::Image { media_type, data } => {
+                                Some(image_part(media_type, data))
+                            }
+                            _ => None,
                         })
                         .collect();
                     out.push(serde_json::json!({ "role": "user", "content": content }));
@@ -497,6 +569,23 @@ struct ChatChunkChoice {
 struct ChatChunkDelta {
     content: Option<String>,
     tool_calls: Option<Vec<ChatChunkToolCall>>,
+    /// Reasoning text streamed by DeepSeek-style providers…
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    /// …or under this name by OpenRouter and others.
+    #[serde(default)]
+    reasoning: Option<String>,
+}
+
+impl ChatChunkDelta {
+    /// The reasoning text carried by this delta, if any.
+    fn reasoning_text(&self) -> Option<String> {
+        self.reasoning_content
+            .as_deref()
+            .or(self.reasoning.as_deref())
+            .filter(|r| !r.is_empty())
+            .map(str::to_string)
+    }
 }
 #[derive(serde::Deserialize)]
 struct ChatChunkToolCall {
@@ -519,6 +608,14 @@ fn convert_chunk(chunk: ChatChunk) -> StreamEvent {
         if let Some(ref c) = choice.delta.content {
             if !c.is_empty() {
                 delta = choice.delta.content.clone();
+            }
+        }
+        if delta.is_none() && content_block.is_none() {
+            if let Some(r) = choice.delta.reasoning_text() {
+                content_block = Some(ContentBlock::Thinking {
+                    thinking: r,
+                    signature: None,
+                });
             }
         }
         if let Some(ref calls) = choice.delta.tool_calls {
@@ -605,6 +702,110 @@ mod tests {
                 (300, 0),
                 "{usage_json}"
             );
+        }
+    }
+
+    fn request_with(model_thinking: Option<u32>, max_tokens: u32) -> CompletionRequest {
+        CompletionRequest {
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            }],
+            max_tokens: Some(max_tokens),
+            thinking: model_thinking.map(|b| crate::provider::ThinkingRequest { budget_tokens: b }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reasoning_models_get_effort_and_completion_token_limit() {
+        let body = build_chat_body_with_model("o3-mini", &request_with(Some(10_000), 2048), false);
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert_eq!(body["max_completion_tokens"], 2048);
+        assert!(body.get("max_tokens").is_none());
+
+        for (budget, effort) in [
+            (1_000, "low"),
+            (4_000, "low"),
+            (8_000, "medium"),
+            (31_999, "high"),
+        ] {
+            let body = build_chat_body_with_model("gpt-5", &request_with(Some(budget), 100), false);
+            assert_eq!(body["reasoning_effort"], effort, "budget {budget}");
+        }
+    }
+
+    #[test]
+    fn non_reasoning_models_ignore_thinking_and_keep_max_tokens() {
+        let body = build_chat_body_with_model("gpt-4o", &request_with(Some(31_999), 2048), false);
+        assert!(body.get("reasoning_effort").is_none());
+        assert_eq!(body["max_tokens"], 2048);
+
+        // A reasoning model with thinking off leaves the provider default.
+        let body = build_chat_body_with_model("o3", &request_with(None, 2048), false);
+        assert!(body.get("reasoning_effort").is_none());
+        // Provider prefixes (OpenRouter) are looked through.
+        assert!(is_reasoning_model("openai/o4-mini"));
+        assert!(!is_reasoning_model("gpt-5-chat-latest"));
+        assert!(!is_reasoning_model("deepseek-chat"));
+    }
+
+    #[test]
+    fn user_images_become_image_url_parts() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "look".into(),
+                },
+                ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "QUJD".into(),
+                },
+            ],
+        }];
+        let out = convert_messages(&msgs);
+        assert_eq!(out[0]["content"][1]["type"], "image_url");
+        assert_eq!(
+            out[0]["content"][1]["image_url"]["url"],
+            "data:image/png;base64,QUJD"
+        );
+    }
+
+    #[test]
+    fn tool_result_images_follow_the_tool_messages_as_a_user_message() {
+        let msgs = vec![Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "Image file".into(),
+                    is_error: None,
+                },
+                ContentBlock::Image {
+                    media_type: "image/jpeg".into(),
+                    data: "QUJD".into(),
+                },
+            ],
+        }];
+        let out = convert_messages(&msgs);
+        assert_eq!(out[0]["role"], "tool");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"][1]["type"], "image_url");
+    }
+
+    #[test]
+    fn streaming_chunk_surfaces_reasoning_text_as_a_thinking_delta() {
+        for field in ["reasoning_content", "reasoning"] {
+            let ev = parse_and_convert_chunk(&format!(
+                r#"{{"choices":[{{"delta":{{"{field}":"pondering"}}}}]}}"#
+            ))
+            .unwrap();
+            assert!(ev.delta.is_none());
+            assert!(matches!(
+                ev.content_block,
+                Some(ContentBlock::Thinking { ref thinking, signature: None }) if thinking == "pondering"
+            ));
         }
     }
 }

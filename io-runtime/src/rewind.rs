@@ -40,7 +40,7 @@ pub async fn run(
 
     for turn in &turns[turn_index..] {
         for tc in &turn.tool_calls {
-            if !tc.success || (tc.tool_name != "write" && tc.tool_name != "edit") {
+            if !tc.success || !crate::sandbox::is_file_write_tool(&tc.tool_name) {
                 continue;
             }
             let Some(path) = tc.input.get("path").and_then(|v| v.as_str()) else {

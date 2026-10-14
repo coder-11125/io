@@ -60,13 +60,16 @@ pub enum AgentEvent {
 /// (e.g. single-shot mode, where there is no event channel to ask through).
 pub type PromptFn = Arc<dyn Fn(&str, &serde_json::Value) -> PermissionReply + Send + Sync>;
 
+use crate::config::ThinkingConfig;
 use crate::hooks::Hooks;
 use crate::memory::SessionStore;
 use crate::pricing::ModelPricing;
-use crate::provider::{CompletionModel, CompletionRequest, ContentBlock, StreamEvent, Usage};
+use crate::provider::{
+    CompletionModel, CompletionRequest, ContentBlock, StreamEvent, ThinkingRequest, Usage,
+};
 use crate::provider::{Message, Role};
-use crate::sandbox::{PermissionChecker, PermissionLevel};
-use crate::tools::{ToolInput, ToolRegistry};
+use crate::sandbox::{is_file_write_tool, InteractionMode, PermissionChecker, PermissionLevel};
+use crate::tools::{ToolImage, ToolInput, ToolRegistry};
 use crate::types::{Session, SessionId, ToolCallRecord, Turn, TurnUsage};
 use std::sync::Arc;
 use std::sync::{
@@ -95,7 +98,18 @@ pub struct Agent {
     /// User-configured lifecycle hooks; empty (a no-op) unless set with
     /// [`Agent::with_hooks`].
     hooks: Hooks,
+    /// Extended-thinking settings, adjustable mid-session (`/think`).
+    thinking: Mutex<ThinkingConfig>,
 }
+
+/// Appended to the system prompt while plan mode is active.
+const PLAN_MODE_PROMPT: &str = "\n\n## Plan mode is active\n\n\
+    You are in plan mode: a read-only research phase. You cannot modify files or run \
+    state-changing commands — those calls will be refused. Explore the codebase with read, glob, \
+    grep and read-only shell commands, then call `exit_plan_mode` with a concrete markdown plan \
+    (what changes, where, in what order, and any risks). The user reviews it and decides whether \
+    to proceed. Do not start implementing before the plan is approved. If the user rejects it, \
+    stay in plan mode and revise.";
 
 impl Agent {
     #[allow(clippy::too_many_arguments)]
@@ -142,6 +156,7 @@ impl Agent {
             provider_id,
             pricing_override,
             hooks: Hooks::default(),
+            thinking: Mutex::new(ThinkingConfig::default()),
         }
     }
 
@@ -149,6 +164,38 @@ impl Agent {
     pub fn with_hooks(mut self, hooks: Hooks) -> Self {
         self.hooks = hooks;
         self
+    }
+
+    /// Start with these extended-thinking settings (from `[thinking]`).
+    pub fn with_thinking(self, thinking: ThinkingConfig) -> Self {
+        *self.thinking.lock().unwrap() = thinking;
+        self
+    }
+
+    /// The current extended-thinking settings.
+    pub fn thinking(&self) -> ThinkingConfig {
+        self.thinking.lock().unwrap().clone()
+    }
+
+    /// Change the extended-thinking settings; applies from the next turn.
+    pub fn set_thinking(&self, thinking: ThinkingConfig) {
+        *self.thinking.lock().unwrap() = thinking;
+    }
+
+    /// The current working mode (default / accept edits / plan).
+    pub fn interaction_mode(&self) -> InteractionMode {
+        self.permissions.interaction_mode()
+    }
+
+    pub fn set_interaction_mode(&self, mode: InteractionMode) {
+        self.permissions.set_interaction_mode(mode);
+    }
+
+    /// Advance to the next mode (the Shift+Tab cycle) and return it.
+    pub fn cycle_interaction_mode(&self) -> InteractionMode {
+        let next = self.interaction_mode().next();
+        self.set_interaction_mode(next);
+        next
     }
 
     /// Set a blocking permission prompt for the non-streaming `run_turn` path.
@@ -171,10 +218,26 @@ impl Agent {
         self.provider.context_window()
     }
 
+    /// Whether the active model supports extended thinking.
+    pub fn supports_thinking(&self) -> bool {
+        self.provider.supports_thinking()
+    }
+
     /// Execute a single conversation turn without streaming. Permission
     /// prompts go through the `set_prompt_fn` callback if one is set.
     pub async fn run_turn(&self, user_input: &str) -> anyhow::Result<String> {
-        self.run_turn_inner(user_input, None).await
+        self.run_turn_inner(user_input, Vec::new(), None).await
+    }
+
+    /// Like [`run_turn`](Self::run_turn), with images attached to the user
+    /// message (vision input). Images are sent for this turn only; the saved
+    /// session keeps a note that they were attached.
+    pub async fn run_turn_with_images(
+        &self,
+        user_input: &str,
+        images: Vec<ToolImage>,
+    ) -> anyhow::Result<String> {
+        self.run_turn_inner(user_input, images, None).await
     }
 
     /// Like `run_turn` but streams events to `token_tx` as they arrive:
@@ -185,7 +248,19 @@ impl Agent {
         user_input: &str,
         token_tx: tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> anyhow::Result<String> {
-        self.run_turn_inner(user_input, Some(&token_tx)).await
+        self.run_turn_inner(user_input, Vec::new(), Some(&token_tx))
+            .await
+    }
+
+    /// Streaming variant of [`run_turn_with_images`](Self::run_turn_with_images).
+    pub async fn run_turn_streaming_with_images(
+        &self,
+        user_input: &str,
+        images: Vec<ToolImage>,
+        token_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> anyhow::Result<String> {
+        self.run_turn_inner(user_input, images, Some(&token_tx))
+            .await
     }
 
     /// Shared turn loop. `token_tx` selects the mode: `Some` streams the
@@ -193,6 +268,7 @@ impl Agent {
     async fn run_turn_inner(
         &self,
         user_input: &str,
+        images: Vec<ToolImage>,
         token_tx: Option<&tokio::sync::mpsc::Sender<AgentEvent>>,
     ) -> anyhow::Result<String> {
         // Hold the lock only long enough to snapshot history; release before any async I/O.
@@ -220,18 +296,7 @@ impl Agent {
             None => user_input.to_string(),
         };
 
-        let system_text = match summary {
-            Some(ref s) => format!(
-                "{}\n\n## Prior Conversation Summary\n\n{}",
-                self.system_prompt, s
-            ),
-            None => self.system_prompt.clone(),
-        };
-
-        let mut messages = vec![Message {
-            role: Role::System,
-            content: vec![ContentBlock::Text { text: system_text }],
-        }];
+        let mut messages = vec![self.system_message(summary.as_deref())];
 
         // Inject project context (AGENTS.md / CLAUDE.md) as a synthetic
         // user/assistant exchange so it occupies a real context slot and is
@@ -274,10 +339,33 @@ impl Agent {
             }
         }
 
+        // Attached images lead the message, as providers expect.
+        let attached = images.len();
+        let mut user_content: Vec<ContentBlock> = images
+            .into_iter()
+            .map(|i| ContentBlock::Image {
+                media_type: i.media_type,
+                data: i.data,
+            })
+            .collect();
+        user_content.push(ContentBlock::Text { text: model_input });
         messages.push(Message {
             role: Role::User,
-            content: vec![ContentBlock::Text { text: model_input }],
+            content: user_content,
         });
+
+        // Extended thinking for this turn: the configured setting and/or a
+        // keyword in the prompt, with output room reserved for the answer.
+        // A model that can't reason gets neither a budget nor extra output room.
+        let thinking_budget = if self.provider.supports_thinking() {
+            crate::thinking::budget_for_turn(&self.thinking.lock().unwrap(), user_input)
+        } else {
+            None
+        };
+        let request_max_tokens = match thinking_budget {
+            Some(budget) => crate::thinking::max_tokens_with_thinking(self.max_tokens, budget),
+            None => self.max_tokens,
+        };
 
         let mut all_text = String::new();
         let mut all_tool_calls: Vec<ToolCallRecord> = Vec::new();
@@ -301,13 +389,18 @@ impl Agent {
                 return Err(Cancelled.into());
             }
 
+            // The plan-mode notice follows the live mode, which can change
+            // during the loop (the user approves the plan).
+            messages[0] = self.system_message(summary.as_deref());
+
             let request = CompletionRequest {
                 messages: messages.clone(),
                 tools: tool_specs.clone(),
                 system_prompt: None,
-                max_tokens: Some(self.max_tokens),
+                max_tokens: Some(request_max_tokens),
                 temperature: None,
                 stream: token_tx.is_some(),
+                thinking: thinking_budget.map(|budget_tokens| ThinkingRequest { budget_tokens }),
             };
 
             let (assistant_content, iter_text, iter_tool_uses) = match token_tx {
@@ -322,6 +415,9 @@ impl Agent {
 
                     let mut iter_text = String::new();
                     let mut tool_uses: Vec<(String, String, serde_json::Value)> = Vec::new();
+                    // Finished reasoning blocks, which the next request must
+                    // carry back verbatim when this response calls tools.
+                    let mut thinking_blocks: Vec<ContentBlock> = Vec::new();
 
                     while let Some(event) = rx.recv().await {
                         let ev = match event {
@@ -349,6 +445,28 @@ impl Agent {
                             } => {
                                 tool_uses.push((id, name, input));
                             }
+                            // A signature-less block is a display delta; a
+                            // signed one is the finished block to replay.
+                            StreamEvent {
+                                content_block:
+                                    Some(ContentBlock::Thinking {
+                                        thinking,
+                                        signature: None,
+                                    }),
+                                ..
+                            } => {
+                                if !thinking.is_empty() {
+                                    let _ = tx.send(AgentEvent::Thinking(thinking)).await;
+                                }
+                            }
+                            StreamEvent {
+                                content_block: Some(block @ ContentBlock::Thinking { .. }),
+                                ..
+                            }
+                            | StreamEvent {
+                                content_block: Some(block @ ContentBlock::RedactedThinking { .. }),
+                                ..
+                            } => thinking_blocks.push(block),
                             StreamEvent {
                                 stop_reason: Some(_),
                                 ..
@@ -357,7 +475,7 @@ impl Agent {
                         }
                     }
 
-                    let mut content = Vec::new();
+                    let mut content = thinking_blocks;
                     if !iter_text.is_empty() {
                         content.push(ContentBlock::Text {
                             text: iter_text.clone(),
@@ -403,7 +521,21 @@ impl Agent {
                         }
                     }
 
-                    (response.content, iter_text, tool_uses)
+                    // Display-only (unsigned) reasoning is never replayed.
+                    let content = response
+                        .content
+                        .into_iter()
+                        .filter(|b| {
+                            !matches!(
+                                b,
+                                ContentBlock::Thinking {
+                                    signature: None,
+                                    ..
+                                }
+                            )
+                        })
+                        .collect();
+                    (content, iter_text, tool_uses)
                 }
             };
 
@@ -432,6 +564,9 @@ impl Agent {
 
             // Execute each tool and collect results
             let mut tool_results: Vec<ContentBlock> = Vec::new();
+            // Images tools returned (e.g. `read` on a screenshot), sent after
+            // the tool results in the same user message.
+            let mut tool_images: Vec<ContentBlock> = Vec::new();
             for (id, name, input) in &iter_tool_uses {
                 if let Some(tx) = token_tx {
                     let _ = tx
@@ -467,9 +602,14 @@ impl Agent {
                         {
                             Err(denial) => (denial, false, None, false),
                             Ok(()) => {
-                                let (output, success, snapshot) =
-                                    self.execute_tool(name, input).await;
-                                (output, success, snapshot, true)
+                                let run = self.execute_tool(name, input).await;
+                                tool_images.extend(run.images.into_iter().map(|i| {
+                                    ContentBlock::Image {
+                                        media_type: i.media_type,
+                                        data: i.data,
+                                    }
+                                }));
+                                (run.output, run.success, run.snapshot, true)
                             }
                         },
                     };
@@ -485,7 +625,7 @@ impl Agent {
                         output.push_str(&format!("\n\n[post_tool_use hook]\n{feedback}"));
                     }
                 }
-                if success && (name == "write" || name == "edit") {
+                if success && is_file_write_tool(name) {
                     if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
                         written_this_turn.push(path.to_string());
                     }
@@ -520,6 +660,7 @@ impl Agent {
             }
 
             // Feed results back into the conversation
+            tool_results.extend(tool_images);
             messages.push(Message {
                 role: Role::User,
                 content: tool_results,
@@ -558,7 +699,12 @@ impl Agent {
         let turn = Turn {
             id: uuid::Uuid::new_v4(),
             timestamp: chrono::Utc::now(),
-            user_message: user_input.to_string(),
+            user_message: if attached == 0 {
+                user_input.to_string()
+            } else {
+                // Images aren't persisted; leave a note so later turns know.
+                format!("{user_input}\n\n[{attached} image(s) were attached to this message]")
+            },
             assistant_message: Some(all_text.clone()),
             tool_calls: all_tool_calls,
             usage,
@@ -605,6 +751,26 @@ impl Agent {
         Ok(all_text)
     }
 
+    /// The system message for the next request: the agent's prompt, the
+    /// compaction summary if any, and the plan-mode notice while plan mode is
+    /// on.
+    fn system_message(&self, summary: Option<&str>) -> Message {
+        let mut text = match summary {
+            Some(s) => format!(
+                "{}\n\n## Prior Conversation Summary\n\n{}",
+                self.system_prompt, s
+            ),
+            None => self.system_prompt.clone(),
+        };
+        if self.interaction_mode() == InteractionMode::Plan {
+            text.push_str(PLAN_MODE_PROMPT);
+        }
+        Message {
+            role: Role::System,
+            content: vec![ContentBlock::Text { text }],
+        }
+    }
+
     /// Resolve the permission decision for one tool call. `Prompt` decisions
     /// ask through the event channel when streaming, or the blocking
     /// `prompt_fn` otherwise; with no way to ask, the call is denied.
@@ -616,6 +782,14 @@ impl Agent {
         token_tx: Option<&tokio::sync::mpsc::Sender<AgentEvent>>,
         force_prompt: bool,
     ) -> Result<(), String> {
+        let in_plan_mode = self.interaction_mode() == InteractionMode::Plan;
+        if name == "exit_plan_mode" && !in_plan_mode {
+            return Err(
+                "exit_plan_mode only applies in plan mode, and plan mode is not active — there \
+                 is nothing to exit. Carry on with the task."
+                    .to_string(),
+            );
+        }
         let decision = self.permissions.decide_tool(name, input);
         let effective = if force_prompt && decision == PermissionLevel::Allow {
             PermissionLevel::Prompt
@@ -624,6 +798,15 @@ impl Agent {
         };
         match effective {
             PermissionLevel::Allow => Ok(()),
+            PermissionLevel::Deny
+                if in_plan_mode && (is_file_write_tool(name) || name == "bash") =>
+            {
+                Err(format!(
+                    "{name} refused: plan mode is active, so file changes and state-changing \
+                     commands are not allowed. Research with read-only tools, then present your \
+                     plan with exit_plan_mode."
+                ))
+            }
             PermissionLevel::Deny => Err(format!("tool {name} not permitted")),
             PermissionLevel::Prompt => {
                 let reply = if let Some(tx) = token_tx {
@@ -652,13 +835,32 @@ impl Agent {
                         }
                     }
                 };
+                if name == "exit_plan_mode" {
+                    // Approving the plan ends plan mode; "always" (the second
+                    // option in the plan dialog) also accepts edits from here.
+                    return match reply {
+                        PermissionReply::AllowOnce => {
+                            self.set_interaction_mode(InteractionMode::Default);
+                            Ok(())
+                        }
+                        PermissionReply::AllowSession => {
+                            self.set_interaction_mode(InteractionMode::AcceptEdits);
+                            Ok(())
+                        }
+                        PermissionReply::Deny => Err(
+                            "The user did not approve the plan, so plan mode stays on. Ask what \
+                             they want changed, or revise the plan and call exit_plan_mode again."
+                                .to_string(),
+                        ),
+                    };
+                }
                 match reply {
                     PermissionReply::AllowOnce => Ok(()),
                     PermissionReply::AllowSession => {
                         let command = if name == "bash" {
                             input.get("command").and_then(|v| v.as_str())
-                        } else if name == "write" || name == "edit" {
-                            // Per-path approval: "always" for write/edit approves only this path
+                        } else if is_file_write_tool(name) {
+                            // Per-path approval: "always" for file writes approves only this path
                             input.get("path").and_then(|v| v.as_str())
                         } else if name == "spawn_agent" {
                             // Per-agent-id approval: "always" approves only this agent role
@@ -675,11 +877,7 @@ impl Agent {
         }
     }
 
-    async fn execute_tool(
-        &self,
-        name: &str,
-        input: &serde_json::Value,
-    ) -> (String, bool, Option<crate::tools::FileSnapshot>) {
+    async fn execute_tool(&self, name: &str, input: &serde_json::Value) -> ToolRun {
         let tool_input = ToolInput {
             name: name.to_string(),
             args: input
@@ -694,9 +892,19 @@ impl Agent {
         {
             Some(fut) => {
                 let out = fut.await;
-                (out.data, out.success, out.pre_edit_snapshot)
+                ToolRun {
+                    output: out.data,
+                    success: out.success,
+                    snapshot: out.pre_edit_snapshot,
+                    images: out.images,
+                }
             }
-            None => (format!("unknown tool: {name}"), false, None),
+            None => ToolRun {
+                output: format!("unknown tool: {name}"),
+                success: false,
+                snapshot: None,
+                images: Vec::new(),
+            },
         }
     }
 
@@ -718,6 +926,14 @@ impl Agent {
     ) -> anyhow::Result<crate::rewind::RewindResult> {
         crate::rewind::run(&self.session, &self.memory, turn_index).await
     }
+}
+
+/// What one tool call produced, as the agent loop needs it.
+struct ToolRun {
+    output: String,
+    success: bool,
+    snapshot: Option<crate::tools::FileSnapshot>,
+    images: Vec<ToolImage>,
 }
 
 /// Token usage accumulated across the model calls of one turn.

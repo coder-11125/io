@@ -1,6 +1,8 @@
 //! TUI input: readline loops, popup helpers, @file resolution, text editing primitives.
 
 use crate::stream::{LineBuf, SCROLL_STEP};
+use io_runtime::tools::read::encode_image;
+use io_runtime::tools::ToolImage;
 use io_tui::render::{
     draw_prompt_bar, handle_resize_with_height, render_scroll_view, PROMPT_BAR_HEIGHT,
 };
@@ -18,22 +20,38 @@ const DOUBLE_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 
 // ── @file resolution ───────────────────────────────────────────────────────────
 
-pub fn resolve_at_mentions(input: &str) -> String {
+/// Expand `@path` mentions. Text files and directory listings are appended to
+/// the prompt as `<file>` blocks; image files are returned separately so they
+/// can be attached to the message as vision input. A path containing spaces
+/// is written `@"path with spaces"`.
+pub fn resolve_at_mentions_with_images(input: &str) -> (String, Vec<ToolImage>) {
     let mut blocks: Vec<String> = Vec::new();
+    let mut images: Vec<ToolImage> = Vec::new();
     let chars: Vec<char> = input.chars().collect();
     let mut i = 0;
 
     while i < chars.len() {
         if chars[i] == '@' && (i == 0 || chars[i - 1].is_whitespace()) {
             let start = i + 1;
-            let end = chars[start..]
-                .iter()
-                .position(|c| c.is_whitespace())
-                .map(|p| start + p)
-                .unwrap_or(chars.len());
-            let path_str: String = chars[start..end].iter().collect();
+            let quoted_end = (chars.get(start) == Some(&'"'))
+                .then(|| chars[start + 1..].iter().position(|c| *c == '"'))
+                .flatten();
+            let (path_str, end): (String, usize) = match quoted_end {
+                Some(p) => (
+                    chars[start + 1..start + 1 + p].iter().collect(),
+                    start + 1 + p + 1,
+                ),
+                None => {
+                    let end = chars[start..]
+                        .iter()
+                        .position(|c| c.is_whitespace())
+                        .map(|p| start + p)
+                        .unwrap_or(chars.len());
+                    (chars[start..end].iter().collect(), end)
+                }
+            };
             if !path_str.is_empty() {
-                if let Some(block) = read_at_path(&path_str) {
+                if let Some(block) = read_at_path(&path_str, &mut images) {
                     blocks.push(block);
                 }
             }
@@ -44,12 +62,12 @@ pub fn resolve_at_mentions(input: &str) -> String {
     }
 
     if blocks.is_empty() {
-        return input.to_string();
+        return (input.to_string(), images);
     }
-    format!("{}\n\n{}", input, blocks.join("\n\n"))
+    (format!("{}\n\n{}", input, blocks.join("\n\n")), images)
 }
 
-fn read_at_path(path: &str) -> Option<String> {
+fn read_at_path(path: &str, images: &mut Vec<ToolImage>) -> Option<String> {
     let clean = path.trim_end_matches('/');
     let p = std::path::Path::new(clean);
 
@@ -88,6 +106,21 @@ fn read_at_path(path: &str) -> Option<String> {
                 ))
             }
         };
+        // Images are attached to the message rather than inlined as text.
+        match encode_image(&raw) {
+            Ok(Some(image)) => {
+                images.push(image);
+                return Some(format!(
+                    "<file path=\"{path}\">\n[image attached to this message]\n</file>"
+                ));
+            }
+            Ok(None) => {}
+            Err(why) => {
+                return Some(format!(
+                    "<file path=\"{path}\">\n[image not attached: {why}]\n</file>"
+                ))
+            }
+        }
         if raw.len() > MAX_AT_FILE_BYTES {
             return Some(format!(
                 "<file path=\"{path}\">\n[file too large to inline ({} bytes)]\n</file>",
@@ -459,6 +492,24 @@ pub fn paste_display(buf: &str, cursor: usize, pb: Option<&PasteBlock>) -> (Stri
     }
 }
 
+/// Insert `text` into `buf` at `cursor` (typing it, as far as the paste-block
+/// anchor and the cursor are concerned).
+fn insert_text(buf: &mut String, cursor: &mut usize, paste: &mut Option<PasteBlock>, text: &str) {
+    buf.insert_str(*cursor, text);
+    if let Some(pb) = paste {
+        pb.on_insert(*cursor, text.len());
+    }
+    *cursor += text.len();
+}
+
+/// Ctrl+V: if the clipboard holds an image, save it and return the `@path `
+/// mention that attaches it to the prompt.
+fn clipboard_image_mention() -> Option<String> {
+    let (media_type, bytes) = crate::clipboard::read_image()?;
+    let path = crate::clipboard::save_image(media_type, &bytes).ok()?;
+    Some(crate::clipboard::mention_for(&path))
+}
+
 // ── REPL readline ──────────────────────────────────────────────────────────────
 
 /// Read a line of input in TUI mode. Supports /slash completions, @file mentions,
@@ -543,6 +594,25 @@ pub fn tui_read_line(
                 current_prompt_height = bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
             }
             Event::Paste(text) => {
+                // A dragged-in image file arrives as its path: attach it.
+                if let Some(path) = crate::clipboard::pasted_image_path(&text) {
+                    insert_text(
+                        &mut buf,
+                        &mut cursor,
+                        &mut paste_block,
+                        &crate::clipboard::mention_for(&path),
+                    );
+                    slash_matches.clear();
+                    slash_selected = None;
+                    file_all = None;
+                    file_filtered.clear();
+                    file_selected = None;
+                    file_scroll = 0;
+                    clear_rows_above(popup_rows)?;
+                    popup_rows = 0;
+                    current_prompt_height = bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                    continue;
+                }
                 let content: String = text.chars().filter(|&c| c != '\r').collect();
                 if !content.trim().is_empty() {
                     paste_block = Some(PasteBlock::new(cursor, content));
@@ -733,6 +803,37 @@ pub fn tui_read_line(
                         popup_rows = new_rows;
                         current_prompt_height =
                             bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                    }
+
+                    // Shift+Tab: cycle default → accept edits → plan.
+                    (KeyCode::BackTab, _) => {
+                        crate::status::cycle_mode(agent);
+                        current_prompt_height =
+                            bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                    }
+
+                    // Alt+T: toggle extended thinking.
+                    (KeyCode::Char('t'), KeyModifiers::ALT) => {
+                        let _ = crate::status::toggle_thinking(agent);
+                        current_prompt_height =
+                            bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                    }
+
+                    // Ctrl+V: paste an image from the clipboard as an attachment.
+                    (KeyCode::Char('v'), KeyModifiers::CONTROL) => {
+                        if let Some(mention) = clipboard_image_mention() {
+                            insert_text(&mut buf, &mut cursor, &mut paste_block, &mention);
+                            file_all = None;
+                            file_filtered.clear();
+                            file_selected = None;
+                            file_scroll = 0;
+                            slash_matches.clear();
+                            slash_selected = None;
+                            clear_rows_above(popup_rows)?;
+                            popup_rows = 0;
+                            current_prompt_height =
+                                bar(&buf, cursor, *tab_current, paste_block.as_ref())?;
+                        }
                     }
 
                     (KeyCode::Tab, _) => {
@@ -1300,6 +1401,39 @@ pub fn splash_read_line(
                         let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf, cursor);
                         execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
                     }
+                    // Shift+Tab / Alt+T: working mode and thinking, as in the REPL.
+                    (KeyCode::BackTab, _) | (KeyCode::Char('t'), KeyModifiers::ALT) => {
+                        if key.code == KeyCode::BackTab {
+                            crate::status::cycle_mode(agent);
+                        } else {
+                            let _ = crate::status::toggle_thinking(agent);
+                        }
+                        io_tui::render::splash_update_status(
+                            &layout,
+                            splash_name(*tab_current),
+                            agent.provider_id,
+                            &agent.model_id,
+                            theme,
+                        )?;
+                        let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf, cursor);
+                        execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
+                    }
+                    // Ctrl+V: attach an image from the clipboard.
+                    (KeyCode::Char('v'), KeyModifiers::CONTROL) => {
+                        if let Some(mention) = clipboard_image_mention() {
+                            buf.insert_str(cursor, &mention);
+                            cursor += mention.len();
+                            sync_splash_input(
+                                &mut layout,
+                                &buf,
+                                splash_name(*tab_current),
+                                agent,
+                                theme,
+                            )?;
+                            let (cx, cy) = io_tui::render::splash_cursor(&layout, &buf, cursor);
+                            execute!(std::io::stdout(), cursor::MoveTo(cx, cy))?;
+                        }
+                    }
                     (KeyCode::Up, _) if !slash_matches.is_empty() => {
                         slash_selected = Some(match slash_selected {
                             None | Some(0) => slash_matches.len() - 1,
@@ -1420,7 +1554,10 @@ pub fn splash_read_line(
                 }
             }
             Event::Paste(text) => {
-                let clean: String = text.chars().filter(|&c| c != '\r' && c != '\n').collect();
+                let clean: String = match crate::clipboard::pasted_image_path(&text) {
+                    Some(path) => crate::clipboard::mention_for(&path),
+                    None => text.chars().filter(|&c| c != '\r' && c != '\n').collect(),
+                };
                 buf.insert_str(cursor, &clean);
                 cursor += clean.len();
                 sync_splash_input(&mut layout, &buf, splash_name(*tab_current), agent, theme)?;
@@ -1438,5 +1575,72 @@ pub fn splash_read_line(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 1x1 transparent PNG.
+    const PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89,
+    ];
+
+    fn temp(name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("io_at_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn text_files_are_inlined_and_images_are_attached() {
+        let txt = temp("notes.txt", b"hello notes");
+        let img = temp("shot.png", PNG);
+        let prompt = format!("look at @{} and @{}", txt.display(), img.display());
+        let (text, images) = resolve_at_mentions_with_images(&prompt);
+        assert!(text.contains("hello notes"), "{text}");
+        assert!(text.contains("[image attached to this message]"), "{text}");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].media_type, "image/png");
+        // The image bytes are not pasted into the prompt as text.
+        assert!(!text.contains(&images[0].data));
+    }
+
+    #[test]
+    fn quoted_mentions_allow_spaces_in_paths() {
+        let img = temp("my shot.png", PNG);
+        let (text, images) =
+            resolve_at_mentions_with_images(&format!("see @\"{}\" please", img.display()));
+        assert_eq!(images.len(), 1, "{text}");
+        assert!(text.contains("[image attached"));
+    }
+
+    #[test]
+    fn missing_paths_and_plain_text_are_handled() {
+        let (text, images) = resolve_at_mentions_with_images("no mentions here");
+        assert_eq!(text, "no mentions here");
+        assert!(images.is_empty());
+        let (text, images) = resolve_at_mentions_with_images("see @/definitely/not/here.png");
+        assert!(text.contains("[not found"));
+        assert!(images.is_empty());
+        // An email address is not a mention.
+        let (text, _) = resolve_at_mentions_with_images("write to me@example.com");
+        assert_eq!(text, "write to me@example.com");
+    }
+
+    #[test]
+    fn insert_text_moves_the_cursor_and_the_paste_anchor() {
+        let mut buf = "ab".to_string();
+        let mut cursor = 1;
+        let mut paste = Some(PasteBlock::new(2, "pasted".to_string()));
+        insert_text(&mut buf, &mut cursor, &mut paste, "XY");
+        assert_eq!(buf, "aXYb");
+        assert_eq!(cursor, 3);
+        assert_eq!(paste.unwrap().pos, 4);
     }
 }

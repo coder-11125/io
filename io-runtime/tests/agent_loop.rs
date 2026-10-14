@@ -5,13 +5,14 @@
 
 use async_trait::async_trait;
 use io_runtime::agent::{Agent, AgentEvent, PermissionReply, PromptBlocked};
+use io_runtime::config::ThinkingConfig;
 use io_runtime::hooks::{HookEntry, Hooks, HooksConfig};
 use io_runtime::memory::SessionStore;
 use io_runtime::provider::{
     CompletionModel, CompletionRequest, CompletionResponse, ContentBlock, StreamEvent, Usage,
 };
-use io_runtime::sandbox::PermissionChecker;
-use io_runtime::tools::default_registry;
+use io_runtime::sandbox::{InteractionMode, PermissionChecker};
+use io_runtime::tools::{default_registry, ToolImage};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -27,6 +28,8 @@ struct MockProvider {
     /// to the trait's default of 128K, same as a real provider with no
     /// configured/guessed window.
     context_window: AtomicU64,
+    /// Whether the mock claims to support extended thinking (default: yes).
+    thinking_capable: std::sync::atomic::AtomicBool,
 }
 
 impl MockProvider {
@@ -35,6 +38,7 @@ impl MockProvider {
             responses: Mutex::new(responses.into()),
             requests: Mutex::new(Vec::new()),
             context_window: AtomicU64::new(0),
+            thinking_capable: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -69,6 +73,10 @@ impl CompletionModel for MockProvider {
         }
     }
 
+    fn supports_thinking(&self) -> bool {
+        self.thinking_capable.load(Ordering::Relaxed)
+    }
+
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse> {
         self.next_response(request)
     }
@@ -91,6 +99,15 @@ impl CompletionModel for MockProvider {
                     tool_use @ ContentBlock::ToolUse { .. } => StreamEvent {
                         delta: None,
                         content_block: Some(tool_use),
+                        stop_reason: None,
+                        usage: None,
+                    },
+                    // Reasoning blocks stream through unchanged: unsigned ones
+                    // are display deltas, signed ones are finished blocks.
+                    reasoning @ (ContentBlock::Thinking { .. }
+                    | ContentBlock::RedactedThinking { .. }) => StreamEvent {
+                        delta: None,
+                        content_block: Some(reasoning),
                         stop_reason: None,
                         usage: None,
                     },
@@ -1170,4 +1187,597 @@ async fn sub_agents_inherit_pre_tool_use_hooks() {
         .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("secret contents")));
     assert!(!leaked, "file contents must never reach the model");
     std::fs::remove_file(&file).ok();
+}
+
+// ── Edit safety ───────────────────────────────────────────────────────────────
+
+/// The result text and error flag of the tool result at the end of `request`.
+fn last_tool_result(request: &CompletionRequest) -> (String, Option<bool>) {
+    request
+        .messages
+        .last()
+        .unwrap()
+        .content
+        .iter()
+        .find_map(|b| match b {
+            ContentBlock::ToolResult {
+                content, is_error, ..
+            } => Some((content.clone(), *is_error)),
+            _ => None,
+        })
+        .expect("last message carries a tool result")
+}
+
+#[tokio::test]
+async fn editing_an_unread_file_is_refused_until_it_has_been_read() {
+    let file = temp_path("io-test-unread", ".txt");
+    std::fs::write(&file, "alpha").unwrap();
+    let p = file.to_str().unwrap();
+    let edit = serde_json::json!({"path": p, "old_string": "alpha", "new_string": "beta"});
+
+    let provider = MockProvider::new(vec![
+        tool_response("edit", edit.clone()),
+        tool_response("read", serde_json::json!({"file_path": p})),
+        tool_response("edit", edit),
+        text_response("done"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow"));
+    agent.run_turn("change alpha to beta").await.unwrap();
+
+    let requests = provider.recorded_requests();
+    let (refusal, is_error) = last_tool_result(&requests[1]);
+    assert_eq!(is_error, Some(true));
+    assert!(refusal.contains("has not been read yet"), "{refusal}");
+    let (_, is_error) = last_tool_result(&requests[3]);
+    assert_eq!(is_error, None, "the edit after the read succeeds");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "beta");
+    std::fs::remove_file(&file).ok();
+}
+
+#[tokio::test]
+async fn a_file_changed_behind_the_agents_back_must_be_read_again() {
+    let file = temp_path("io-test-stale", ".txt");
+    std::fs::write(&file, "v1").unwrap();
+    let p = file.to_str().unwrap();
+    let edit = serde_json::json!({"path": p, "old_string": "v1", "new_string": "mine"});
+
+    let provider = MockProvider::new(vec![
+        tool_response("read", serde_json::json!({"file_path": p})),
+        text_response("read it"),
+        tool_response("edit", edit),
+        text_response("tried"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow"));
+    agent.run_turn("look at it").await.unwrap();
+    // The user (or a formatter) edits the file between turns.
+    std::fs::write(&file, "v1 plus the user's change").unwrap();
+    agent.run_turn("now edit it").await.unwrap();
+
+    let requests = provider.recorded_requests();
+    let (refusal, is_error) = last_tool_result(&requests[3]);
+    assert_eq!(is_error, Some(true));
+    assert!(refusal.contains("modified since"), "{refusal}");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "v1 plus the user's change",
+        "the user's change must not be clobbered"
+    );
+    std::fs::remove_file(&file).ok();
+}
+
+#[tokio::test]
+async fn multi_edit_changes_are_rewound_like_edits() {
+    let file = temp_path("io-test-multi-rewind", ".txt");
+    std::fs::write(&file, "one two").unwrap();
+    let p = file.to_str().unwrap();
+    let provider = MockProvider::new(vec![
+        tool_response("read", serde_json::json!({"file_path": p})),
+        tool_response(
+            "multi_edit",
+            serde_json::json!({"path": p, "edits": [
+                {"old_string": "one", "new_string": "1"},
+                {"old_string": "two", "new_string": "2"}
+            ]}),
+        ),
+        text_response("edited"),
+    ]);
+    let agent = make_agent(provider, PermissionChecker::new("allow"));
+    agent.run_turn("renumber").await.unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "1 2");
+
+    let result = agent.rewind_to(0).await.unwrap();
+    assert_eq!(result.files_restored.len(), 1);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "one two");
+    std::fs::remove_file(&file).ok();
+}
+
+// ── Todo list ─────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn todo_write_runs_without_prompting_even_in_strict_mode() {
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "todo_write",
+            serde_json::json!({"todos": [
+                {"content": "Write code", "status": "in_progress", "activeForm": "Writing code"},
+                {"content": "Test it", "status": "pending"}
+            ]}),
+        ),
+        text_response("planned"),
+    ]);
+    let db = temp_path("io-test", ".db");
+    let agent = make_agent_at(
+        provider.clone(),
+        PermissionChecker::new("prompt"),
+        db.clone(),
+        None,
+    );
+    agent.run_turn("do the thing").await.unwrap();
+
+    let (result, is_error) = last_tool_result(&provider.recorded_requests()[1]);
+    assert_eq!(is_error, None);
+    assert!(
+        result.contains("1 pending, 1 in progress, 0 completed"),
+        "{result}"
+    );
+
+    let store = SessionStore::with_path(db).unwrap();
+    let session = store.load_session(agent.session_id().await).unwrap();
+    assert_eq!(session.turns[0].tool_calls[0].tool_name, "todo_write");
+}
+
+// ── Plan mode ─────────────────────────────────────────────────────────────────
+
+fn system_text_of(request: &CompletionRequest) -> String {
+    request.system_text().unwrap_or_default()
+}
+
+#[tokio::test]
+async fn plan_mode_blocks_edits_until_the_user_approves_the_plan() {
+    let target = temp_path("io-test-plan", ".txt");
+    let write = serde_json::json!({"path": target.to_str().unwrap(), "content": "built"});
+    let provider = MockProvider::new(vec![
+        tool_response("write", write.clone()),
+        tool_response(
+            "exit_plan_mode",
+            serde_json::json!({"plan": "1. write the file"}),
+        ),
+        tool_response("write", write),
+        text_response("implemented"),
+    ]);
+    // Even with every permission granted, plan mode is read-only.
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow"));
+    agent.set_interaction_mode(InteractionMode::Plan);
+
+    let asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log = asked.clone();
+    agent.set_prompt_fn(Arc::new(move |name, input| {
+        log.lock().unwrap().push(format!("{name}: {input}"));
+        // The second option in the plan dialog: approve and accept edits.
+        PermissionReply::AllowSession
+    }));
+
+    let reply = agent.run_turn("add the file").await.unwrap();
+    assert_eq!(reply, "implemented");
+
+    let requests = provider.recorded_requests();
+    // The first write was refused with a pointer to exit_plan_mode.
+    let (refusal, is_error) = last_tool_result(&requests[1]);
+    assert_eq!(is_error, Some(true));
+    assert!(refusal.contains("plan mode is active"), "{refusal}");
+    assert!(refusal.contains("exit_plan_mode"));
+    // Only the plan itself was put to the user — never the blocked write.
+    let asked = asked.lock().unwrap();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(asked[0].starts_with("exit_plan_mode") && asked[0].contains("1. write the file"));
+    // Approval ended plan mode and accepted edits, so the second write ran.
+    assert_eq!(agent.interaction_mode(), InteractionMode::AcceptEdits);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "built");
+    // The model was told it is in plan mode while it was, and not after.
+    assert!(system_text_of(&requests[0]).contains("Plan mode is active"));
+    assert!(system_text_of(&requests[1]).contains("Plan mode is active"));
+    assert!(!system_text_of(&requests[2]).contains("Plan mode is active"));
+    let (approved, _) = last_tool_result(&requests[2]);
+    assert!(approved.contains("approved your plan"), "{approved}");
+    std::fs::remove_file(&target).ok();
+}
+
+#[tokio::test]
+async fn approving_the_plan_once_returns_to_the_default_mode() {
+    let provider = MockProvider::new(vec![
+        tool_response("exit_plan_mode", serde_json::json!({"plan": "do it"})),
+        text_response("ok"),
+    ]);
+    let agent = make_agent(provider, PermissionChecker::new("prompt"));
+    agent.set_interaction_mode(InteractionMode::Plan);
+    agent.set_prompt_fn(Arc::new(|_, _| PermissionReply::AllowOnce));
+    agent.run_turn("plan it").await.unwrap();
+    assert_eq!(agent.interaction_mode(), InteractionMode::Default);
+}
+
+#[tokio::test]
+async fn a_rejected_plan_keeps_plan_mode_on_and_tells_the_model() {
+    let target = temp_path("io-test-plan-rejected", ".txt");
+    let provider = MockProvider::new(vec![
+        tool_response("exit_plan_mode", serde_json::json!({"plan": "risky plan"})),
+        tool_response(
+            "write",
+            serde_json::json!({"path": target.to_str().unwrap(), "content": "x"}),
+        ),
+        text_response("revising"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow"));
+    agent.set_interaction_mode(InteractionMode::Plan);
+    agent.set_prompt_fn(Arc::new(|_, _| PermissionReply::Deny));
+    agent.run_turn("plan it").await.unwrap();
+
+    let requests = provider.recorded_requests();
+    let (rejection, is_error) = last_tool_result(&requests[1]);
+    assert_eq!(is_error, Some(true));
+    assert!(
+        rejection.contains("did not approve the plan"),
+        "{rejection}"
+    );
+    assert_eq!(agent.interaction_mode(), InteractionMode::Plan);
+    assert!(!target.exists(), "no edits while the plan is unapproved");
+}
+
+#[tokio::test]
+async fn exit_plan_mode_outside_plan_mode_is_a_harmless_error() {
+    let provider = MockProvider::new(vec![
+        tool_response("exit_plan_mode", serde_json::json!({"plan": "unneeded"})),
+        text_response("carrying on"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("prompt"));
+    // No prompt_fn: if the user were asked, the call would fail differently.
+    agent.run_turn("go").await.unwrap();
+    let (result, is_error) = last_tool_result(&provider.recorded_requests()[1]);
+    assert_eq!(is_error, Some(true));
+    assert!(result.contains("plan mode is not active"), "{result}");
+    assert_eq!(agent.interaction_mode(), InteractionMode::Default);
+}
+
+#[tokio::test]
+async fn plan_mode_still_allows_reading_and_read_only_commands() {
+    let file = temp_path("io-test-plan-read", ".txt");
+    std::fs::write(&file, "research material").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "read",
+            serde_json::json!({"file_path": file.to_str().unwrap()}),
+        ),
+        tool_response("bash", serde_json::json!({"command": "ls"})),
+        tool_response(
+            "bash",
+            serde_json::json!({"command": "rm -rf /tmp/io-never"}),
+        ),
+        text_response("researched"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow"));
+    agent.set_interaction_mode(InteractionMode::Plan);
+    agent.run_turn("investigate").await.unwrap();
+
+    let requests = provider.recorded_requests();
+    let (read, e1) = last_tool_result(&requests[1]);
+    assert!(read.contains("research material") && e1.is_none());
+    let (_, e2) = last_tool_result(&requests[2]);
+    assert_eq!(e2, None, "ls is read-only");
+    let (blocked, e3) = last_tool_result(&requests[3]);
+    assert_eq!(e3, Some(true));
+    assert!(blocked.contains("plan mode is active"), "{blocked}");
+    std::fs::remove_file(&file).ok();
+}
+
+#[tokio::test]
+async fn accept_edits_mode_writes_without_asking() {
+    let target = temp_path("io-test-accept", ".txt");
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "write",
+            serde_json::json!({"path": target.to_str().unwrap(), "content": "accepted"}),
+        ),
+        text_response("written"),
+    ]);
+    // Strict prompt mode with no way to ask: only accept-edits lets this run.
+    let agent = make_agent(provider, PermissionChecker::new("prompt"));
+    agent.set_interaction_mode(InteractionMode::AcceptEdits);
+    agent.run_turn("write it").await.unwrap();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "accepted");
+    std::fs::remove_file(&target).ok();
+}
+
+#[tokio::test]
+async fn the_mode_cycles_and_is_shared_with_the_permission_checker() {
+    let permissions = Arc::new(PermissionChecker::new("prompt"));
+    let memory = SessionStore::with_path(temp_path("io-test", ".db")).unwrap();
+    let agent = Agent::new(
+        MockProvider::new(vec![]),
+        default_registry(),
+        memory,
+        permissions.clone(),
+        "x".to_string(),
+        None,
+        None,
+        "mock-model".to_string(),
+        1024,
+        false,
+        None,
+    );
+    assert_eq!(agent.cycle_interaction_mode(), InteractionMode::AcceptEdits);
+    assert_eq!(permissions.interaction_mode(), InteractionMode::AcceptEdits);
+    assert_eq!(agent.cycle_interaction_mode(), InteractionMode::Plan);
+    assert_eq!(agent.cycle_interaction_mode(), InteractionMode::Default);
+}
+
+// ── Images ────────────────────────────────────────────────────────────────────
+
+const PNG_BYTES: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0";
+
+#[tokio::test]
+async fn images_a_tool_returns_follow_the_tool_results_to_the_model() {
+    let file = temp_path("io-test-shot", ".png");
+    std::fs::write(&file, PNG_BYTES).unwrap();
+    let provider = MockProvider::new(vec![
+        tool_response(
+            "read",
+            serde_json::json!({"file_path": file.to_str().unwrap()}),
+        ),
+        text_response("a 1x1 pixel"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow"));
+    agent.run_turn("what is in the screenshot?").await.unwrap();
+
+    let requests = provider.recorded_requests();
+    let last = requests[1].messages.last().unwrap();
+    // Tool results first (providers require it), then the image.
+    assert!(matches!(last.content[0], ContentBlock::ToolResult { .. }));
+    match &last.content[1] {
+        ContentBlock::Image { media_type, data } => {
+            assert_eq!(media_type, "image/png");
+            assert!(!data.is_empty());
+        }
+        other => panic!("expected an image block, got {other:?}"),
+    }
+    std::fs::remove_file(&file).ok();
+}
+
+#[tokio::test]
+async fn attached_images_lead_the_user_message_and_are_noted_in_history() {
+    let provider = MockProvider::new(vec![text_response("I see it")]);
+    let db = temp_path("io-test", ".db");
+    let agent = make_agent_at(
+        provider.clone(),
+        PermissionChecker::new("allow"),
+        db.clone(),
+        None,
+    );
+    let image = ToolImage {
+        media_type: "image/png".to_string(),
+        data: "QUJD".to_string(),
+    };
+    agent
+        .run_turn_with_images("describe this", vec![image])
+        .await
+        .unwrap();
+
+    let requests = provider.recorded_requests();
+    let user = requests[0].messages.last().unwrap();
+    assert!(matches!(&user.content[0], ContentBlock::Image { data, .. } if data == "QUJD"));
+    assert!(
+        matches!(&user.content[1], ContentBlock::Text { text } if text.contains("describe this"))
+    );
+
+    // Images aren't persisted, but the saved turn says they existed.
+    let store = SessionStore::with_path(db).unwrap();
+    let session = store.load_session(agent.session_id().await).unwrap();
+    assert!(session.turns[0]
+        .user_message
+        .contains("1 image(s) were attached"));
+}
+
+// ── Extended thinking ─────────────────────────────────────────────────────────
+
+fn thinking(enabled: bool, budget_tokens: u32) -> ThinkingConfig {
+    ThinkingConfig {
+        enabled,
+        budget_tokens,
+        keywords: true,
+    }
+}
+
+#[tokio::test]
+async fn thinking_is_off_by_default_and_requests_carry_no_budget() {
+    let provider = MockProvider::new(vec![text_response("hi")]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow"));
+    agent.run_turn("hello there").await.unwrap();
+    let req = &provider.recorded_requests()[0];
+    assert_eq!(req.thinking, None);
+    assert_eq!(req.max_tokens, Some(1024));
+}
+
+#[tokio::test]
+async fn enabled_thinking_sends_the_budget_and_leaves_room_for_the_answer() {
+    let provider = MockProvider::new(vec![text_response("hi"), text_response("hi again")]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow"))
+        .with_thinking(thinking(true, 8_000));
+    agent.run_turn("hello").await.unwrap();
+    let req = &provider.recorded_requests()[0];
+    assert_eq!(req.thinking.map(|t| t.budget_tokens), Some(8_000));
+    assert_eq!(req.max_tokens, Some(8_000 + 4_096));
+
+    // Switching it off mid-session takes effect on the next turn.
+    agent.set_thinking(thinking(false, 8_000));
+    agent.run_turn("hello again").await.unwrap();
+    let req = &provider.recorded_requests()[1];
+    assert_eq!(req.thinking, None);
+    assert_eq!(req.max_tokens, Some(1024));
+}
+
+#[tokio::test]
+async fn keywords_turn_thinking_on_for_one_turn_only() {
+    let provider = MockProvider::new(vec![
+        text_response("a"),
+        text_response("b"),
+        text_response("c"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow"));
+    agent
+        .run_turn("ultrathink about the cache design")
+        .await
+        .unwrap();
+    agent.run_turn("I think that is fine").await.unwrap();
+    agent.run_turn("think hard about naming").await.unwrap();
+
+    let reqs = provider.recorded_requests();
+    assert_eq!(reqs[0].thinking.map(|t| t.budget_tokens), Some(31_999));
+    assert_eq!(reqs[0].max_tokens, Some(31_999 + 4_096));
+    assert_eq!(
+        reqs[1].thinking, None,
+        "a casual 'I think' is not a keyword"
+    );
+    assert_eq!(reqs[2].thinking.map(|t| t.budget_tokens), Some(10_000));
+}
+
+#[tokio::test]
+async fn keywords_can_be_disabled() {
+    let provider = MockProvider::new(vec![text_response("a")]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow")).with_thinking(
+        ThinkingConfig {
+            keywords: false,
+            ..thinking(false, 8_000)
+        },
+    );
+    agent.run_turn("ultrathink").await.unwrap();
+    assert_eq!(provider.recorded_requests()[0].thinking, None);
+}
+
+#[tokio::test]
+async fn signed_reasoning_is_replayed_during_the_tool_loop_and_shown_live() {
+    let file = temp_path("io-test-thinking", ".txt");
+    std::fs::write(&file, "data").unwrap();
+    let provider = MockProvider::new(vec![
+        CompletionResponse {
+            content: vec![
+                // A display delta, then the finished signed block, then the call.
+                ContentBlock::Thinking {
+                    thinking: "weighing it".to_string(),
+                    signature: None,
+                },
+                ContentBlock::Thinking {
+                    thinking: "weighing it up".to_string(),
+                    signature: Some("sig-1".to_string()),
+                },
+                ContentBlock::RedactedThinking {
+                    data: "opaque".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"file_path": file.to_str().unwrap()}),
+                },
+            ],
+            stop_reason: Some("tool_use".to_string()),
+            usage: None,
+        },
+        text_response("done"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow"))
+        .with_thinking(thinking(true, 8_000));
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(32);
+    let consumer = tokio::spawn(async move {
+        let mut shown = String::new();
+        while let Some(ev) = rx.recv().await {
+            if let AgentEvent::Thinking(delta) = ev {
+                shown.push_str(&delta);
+            }
+        }
+        shown
+    });
+    agent.run_turn_streaming("read it", tx).await.unwrap();
+    assert_eq!(
+        consumer.await.unwrap(),
+        "weighing it",
+        "only deltas are shown"
+    );
+
+    // The follow-up request carries the signed + redacted blocks first, in
+    // the assistant message, ahead of the tool call.
+    let requests = provider.recorded_requests();
+    let assistant = requests[1]
+        .messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, io_runtime::provider::Role::Assistant))
+        .unwrap();
+    assert!(matches!(
+        &assistant.content[0],
+        ContentBlock::Thinking { thinking, signature: Some(sig) }
+            if thinking == "weighing it up" && sig == "sig-1"
+    ));
+    assert!(matches!(
+        &assistant.content[1],
+        ContentBlock::RedactedThinking { .. }
+    ));
+    assert!(matches!(
+        &assistant.content[2],
+        ContentBlock::ToolUse { .. }
+    ));
+    assert_eq!(
+        assistant.content.len(),
+        3,
+        "the unsigned delta is not replayed"
+    );
+    std::fs::remove_file(&file).ok();
+}
+
+#[tokio::test]
+async fn blocking_turns_drop_unsigned_reasoning_from_history() {
+    let file = temp_path("io-test-thinking-blocking", ".txt");
+    std::fs::write(&file, "data").unwrap();
+    let provider = MockProvider::new(vec![
+        CompletionResponse {
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "unsigned musings".to_string(),
+                    signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "call_1".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"file_path": file.to_str().unwrap()}),
+                },
+            ],
+            stop_reason: Some("tool_use".to_string()),
+            usage: None,
+        },
+        text_response("done"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow"));
+    agent.run_turn("read it").await.unwrap();
+    let requests = provider.recorded_requests();
+    let replayed = requests[1]
+        .messages
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .any(|b| matches!(b, ContentBlock::Thinking { .. }));
+    assert!(!replayed);
+    std::fs::remove_file(&file).ok();
+}
+
+#[tokio::test]
+async fn a_model_without_thinking_support_gets_no_budget_and_no_extra_tokens() {
+    let provider = MockProvider::new(vec![text_response("fine")]);
+    provider
+        .thinking_capable
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    // Both the setting and a keyword are ignored: raising max_tokens for a
+    // model that can't think could make its API reject the request.
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow"))
+        .with_thinking(thinking(true, 8_000));
+    assert!(!agent.supports_thinking());
+    agent.run_turn("ultrathink about this").await.unwrap();
+    let req = &provider.recorded_requests()[0];
+    assert_eq!(req.thinking, None);
+    assert_eq!(req.max_tokens, Some(1024));
 }

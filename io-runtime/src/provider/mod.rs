@@ -54,6 +54,11 @@ pub enum Role {
     Tool,
 }
 
+/// One piece of message content.
+///
+/// The enum is untagged, so variants are told apart by their fields; keep
+/// `Image` ahead of `RedactedThinking` (both have a `data` field) so a
+/// round-trip through JSON picks the right one.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum ContentBlock {
@@ -71,9 +76,37 @@ pub enum ContentBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+    /// An inline image (vision input): base64 `data` plus its MIME type.
+    Image {
+        media_type: String,
+        data: String,
+    },
+    /// Opaque reasoning the provider redacted. Must be passed back verbatim
+    /// during a tool loop (Anthropic).
+    RedactedThinking {
+        data: String,
+    },
+    /// Model reasoning. A streamed *delta* carries `signature: None`; a
+    /// finished block carries the provider's signature, which Anthropic
+    /// requires when the block is sent back during a tool loop. Blocks
+    /// without a signature are display-only and never re-sent.
+    Thinking {
+        thinking: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
 }
 
-#[derive(Debug, Clone)]
+/// Extended-thinking request: let the model reason before answering, using
+/// up to `budget_tokens` tokens. Providers map it onto their own control
+/// (Anthropic/Bedrock `thinking.budget_tokens`, Gemini `thinkingBudget`,
+/// OpenAI `reasoning_effort`); providers without reasoning support ignore it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThinkingRequest {
+    pub budget_tokens: u32,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct CompletionRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
@@ -81,6 +114,7 @@ pub struct CompletionRequest {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub stream: bool,
+    pub thinking: Option<ThinkingRequest>,
 }
 
 impl CompletionRequest {
@@ -174,6 +208,22 @@ pub struct StreamEvent {
     pub content_block: Option<ContentBlock>,
     pub stop_reason: Option<String>,
     pub usage: Option<Usage>,
+}
+
+impl StreamEvent {
+    /// A display-only reasoning delta: a [`ContentBlock::Thinking`] with no
+    /// signature, which the agent shows but never replays to the model.
+    pub(crate) fn thinking_delta(text: impl Into<String>) -> Self {
+        Self {
+            delta: None,
+            content_block: Some(ContentBlock::Thinking {
+                thinking: text.into(),
+                signature: None,
+            }),
+            stop_reason: None,
+            usage: None,
+        }
+    }
 }
 
 /// Infer context window size (tokens) from a model ID string.
@@ -394,6 +444,13 @@ pub trait CompletionModel: Debug + Send + Sync {
     fn context_window(&self) -> u64 {
         128_000
     }
+    /// Whether the configured model reasons on request (extended thinking).
+    /// When false the agent sends no thinking budget and doesn't raise
+    /// `max_tokens` for it, so a `think` keyword can't break a model that
+    /// would reject the larger limit.
+    fn supports_thinking(&self) -> bool {
+        false
+    }
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse>;
     async fn complete_stream(
         &self,
@@ -431,6 +488,9 @@ impl CompletionModel for OpenAICompatProvider {
     }
     fn context_window(&self) -> u64 {
         self.context_window
+    }
+    fn supports_thinking(&self) -> bool {
+        self.inner.supports_thinking()
     }
 
     async fn complete(&self, req: CompletionRequest) -> anyhow::Result<CompletionResponse> {
@@ -482,6 +542,10 @@ impl CompletionModel for Retrying {
 
     fn context_window(&self) -> u64 {
         self.0.context_window()
+    }
+
+    fn supports_thinking(&self) -> bool {
+        self.0.supports_thinking()
     }
 
     async fn complete(&self, request: CompletionRequest) -> anyhow::Result<CompletionResponse> {
@@ -842,12 +906,34 @@ mod tests {
     fn request(system_prompt: Option<&str>, messages: Vec<Message>) -> CompletionRequest {
         CompletionRequest {
             messages,
-            tools: vec![],
             system_prompt: system_prompt.map(str::to_string),
-            max_tokens: None,
-            temperature: None,
-            stream: false,
+            ..Default::default()
         }
+    }
+
+    #[test]
+    fn content_blocks_roundtrip_through_json() {
+        let blocks = vec![
+            ContentBlock::Text { text: "hi".into() },
+            ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            },
+            ContentBlock::RedactedThinking { data: "zz".into() },
+            ContentBlock::Thinking {
+                thinking: "hmm".into(),
+                signature: Some("sig".into()),
+            },
+        ];
+        let json = serde_json::to_string(&blocks).unwrap();
+        let back: Vec<ContentBlock> = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back[0], ContentBlock::Text { .. }));
+        assert!(matches!(back[1], ContentBlock::Image { .. }));
+        assert!(matches!(back[2], ContentBlock::RedactedThinking { .. }));
+        assert!(matches!(
+            &back[3],
+            ContentBlock::Thinking { signature: Some(s), .. } if s == "sig"
+        ));
     }
 
     #[test]
