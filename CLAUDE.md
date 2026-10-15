@@ -69,6 +69,7 @@ io/
 │       ├── picker.rs          # Terminal interactive picker (typed Dismissed errors)
 │       ├── readline.rs        # Custom readline with slash commands
 │       ├── pager.rs           # Scrollable full-screen viewer (Ctrl+O)
+│       ├── popup.rs           # Centered scrollable popup over a greyed splash (read-only slash commands)
 │       └── theme.rs           # Interactive theme picker
 ├── io-runtime/                # Core engine (library crate)
 │   ├── Cargo.toml
@@ -1014,6 +1015,16 @@ struct Cli {
 - `io init` - Initialize project-level config
 
 **TUI slash commands**: `/help`, `/new`, `/agent`, `/connect`, `/model`, `/theme`, `/cost`, `/compact`, `/mcp` (`/mcp reconnect`), `/resume`, `/clear`, `/rename`, `/fork`, `/export`, `/status`, `/context` (`/context refresh` = the old catalog lookup), `/todos`, `/hooks`, `/agents`, `/permissions`, `/add-dir`, `/memory`, `/init`, `/output-style`, `/review`, `/commit`, `/pr`, `/doctor`, `/vim`, `/logout`, `/usage`, `/terminal-setup`, `/bug`, `/rewind` (also triggered by pressing Esc twice within 500 ms at the idle prompt), `/plan` (toggle plan mode), `/think [on|off|low|medium|high|<tokens>]` (persists to `[thinking]`), `/exit` (also `/quit`, `/q`).
+**Command output.** Results go through the scrollback (`line_buf`) via
+`tui.rs::notice` / `print_info_lines` — never straight onto the rows above the
+prompt bar, because `draw_prompt_bar` clears everything from `MAX_INPUT_LINES + 2`
+rows up on every redraw. A command run from the splash stays in the full view
+if it printed anything (`NOTICE_SHOWN`). The read-only reports (`/help`,
+`/status`, `/context`, `/hooks`, `/agents`, `/todos`, `/doctor`, `/bug`,
+`/terminal-setup`, `/mcp`, `/permissions`, `/cost`, `/usage`) instead open
+`io_tui::popup::show` when run from the splash (`tui.rs::report`): a scrollable
+box over the splash redrawn in grey; Esc / q / Enter closes it and the splash is
+shown again. In the full view they still print into the scrollback.
 Key bindings: Shift+Tab cycles the working mode, Alt+T toggles extended thinking,
 Ctrl+V attaches a clipboard image (`pngpaste`, `wl-paste` or `xclip`), Tab at the
 empty prompt cycles agents. A pasted path to an image file (drag-and-drop) is
@@ -1192,6 +1203,7 @@ Run with `cargo test`.
 | `memory.rs`, `export.rs`, `io/src/session_cmd.rs` | summaries (title / turns / model), old sessions load, Markdown export, prefix ids, export names, replay and transcript lines |
 | `io/src/{headless,run_opts,info_cmd,doctor,git_prompts,worktree,update,history,vim,permissions,memory_cmd}.rs` | prompt composition, stream-json events, tool-list splitting, report builders, doctor rendering, command expansion, worktree creation (real git), version comparison, history persistence / search / browsing, the whole Vim command set, `/permissions` editing |
 | `io-tui/src/pager.rs` | scroll clamping and visible window |
+| `io-tui/src/popup.rs`, `io/src/tui.rs` (info) | popup geometry (centering, min width, title widening, screen clamp, scrolling); info-block lines (control chars dropped, width cut); multi-line notices |
 | `config.rs` | default config, roundtrip serialization, schema upgrade (incl. `prompt_cache` / `[hooks]` / `[thinking]`), hooks + prompt_cache + thinking parsing |
 | `tools/file_state.rs` | unread / unchanged / stale / re-recorded / forgotten paths |
 | `tools/{edit,write,multi_edit,notebook}.rs` | read-before-edit and stale-file refusals, `replace_all`, all-or-nothing multi-edit, notebook replace/insert/delete by id and index, Jupyter-style serialization |

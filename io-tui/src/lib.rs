@@ -1,6 +1,7 @@
 pub mod modal;
 pub mod pager;
 pub mod picker;
+pub mod popup;
 pub mod raw;
 pub mod readline;
 pub mod render;

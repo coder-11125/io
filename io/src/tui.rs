@@ -1,7 +1,7 @@
 //! Interactive TUI and single-shot runner: agent construction, the per-turn
 //! streaming/cancellation/permission dance, and slash command dispatch.
 
-use crate::cost::show_cost_summary;
+use crate::cost::cost_lines;
 use crate::input::{resolve_at_mentions_with_images, splash_read_line, tui_read_line};
 use crate::stream::{
     blink_and_print, push_line, LineBuf, PendingPerm, PendingPermission, SCROLL_STEP,
@@ -583,7 +583,9 @@ pub async fn run_interactive(
         match input.as_str() {
             "/exit" | "/quit" | "/q" => break,
             "/help" => {
-                print_info_lines(&line_buf, &theme, &[
+                report(
+                    "/help",
+                    &[
                     "Commands:",
                     "  /exit, /quit   Exit",
                     "  /help          Show this help",
@@ -631,15 +633,32 @@ pub async fn run_interactive(
                     "  !<cmd>         Run a shell command",
                     "  Shift+Tab      Cycle mode: default → accept edits → plan",
                     "  Ctrl+V         Attach an image from the clipboard (or @image.png)",
-                ])?;
+                    ],
+                    from_splash,
+                    &line_buf,
+                    &theme,
+                    current_agent.name,
+                    &agent,
+                )?;
                 if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
             }
             "/cost" => {
-                if let Err(e) = show_cost_summary(&agent).await {
-                    let _ = notice(&line_buf, &theme, &format!("error: {e}"));
+                match cost_lines(&agent).await {
+                    Ok(lines) => report(
+                        &input,
+                        &lines,
+                        from_splash,
+                        &line_buf,
+                        &theme,
+                        current_agent.name,
+                        &agent,
+                    )?,
+                    Err(e) => {
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
+                    }
                 }
                 if from_splash && !notice_shown() {
                     is_splash = true;
@@ -969,7 +988,15 @@ pub async fn run_interactive(
                     lines.push("No MCP servers configured — add one with `io mcp add`.".into());
                 }
                 lines.extend(mcp_cmd::state_lines(&states));
-                print_info_lines(&line_buf, &theme, &lines)?;
+                report(
+                    &input,
+                    &lines,
+                    from_splash,
+                    &line_buf,
+                    &theme,
+                    current_agent.name,
+                    &agent,
+                )?;
                 if from_splash && !notice_shown() {
                     is_splash = true;
                 }
@@ -1113,15 +1140,34 @@ pub async fn run_interactive(
                     "/terminal-setup" => info_cmd::terminal_setup_lines(),
                     _ => doctor::render(&doctor::run_checks(&root)),
                 };
-                print_info_lines(&line_buf, &theme, &lines)?;
+                report(
+                    &input,
+                    &lines,
+                    from_splash,
+                    &line_buf,
+                    &theme,
+                    current_agent.name,
+                    &agent,
+                )?;
                 if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
             }
             "/usage" => {
-                if let Err(e) = show_cost_summary(&agent).await {
-                    let _ = notice(&line_buf, &theme, &format!("error: {e}"));
+                match cost_lines(&agent).await {
+                    Ok(lines) => report(
+                        &input,
+                        &lines,
+                        from_splash,
+                        &line_buf,
+                        &theme,
+                        current_agent.name,
+                        &agent,
+                    )?,
+                    Err(e) => {
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
+                    }
                 }
                 if from_splash && !notice_shown() {
                     is_splash = true;
@@ -1274,7 +1320,15 @@ pub async fn run_interactive(
                 {
                     agent = new_agent;
                 }
-                print_info_lines(&line_buf, &theme, &lines)?;
+                report(
+                    &input,
+                    &lines,
+                    from_splash,
+                    &line_buf,
+                    &theme,
+                    current_agent.name,
+                    &agent,
+                )?;
                 if from_splash && !notice_shown() {
                     is_splash = true;
                 }
@@ -1690,6 +1744,31 @@ fn notice_shown() -> bool {
 fn notice(line_buf: &LineBuf, theme: &io_tui::render::Theme, msg: &str) -> anyhow::Result<()> {
     let lines: Vec<&str> = msg.lines().collect();
     print_info_lines(line_buf, theme, &lines)
+}
+
+/// Show a read-only command's output. From the splash screen it opens in a
+/// popup over the dimmed splash (Esc returns to the splash); in the full view
+/// it goes into the scrollback so it stays in the conversation's history.
+fn report<S: AsRef<str>>(
+    title: &str,
+    lines: &[S],
+    from_splash: bool,
+    line_buf: &LineBuf,
+    theme: &io_tui::render::Theme,
+    agent_name: &str,
+    agent: &io_runtime::Agent,
+) -> anyhow::Result<()> {
+    if !from_splash {
+        return print_info_lines(line_buf, theme, lines);
+    }
+    let lines: Vec<String> = lines
+        .iter()
+        .map(|l| l.as_ref().replace('\t', "    "))
+        .collect();
+    io_tui::popup::show(title, &lines, &mut || {
+        io_tui::popup::draw_dimmed_splash(agent_name, agent.provider_id, &agent.model_id, theme)
+    })?;
+    Ok(())
 }
 
 /// Scrollback lines for an info block: control characters dropped, each line
