@@ -2,9 +2,7 @@
 //! streaming/cancellation/permission dance, and slash command dispatch.
 
 use crate::cost::show_cost_summary;
-use crate::input::{
-    clear_rows_above, resolve_at_mentions_with_images, splash_read_line, tui_read_line,
-};
+use crate::input::{resolve_at_mentions_with_images, splash_read_line, tui_read_line};
 use crate::stream::{
     blink_and_print, push_line, LineBuf, PendingPerm, PendingPermission, SCROLL_STEP,
 };
@@ -511,6 +509,7 @@ pub async fn run_interactive(
             .unwrap_or(0);
 
         let from_splash = is_splash;
+        NOTICE_SHOWN.store(false, std::sync::atomic::Ordering::Relaxed);
         let input = if let Some(next) = pending_inputs.pop_front() {
             next
         } else if is_splash {
@@ -550,15 +549,7 @@ pub async fn run_interactive(
                 Ok(Some(s)) => s,
                 Ok(None) => break,
                 Err(e) => {
-                    let _ = draw_prompt_bar(
-                        &format!("error: {e}"),
-                        current_agent.name,
-                        agent.provider_id,
-                        &agent.model_id,
-                        last_input_tokens,
-                        agent.context_window(),
-                        &theme,
-                    );
+                    let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                     continue;
                 }
             }
@@ -576,15 +567,7 @@ pub async fn run_interactive(
                 match build_agent(SessionChoice::Existing(sid), &current_agent, None).await {
                     Ok(new_agent) => agent = new_agent,
                     Err(e) => {
-                        let _ = draw_prompt_bar(
-                            &format!("error switching agent: {e}"),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &format!("error switching agent: {e}"));
                         continue;
                     }
                 }
@@ -600,7 +583,7 @@ pub async fn run_interactive(
         match input.as_str() {
             "/exit" | "/quit" | "/q" => break,
             "/help" => {
-                print_info_lines(&[
+                print_info_lines(&line_buf, &theme, &[
                     "Commands:",
                     "  /exit, /quit   Exit",
                     "  /help          Show this help",
@@ -649,24 +632,16 @@ pub async fn run_interactive(
                     "  Shift+Tab      Cycle mode: default → accept edits → plan",
                     "  Ctrl+V         Attach an image from the clipboard (or @image.png)",
                 ])?;
-                if from_splash {
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
             }
             "/cost" => {
                 if let Err(e) = show_cost_summary(&agent).await {
-                    let _ = draw_prompt_bar(
-                        &format!("error: {e}"),
-                        current_agent.name,
-                        agent.provider_id,
-                        &agent.model_id,
-                        last_input_tokens,
-                        agent.context_window(),
-                        &theme,
-                    );
+                    let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                 }
-                if from_splash {
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -679,42 +654,22 @@ pub async fn run_interactive(
                         {
                             Ok(new_agent) => {
                                 agent = new_agent;
-                                let _ = draw_prompt_bar(
-                                    &msg,
-                                    current_agent.name,
-                                    agent.provider_id,
-                                    &agent.model_id,
-                                    last_input_tokens,
-                                    agent.context_window(),
-                                    &theme,
-                                );
+                                let _ = notice(&line_buf, &theme, &msg);
                             }
                             Err(e) => {
-                                let _ = draw_prompt_bar(
-                                    &format!("error reloading provider: {e}"),
-                                    current_agent.name,
-                                    agent.provider_id,
-                                    &agent.model_id,
-                                    last_input_tokens,
-                                    agent.context_window(),
+                                let _ = notice(
+                                    &line_buf,
                                     &theme,
+                                    &format!("error reloading provider: {e}"),
                                 );
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = draw_prompt_bar(
-                            &format!("error: {e}"),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                     }
                 }
-                if from_splash {
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -722,44 +677,28 @@ pub async fn run_interactive(
             "/compact" => {
                 match agent.compact().await {
                     Ok(result) if result.turns_compacted == 0 => {
-                        let _ = draw_prompt_bar(
-                            "Nothing to compact — session has no turns.",
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
+                        let _ = notice(
+                            &line_buf,
                             &theme,
+                            "Nothing to compact — session has no turns.",
                         );
                     }
                     Ok(result) => {
-                        let _ = draw_prompt_bar(
+                        let _ = notice(
+                            &line_buf,
+                            &theme,
                             &format!(
                                 "Compacted {} turn{} into a summary.",
                                 result.turns_compacted,
                                 if result.turns_compacted == 1 { "" } else { "s" }
                             ),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
                         );
                     }
                     Err(e) => {
-                        let _ = draw_prompt_bar(
-                            &format!("error: {e}"),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                     }
                 }
-                if from_splash {
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -767,16 +706,12 @@ pub async fn run_interactive(
             "/rewind" => {
                 let turns = agent.session_turns().await;
                 if turns.is_empty() {
-                    let _ = draw_prompt_bar(
-                        "Nothing to rewind — session has no turns.",
-                        current_agent.name,
-                        agent.provider_id,
-                        &agent.model_id,
-                        last_input_tokens,
-                        agent.context_window(),
+                    let _ = notice(
+                        &line_buf,
                         &theme,
+                        "Nothing to rewind — session has no turns.",
                     );
-                    if from_splash {
+                    if from_splash && !notice_shown() {
                         is_splash = true;
                     }
                     continue;
@@ -824,56 +759,24 @@ pub async fn run_interactive(
                                             result.files_skipped.len()
                                         )
                                     };
-                                    let _ = draw_prompt_bar(
-                                        &msg,
-                                        current_agent.name,
-                                        agent.provider_id,
-                                        &agent.model_id,
-                                        last_input_tokens,
-                                        agent.context_window(),
-                                        &theme,
-                                    );
+                                    let _ = notice(&line_buf, &theme, &msg);
                                 }
                                 Err(e) => {
-                                    let _ = draw_prompt_bar(
-                                        &format!("error: {e}"),
-                                        current_agent.name,
-                                        agent.provider_id,
-                                        &agent.model_id,
-                                        last_input_tokens,
-                                        agent.context_window(),
-                                        &theme,
-                                    );
+                                    let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                                 }
                             },
                             Err(e) if !e.is::<picker::Dismissed>() => {
-                                let _ = draw_prompt_bar(
-                                    &format!("error: {e}"),
-                                    current_agent.name,
-                                    agent.provider_id,
-                                    &agent.model_id,
-                                    last_input_tokens,
-                                    agent.context_window(),
-                                    &theme,
-                                );
+                                let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                             }
                             _ => {}
                         }
                     }
                     Err(e) if !e.is::<picker::Dismissed>() => {
-                        let _ = draw_prompt_bar(
-                            &format!("error: {e}"),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                     }
                     _ => {}
                 }
-                if from_splash {
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -887,32 +790,20 @@ pub async fn run_interactive(
                         {
                             Ok(new_agent) => agent = new_agent,
                             Err(e) => {
-                                let _ = draw_prompt_bar(
-                                    &format!("error reloading agent: {e}"),
-                                    current_agent.name,
-                                    agent.provider_id,
-                                    &agent.model_id,
-                                    last_input_tokens,
-                                    agent.context_window(),
+                                let _ = notice(
+                                    &line_buf,
                                     &theme,
+                                    &format!("error reloading agent: {e}"),
                                 );
                             }
                         }
                     }
                     Err(e) if !e.is::<picker::Dismissed>() => {
-                        let _ = draw_prompt_bar(
-                            &format!("error: {e}"),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                     }
                     _ => {}
                 }
-                if from_splash {
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -925,43 +816,23 @@ pub async fn run_interactive(
                         {
                             Ok(new_agent) => {
                                 agent = new_agent;
-                                let _ = draw_prompt_bar(
-                                    &msg,
-                                    current_agent.name,
-                                    agent.provider_id,
-                                    &agent.model_id,
-                                    last_input_tokens,
-                                    agent.context_window(),
-                                    &theme,
-                                );
+                                let _ = notice(&line_buf, &theme, &msg);
                             }
                             Err(e) => {
-                                let _ = draw_prompt_bar(
-                                    &format!("error reloading provider: {e}"),
-                                    current_agent.name,
-                                    agent.provider_id,
-                                    &agent.model_id,
-                                    last_input_tokens,
-                                    agent.context_window(),
+                                let _ = notice(
+                                    &line_buf,
                                     &theme,
+                                    &format!("error reloading provider: {e}"),
                                 );
                             }
                         }
                     }
                     Err(e) if !e.is::<picker::Dismissed>() => {
-                        let _ = draw_prompt_bar(
-                            &format!("error: {e}"),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                     }
                     _ => {}
                 }
-                if from_splash {
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -974,43 +845,23 @@ pub async fn run_interactive(
                         {
                             Ok(new_agent) => {
                                 agent = new_agent;
-                                let _ = draw_prompt_bar(
-                                    &msg,
-                                    current_agent.name,
-                                    agent.provider_id,
-                                    &agent.model_id,
-                                    last_input_tokens,
-                                    agent.context_window(),
-                                    &theme,
-                                );
+                                let _ = notice(&line_buf, &theme, &msg);
                             }
                             Err(e) => {
-                                let _ = draw_prompt_bar(
-                                    &format!("error reloading provider: {e}"),
-                                    current_agent.name,
-                                    agent.provider_id,
-                                    &agent.model_id,
-                                    last_input_tokens,
-                                    agent.context_window(),
+                                let _ = notice(
+                                    &line_buf,
                                     &theme,
+                                    &format!("error reloading provider: {e}"),
                                 );
                             }
                         }
                     }
                     Err(e) if !e.is::<picker::Dismissed>() => {
-                        let _ = draw_prompt_bar(
-                            &format!("error: {e}"),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                     }
                     _ => {}
                 }
-                if from_splash {
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1023,32 +874,20 @@ pub async fn run_interactive(
                         {
                             Ok(new_agent) => agent = new_agent,
                             Err(e) => {
-                                let _ = draw_prompt_bar(
-                                    &format!("error reloading provider: {e}"),
-                                    current_agent.name,
-                                    agent.provider_id,
-                                    &agent.model_id,
-                                    last_input_tokens,
-                                    agent.context_window(),
+                                let _ = notice(
+                                    &line_buf,
                                     &theme,
+                                    &format!("error reloading provider: {e}"),
                                 );
                             }
                         }
                     }
                     Err(e) if !e.is::<picker::Dismissed>() => {
-                        let _ = draw_prompt_bar(
-                            &format!("error: {e}"),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                     }
                     _ => {}
                 }
-                if from_splash {
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1064,16 +903,8 @@ pub async fn run_interactive(
                         is_splash = true;
                     }
                     Err(e) => {
-                        let _ = draw_prompt_bar(
-                            &format!("error: {e}"),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
-                        if from_splash {
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
+                        if from_splash && !notice_shown() {
                             is_splash = true;
                         }
                     }
@@ -1088,32 +919,20 @@ pub async fn run_interactive(
                         {
                             Ok(new_agent) => agent = new_agent,
                             Err(e) => {
-                                let _ = draw_prompt_bar(
-                                    &format!("error reloading agent: {e}"),
-                                    current_agent.name,
-                                    agent.provider_id,
-                                    &agent.model_id,
-                                    last_input_tokens,
-                                    agent.context_window(),
+                                let _ = notice(
+                                    &line_buf,
                                     &theme,
+                                    &format!("error reloading agent: {e}"),
                                 );
                             }
                         }
                     }
                     Ok(false) => {}
                     Err(e) => {
-                        let _ = draw_prompt_bar(
-                            &format!("error: {e}"),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                     }
                 }
-                if from_splash {
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1125,18 +944,10 @@ pub async fn run_interactive(
                         is_splash = true;
                     }
                     Err(e) if !e.is::<picker::Dismissed>() => {
-                        let _ = draw_prompt_bar(
-                            &format!("error: {e}"),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                     }
                     _ => {
-                        if from_splash {
+                        if from_splash && !notice_shown() {
                             is_splash = true;
                         }
                     }
@@ -1158,8 +969,8 @@ pub async fn run_interactive(
                     lines.push("No MCP servers configured — add one with `io mcp add`.".into());
                 }
                 lines.extend(mcp_cmd::state_lines(&states));
-                print_info_lines(&lines)?;
-                if from_splash {
+                print_info_lines(&line_buf, &theme, &lines)?;
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1183,17 +994,9 @@ pub async fn run_interactive(
                     Err(e) => format!("error: {e}"),
                 };
                 if !msg.is_empty() {
-                    let _ = draw_prompt_bar(
-                        &msg,
-                        current_agent.name,
-                        agent.provider_id,
-                        &agent.model_id,
-                        last_input_tokens,
-                        agent.context_window(),
-                        &theme,
-                    );
+                    let _ = notice(&line_buf, &theme, &msg);
                 }
-                if from_splash {
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1223,17 +1026,9 @@ pub async fn run_interactive(
                     Err(e) => format!("error: {e}"),
                 };
                 if !msg.is_empty() {
-                    let _ = draw_prompt_bar(
-                        &msg,
-                        current_agent.name,
-                        agent.provider_id,
-                        &agent.model_id,
-                        last_input_tokens,
-                        agent.context_window(),
-                        &theme,
-                    );
+                    let _ = notice(&line_buf, &theme, &msg);
                 }
-                if from_splash && is_splash {
+                if from_splash && is_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1247,16 +1042,8 @@ pub async fn run_interactive(
                     Ok(()) => format!("Exported to {}", path.display()),
                     Err(e) => format!("error: {}: {e}", path.display()),
                 };
-                let _ = draw_prompt_bar(
-                    &msg,
-                    current_agent.name,
-                    agent.provider_id,
-                    &agent.model_id,
-                    last_input_tokens,
-                    agent.context_window(),
-                    &theme,
-                );
-                if from_splash {
+                let _ = notice(&line_buf, &theme, &msg);
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1271,16 +1058,8 @@ pub async fn run_interactive(
                         Err(e) => format!("error: {e}"),
                     }
                 };
-                let _ = draw_prompt_bar(
-                    &msg,
-                    current_agent.name,
-                    agent.provider_id,
-                    &agent.model_id,
-                    last_input_tokens,
-                    agent.context_window(),
-                    &theme,
-                );
-                if from_splash {
+                let _ = notice(&line_buf, &theme, &msg);
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1303,16 +1082,8 @@ pub async fn run_interactive(
                     }
                     Err(e) => format!("error: {e}"),
                 };
-                let _ = draw_prompt_bar(
-                    &msg,
-                    current_agent.name,
-                    agent.provider_id,
-                    &agent.model_id,
-                    last_input_tokens,
-                    agent.context_window(),
-                    &theme,
-                );
-                if from_splash {
+                let _ = notice(&line_buf, &theme, &msg);
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1342,25 +1113,17 @@ pub async fn run_interactive(
                     "/terminal-setup" => info_cmd::terminal_setup_lines(),
                     _ => doctor::render(&doctor::run_checks(&root)),
                 };
-                print_info_lines(&lines)?;
-                if from_splash {
+                print_info_lines(&line_buf, &theme, &lines)?;
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
             }
             "/usage" => {
                 if let Err(e) = show_cost_summary(&agent).await {
-                    let _ = draw_prompt_bar(
-                        &format!("error: {e}"),
-                        current_agent.name,
-                        agent.provider_id,
-                        &agent.model_id,
-                        last_input_tokens,
-                        agent.context_window(),
-                        &theme,
-                    );
+                    let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                 }
-                if from_splash {
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1379,16 +1142,8 @@ pub async fn run_interactive(
                     }
                     Err(e) => format!("error: {e}"),
                 };
-                let _ = draw_prompt_bar(
-                    &msg,
-                    current_agent.name,
-                    agent.provider_id,
-                    &agent.model_id,
-                    last_input_tokens,
-                    agent.context_window(),
-                    &theme,
-                );
-                if from_splash {
+                let _ = notice(&line_buf, &theme, &msg);
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1412,16 +1167,8 @@ pub async fn run_interactive(
                         Err(e) => format!("error: {e}"),
                     }
                 };
-                let _ = draw_prompt_bar(
-                    &msg,
-                    current_agent.name,
-                    agent.provider_id,
-                    &agent.model_id,
-                    last_input_tokens,
-                    agent.context_window(),
-                    &theme,
-                );
-                if from_splash {
+                let _ = notice(&line_buf, &theme, &msg);
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1443,16 +1190,8 @@ pub async fn run_interactive(
                     Err(_) if on => "Vim mode on (could not save the setting)",
                     Err(_) => "Vim mode off (could not save the setting)",
                 };
-                let _ = draw_prompt_bar(
-                    msg,
-                    current_agent.name,
-                    agent.provider_id,
-                    &agent.model_id,
-                    last_input_tokens,
-                    agent.context_window(),
-                    &theme,
-                );
-                if from_splash {
+                let _ = notice(&line_buf, &theme, msg);
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1466,7 +1205,7 @@ pub async fn run_interactive(
                     crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
                 );
                 let _ = render_scroll_view(&line_buf.lock().unwrap(), 0, &theme, PROMPT_BAR_HEIGHT);
-                if from_splash {
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1480,41 +1219,23 @@ pub async fn run_interactive(
                         {
                             Ok(new_agent) => agent = new_agent,
                             Err(e) => {
-                                let _ = draw_prompt_bar(
-                                    &format!("error reloading agent: {e}"),
-                                    current_agent.name,
-                                    agent.provider_id,
-                                    &agent.model_id,
-                                    last_input_tokens,
-                                    agent.context_window(),
+                                let _ = notice(
+                                    &line_buf,
                                     &theme,
+                                    &format!("error reloading agent: {e}"),
                                 );
                             }
                         }
-                        let _ = draw_prompt_bar(
-                            &msg,
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &msg);
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        let _ = draw_prompt_bar(
-                            &format!("error: {e}"),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                     }
                 }
-                is_splash = true;
+                // The editor used the whole screen: repaint, unless there is
+                // a message to keep on screen.
+                is_splash = !notice_shown();
                 continue;
             }
             _ if memory_cmd::is_quick_add(&input) => {
@@ -1526,30 +1247,14 @@ pub async fn run_interactive(
                         {
                             agent = new_agent;
                         }
-                        let _ = draw_prompt_bar(
-                            &msg,
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &msg);
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        let _ = draw_prompt_bar(
-                            &format!("error: {e}"),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                     }
                 }
-                if from_splash {
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1569,8 +1274,8 @@ pub async fn run_interactive(
                 {
                     agent = new_agent;
                 }
-                print_info_lines(&lines)?;
-                if from_splash {
+                print_info_lines(&line_buf, &theme, &lines)?;
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1588,16 +1293,8 @@ pub async fn run_interactive(
                     }
                     _ => "Plan mode off.",
                 };
-                let _ = draw_prompt_bar(
-                    msg,
-                    current_agent.name,
-                    agent.provider_id,
-                    &agent.model_id,
-                    last_input_tokens,
-                    agent.context_window(),
-                    &theme,
-                );
-                if from_splash {
+                let _ = notice(&line_buf, &theme, msg);
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1607,16 +1304,8 @@ pub async fn run_interactive(
                     Ok(msg) => msg,
                     Err(e) => format!("error: {e}"),
                 };
-                let _ = draw_prompt_bar(
-                    &msg,
-                    current_agent.name,
-                    agent.provider_id,
-                    &agent.model_id,
-                    last_input_tokens,
-                    agent.context_window(),
-                    &theme,
-                );
-                if from_splash {
+                let _ = notice(&line_buf, &theme, &msg);
+                if from_splash && !notice_shown() {
                     is_splash = true;
                 }
                 continue;
@@ -1859,15 +1548,7 @@ pub async fn run_interactive(
             result = agent.run_turn_streaming_with_images(&prompt, images, token_tx) => {
                 if let Err(e) = result {
                     if !e.is::<io_runtime::Cancelled>() {
-                        let _ = draw_prompt_bar(
-                            &format!("error: {e}"),
-                            current_agent.name,
-                            agent.provider_id,
-                            &agent.model_id,
-                            last_input_tokens,
-                            agent.context_window(),
-                            &theme,
-                        );
+                        let _ = notice(&line_buf, &theme, &format!("error: {e}"));
                     }
                 }
             }
@@ -1996,26 +1677,57 @@ async fn status_report(
     })
 }
 
-/// Show `lines` as a block just above the prompt bar (used by /help, /mcp).
-fn print_info_lines<S: AsRef<str>>(lines: &[S]) -> anyhow::Result<()> {
-    use crossterm::{cursor, execute, style::Print, terminal};
-    clear_rows_above(0)?;
-    let (w, h) = terminal::size()?;
-    let start_row = h.saturating_sub(PROMPT_BAR_HEIGHT + 1 + lines.len() as u16);
-    for (i, line) in lines.iter().enumerate() {
-        let line: String = line
-            .as_ref()
-            .chars()
-            .take(w.saturating_sub(1) as usize)
-            .collect();
-        execute!(
-            std::io::stdout(),
-            cursor::MoveTo(0, start_row + i as u16),
-            terminal::Clear(terminal::ClearType::CurrentLine),
-            Print(line),
-        )?;
+/// Set once a command has put text on screen this iteration. A command run
+/// from the splash screen then stays in the full view; otherwise the splash
+/// would repaint over its output.
+static NOTICE_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn notice_shown() -> bool {
+    NOTICE_SHOWN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Report the outcome of a command (one message, possibly several lines).
+fn notice(line_buf: &LineBuf, theme: &io_tui::render::Theme, msg: &str) -> anyhow::Result<()> {
+    let lines: Vec<&str> = msg.lines().collect();
+    print_info_lines(line_buf, theme, &lines)
+}
+
+/// Scrollback lines for an info block: control characters dropped, each line
+/// cut to the terminal width, a blank line after. `\x01` marks a pre-rendered
+/// line (no muted colour, no width cut by the renderer).
+fn info_block<S: AsRef<str>>(lines: &[S], width: usize) -> Vec<String> {
+    let mut out: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            let text: String = line
+                .as_ref()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(width.saturating_sub(1))
+                .collect();
+            format!("\x01{text}")
+        })
+        .collect();
+    out.push(String::new());
+    out
+}
+
+/// Add `lines` to the scrollback and show them (used by /help, /status,
+/// command results, …). They go through `line_buf` like model output: text
+/// drawn straight onto the rows above the prompt bar is erased by the bar's
+/// next redraw, which clears everything below `MAX_INPUT_LINES + 2` rows from
+/// the bottom.
+fn print_info_lines<S: AsRef<str>>(
+    line_buf: &LineBuf,
+    theme: &io_tui::render::Theme,
+    lines: &[S],
+) -> anyhow::Result<()> {
+    NOTICE_SHOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+    let (w, _) = crossterm::terminal::size()?;
+    for line in info_block(lines, w as usize) {
+        push_line(line_buf, line);
     }
-    std::io::stdout().flush()?;
+    render_scroll_view(&line_buf.lock().unwrap(), 0, theme, PROMPT_BAR_HEIGHT)?;
     Ok(())
 }
 
@@ -2070,6 +1782,25 @@ mod tests {
             detail: detail.to_string(),
             respond,
         }
+    }
+
+    #[test]
+    fn info_blocks_are_prerendered_width_capped_and_followed_by_a_blank_line() {
+        let block = info_block(&["  Session: abc", "a\u{1b}[31mred\tb", "0123456789"], 6);
+        assert_eq!(block, vec!["\u{1}  Ses", "\u{1}a[31m", "\u{1}01234", ""]);
+    }
+
+    #[test]
+    fn notice_splits_multi_line_messages() {
+        let buf: LineBuf = Default::default();
+        let theme = io_tui::render::get_theme("default");
+        // Without a terminal the render step fails, but the lines are already
+        // in the scrollback by then.
+        let _ = notice(&buf, &theme, "one\ntwo");
+        let lines: Vec<String> = buf.lock().unwrap().iter().cloned().collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[0].ends_with("one") && lines[1].ends_with("two"));
+        assert!(notice_shown());
     }
 
     #[test]
