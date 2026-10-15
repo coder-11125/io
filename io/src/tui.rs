@@ -1802,7 +1802,7 @@ fn print_info_lines<S: AsRef<str>>(
     lines: &[S],
 ) -> anyhow::Result<()> {
     NOTICE_SHOWN.store(true, std::sync::atomic::Ordering::Relaxed);
-    let (w, _) = crossterm::terminal::size()?;
+    let w = crossterm::terminal::size().map_or(80, |(w, _)| w);
     for line in info_block(lines, w as usize) {
         push_line(line_buf, line);
     }

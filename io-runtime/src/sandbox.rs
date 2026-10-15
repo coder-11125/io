@@ -605,11 +605,41 @@ impl PermissionChecker {
                 .unwrap_or_else(|_| p.to_path_buf())
         };
         let abs = normalize_path(&abs);
-        abs.starts_with(root) || self.extra_roots.iter().any(|r| abs.starts_with(r))
+        if abs.starts_with(root) {
+            return true;
+        }
+        if self.extra_roots.is_empty() {
+            return false;
+        }
+        // Extra roots are stored with symlinks resolved (`/tmp` is
+        // `/private/tmp` on macOS), so compare where the path really lives too.
+        let real = resolve_existing_prefix(&abs);
+        self.extra_roots
+            .iter()
+            .any(|r| abs.starts_with(r) || real.starts_with(r))
     }
 
     pub fn mode(&self) -> PermissionLevel {
         self.mode
+    }
+}
+
+/// `path` with symlinks resolved as far as it exists: the longest existing
+/// ancestor is canonicalized and the not-yet-existing tail is appended as is.
+fn resolve_existing_prefix(path: &std::path::Path) -> std::path::PathBuf {
+    let mut tail = Vec::new();
+    let mut cur = path;
+    loop {
+        if let Ok(real) = std::fs::canonicalize(cur) {
+            return tail.iter().rev().fold(real, |acc, part| acc.join(part));
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_owned());
+                cur = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
     }
 }
 
