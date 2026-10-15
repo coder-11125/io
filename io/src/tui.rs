@@ -8,7 +8,10 @@ use crate::input::{
 use crate::stream::{
     blink_and_print, push_line, LineBuf, PendingPerm, PendingPermission, SCROLL_STEP,
 };
-use crate::{agent, connect, login, mcp_cmd, model, status};
+use crate::{
+    agent, connect, doctor, info_cmd, login, mcp_cmd, memory_cmd, model, permissions, status,
+    statusline, style_cmd,
+};
 use io_runtime::types::SessionId;
 use io_runtime::PermissionReply;
 use io_tui::picker;
@@ -20,7 +23,7 @@ use std::io::Write;
 
 // ── Session choice ─────────────────────────────────────────────────────────────
 
-enum SessionChoice {
+pub(crate) enum SessionChoice {
     New,
     Continue,
     Existing(SessionId),
@@ -109,13 +112,28 @@ fn apply_model_spec(config: &mut io_runtime::config::Config, spec: &str) {
 /// "`session_start` hooks already fired" for the current session, shared by
 /// every agent built for it: `/model`, `/agent` and friends rebuild the agent
 /// but must not re-announce the session. `/new` resets it.
+/// Read `settings.json` once at startup: report anything unusable and start in
+/// `permissions.defaultMode`.
+pub(crate) fn apply_startup_settings(root: &std::path::Path) -> Vec<String> {
+    let settings = io_runtime::settings::Settings::load(root);
+    status::set_vim_enabled(settings.editor_mode.as_deref() == Some("vim"));
+    if let (Some(mode), false) = (settings.default_mode, crate::run_opts::get().explicit_mode) {
+        status::set_initial_mode(mode);
+    }
+    settings
+        .problems
+        .iter()
+        .map(|p| format!("settings: {p}"))
+        .collect()
+}
+
 fn session_gate() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
     static GATE: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
         std::sync::OnceLock::new();
     GATE.get_or_init(Default::default).clone()
 }
 
-async fn build_agent(
+pub(crate) async fn build_agent(
     session: SessionChoice,
     agent_config: &io_agents::AgentConfig,
     model_override: Option<&str>,
@@ -123,6 +141,10 @@ async fn build_agent(
     let mut config = io_runtime::config::Config::load()?;
     if let Some(spec) = model_override {
         apply_model_spec(&mut config, spec);
+    }
+    let run_opts = crate::run_opts::get();
+    if run_opts.bypass_permissions {
+        config.permissions.default = "allow".to_string();
     }
     let keys = io_runtime::config::KeyStore::load();
     let model_id = config.provider.active_model();
@@ -132,14 +154,27 @@ async fn build_agent(
     let provider = io_runtime::provider::create_provider(&config, &keys)?;
     let memory = io_runtime::memory::SessionStore::new()?;
     let project_root = detect_project_root();
-    let project_context = io_runtime::load_project_context(&project_root);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| project_root.clone());
+    let (project_context, memory_files) = io_runtime::instructions::load(&project_root, &cwd);
     // Hooks come from the global config only (see `io_runtime::hooks`) and
     // run in the project root.
     let hooks = io_runtime::Hooks::new(config.hooks.clone(), project_root.clone())
         .with_session_gate(session_gate());
-    let mut checker = io_runtime::sandbox::PermissionChecker::from(&config.permissions)
-        .with_project_root(project_root)
-        .with_interaction_mode(status::current_mode());
+    let settings = io_runtime::settings::Settings::load(&project_root);
+    let sandbox = settings.sandbox.enabled.then(|| {
+        io_runtime::os_sandbox::SandboxPolicy::new(
+            project_root.clone(),
+            settings.sandbox.network,
+            settings.sandbox.writable_paths.clone(),
+        )
+    });
+    let mut checker = permissions::apply(
+        io_runtime::sandbox::PermissionChecker::from(&config.permissions)
+            .with_project_root(project_root.clone())
+            .with_interaction_mode(status::current_mode()),
+        &settings,
+        &project_root,
+    );
     if agent_config.auto_allow_writes {
         checker = checker.with_allowed_tools(io_runtime::sandbox::FILE_WRITE_TOOLS);
     }
@@ -167,8 +202,14 @@ async fn build_agent(
         permissions.clone(),
         project_context.clone(),
     )
-    .with_hooks(&hooks);
+    .with_hooks(&hooks)
+    .with_sandbox(sandbox.clone());
     tools.register(Box::new(spawn_tool));
+    if let Some(policy) = sandbox {
+        tools.register(Box::new(
+            io_runtime::tools::BashTool::new().with_sandbox(policy),
+        ));
+    }
     let mcp = mcp_cmd::manager();
     for tool in mcp.tools() {
         tools.register(tool);
@@ -182,7 +223,19 @@ async fn build_agent(
         tools,
         memory,
         permissions,
-        agent_config.full_system_prompt(),
+        format!(
+            "{}{}{}",
+            agent_config.full_system_prompt(),
+            run_opts
+                .append_system_prompt
+                .as_deref()
+                .map(|extra| format!("\n\n{extra}"))
+                .unwrap_or_default(),
+            io_runtime::output_style::prompt_for(
+                settings.output_style.as_deref(),
+                &io_runtime::output_style::discover(&project_root, dirs::home_dir().as_deref()),
+            )
+        ),
         project_context,
         session_id,
         model_id,
@@ -191,6 +244,11 @@ async fn build_agent(
         pricing_override,
     )
     .with_hooks(hooks)
+    .with_max_iterations(run_opts.max_turns.unwrap_or(0))
+    .with_nested_memory(
+        project_root,
+        io_runtime::instructions::loaded_set(&memory_files),
+    )
     .with_thinking(config.thinking.clone()))
 }
 
@@ -317,6 +375,9 @@ pub async fn run_single_shot(prompt: &str, model_override: Option<&str>) -> anyh
         );
     }
 
+    for note in apply_startup_settings(&detect_project_root()) {
+        eprintln!("{note}");
+    }
     for note in mcp_cmd::start(false, &detect_project_root()).await {
         eprintln!("{note}");
     }
@@ -332,9 +393,28 @@ pub async fn run_single_shot(prompt: &str, model_override: Option<&str>) -> anyh
 
 // ── Interactive REPL ───────────────────────────────────────────────────────────
 
+/// Show the tail of a resumed conversation in the scrollback.
+fn show_replay(
+    turns: &[io_runtime::types::Turn],
+    line_buf: &LineBuf,
+    theme: &io_tui::render::Theme,
+) -> anyhow::Result<()> {
+    line_buf.lock().unwrap().clear();
+    for line in crate::session_cmd::replay_lines(turns, 6) {
+        push_line(line_buf, line);
+    }
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+    )?;
+    render_scroll_view(&line_buf.lock().unwrap(), 0, theme, PROMPT_BAR_HEIGHT)?;
+    Ok(())
+}
+
 pub async fn run_interactive(
     new_session: bool,
     continue_session: bool,
+    resume: Option<&str>,
     model: Option<&str>,
 ) -> anyhow::Result<()> {
     let mut config = io_runtime::config::Config::load()?;
@@ -365,24 +445,65 @@ pub async fn run_interactive(
     }
 
     // Before the TUI takes the screen: project servers may need a y/n.
+    for note in apply_startup_settings(&detect_project_root()) {
+        println!("{note}");
+    }
     for note in mcp_cmd::start(true, &detect_project_root()).await {
         println!("{note}");
     }
 
     let mut current_agent = io_agents::builtin::by_id("build").expect("build agent must exist");
-    let startup_session = if continue_session && !new_session {
+    let startup_session = if let Some(id) = resume {
+        SessionChoice::Existing(crate::session_cmd::resolve_id(
+            &io_runtime::memory::SessionStore::new()?,
+            id,
+        )?)
+    } else if continue_session && !new_session {
         SessionChoice::Continue
     } else {
         SessionChoice::New
     };
+    let resuming = resume.is_some() || (continue_session && !new_session);
     let mut agent = build_agent(startup_session, &current_agent, model).await?;
 
     enter_tui()?;
 
     let mut last_input_tokens: u32 = 0;
     let mut is_splash = true;
+    let mut history = crate::history::History::load();
+    // Messages typed while the model was busy, in the order they were sent.
+    let mut pending_inputs: std::collections::VecDeque<String> = Default::default();
+    // Text carried from the splash box into the full prompt (Alt+Enter).
+    let mut seed = String::new();
+    if resuming {
+        let turns = agent.session_turns().await;
+        if !turns.is_empty() {
+            show_replay(&turns, &line_buf, &theme)?;
+            is_splash = false;
+        }
+    }
 
     loop {
+        {
+            let root = detect_project_root();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| root.clone());
+            let session_id = agent.session_id().await.to_string();
+            statusline::refresh(
+                &root,
+                &statusline::Snapshot {
+                    session_id: &session_id,
+                    agent: current_agent.id,
+                    provider: agent.provider_id,
+                    model: &agent.model_id,
+                    mode: agent.interaction_mode().label(),
+                    cwd: &cwd,
+                    project_dir: &root,
+                    context_tokens: last_input_tokens,
+                    context_window: agent.context_window(),
+                },
+            )
+            .await;
+        }
         let full_agents = io_agents::builtin::full_agents();
         let mut tab_current = full_agents
             .iter()
@@ -390,7 +511,9 @@ pub async fn run_interactive(
             .unwrap_or(0);
 
         let from_splash = is_splash;
-        let input = if is_splash {
+        let input = if let Some(next) = pending_inputs.pop_front() {
+            next
+        } else if is_splash {
             match splash_read_line(&full_agents, &mut tab_current, &agent, &theme) {
                 Ok(Some(s)) => {
                     is_splash = false;
@@ -398,6 +521,11 @@ pub async fn run_interactive(
                         std::io::stdout(),
                         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
                     )?;
+                    if let Some(typed) = s.strip_prefix(crate::input::CONTINUE_MARKER) {
+                        // Alt+Enter on the splash: keep typing in the full prompt.
+                        seed = typed.to_string();
+                        continue;
+                    }
                     s
                 }
                 Ok(None) => break,
@@ -416,6 +544,8 @@ pub async fn run_interactive(
                 current_agent.id,
                 &theme,
                 &line_buf,
+                &history,
+                &std::mem::take(&mut seed),
             ) {
                 Ok(Some(s)) => s,
                 Ok(None) => break,
@@ -465,6 +595,7 @@ pub async fn run_interactive(
         if input.is_empty() {
             continue;
         }
+        history.push(&input);
 
         match input.as_str() {
             "/exit" | "/quit" | "/q" => break,
@@ -473,7 +604,11 @@ pub async fn run_interactive(
                     "Commands:",
                     "  /exit, /quit   Exit",
                     "  /help          Show this help",
-                    "  /new           Start a new session",
+                    "  /new, /clear   Start a new session",
+                    "  /resume        Go back to an earlier session",
+                    "  /rename <n>    Name this session",
+                    "  /fork          Branch this session into a copy",
+                    "  /export [f]    Write this session to a Markdown file",
                     "  /agent         Switch agent mode",
                     "  /connect       Set up a provider interactively",
                     "  /login         Sign in with OAuth (ChatGPT / Claude)",
@@ -483,6 +618,29 @@ pub async fn run_interactive(
                     "  /cost          Show API cost summary for current session",
                     "  /context       Fetch real context window, pricing, and tool support",
                     "  /compact       Summarize and compress conversation history",
+                    "  /output-style  Change how the agent talks (concise, explanatory, …)",
+                    "  /status        Version, model, mode, settings, rules, memory, MCP",
+                    "  /context       Where the context window is going (/context refresh: re-fetch limits)",
+                    "  /todos         The model's current task list",
+                    "  /hooks         Configured hooks",
+                    "  /agents        Available agents and sub-agents",
+                    "  /doctor        Check the installation and environment",
+                    "  /add-dir <d>   Let file tools reach another directory this session",
+                    "  /logout [p]    Sign out of an OAuth login",
+                    "  /usage         API usage and cost (same as /cost)",
+                    "  /terminal-setup  Multi-line input and image paste setup",
+                    "  /bug           How to report a problem",
+                    "  /review [t]    Review uncommitted changes, a PR number or a branch",
+                    "  /commit [note] Commit the current changes in this repo's style",
+                    "  /pr [note]     Open a pull request for this branch",
+                    "  /vim           Toggle Vim-style editing in the prompt",
+                    "  Ctrl+R         Search earlier prompts · Up/Down browse them",
+                    "  Alt+Enter      New line (also Shift+Enter, Ctrl+J, or end a line with \\)",
+                    "  Ctrl+O         Show the full transcript with tool calls",
+                    "  /init          Have the agent write a CLAUDE.md for this project",
+                    "  /memory        Open a memory file (CLAUDE.md) in your editor",
+                    "  #<note>        Save a note to memory (a '#', a space, then the note)",
+                    "  /permissions   Show or edit allow/ask/deny rules",
                     "  /mcp           List MCP servers (/mcp reconnect restarts them)",
                     "  /rewind        Restore files to an earlier point in the chat (or Esc Esc)",
                     "  /plan          Enter or leave plan mode (read-only research, then approve a plan)",
@@ -513,7 +671,7 @@ pub async fn run_interactive(
                 }
                 continue;
             }
-            "/context" => {
+            "/context refresh" => {
                 match model::refresh_context_window().await {
                     Ok(msg) => {
                         let sid = agent.session_id().await;
@@ -895,7 +1053,7 @@ pub async fn run_interactive(
                 }
                 continue;
             }
-            "/new" => {
+            "/new" | "/clear" => {
                 agent.end_session("new").await;
                 session_gate().store(false, std::sync::atomic::Ordering::SeqCst);
                 match build_agent(SessionChoice::New, &current_agent, None).await {
@@ -1006,6 +1164,417 @@ pub async fn run_interactive(
                 }
                 continue;
             }
+            _ if input == "/output-style" || input.starts_with("/output-style ") => {
+                let result =
+                    style_cmd::run(&input["/output-style".len()..], &detect_project_root());
+                let msg = match result {
+                    Ok(Some(msg)) => {
+                        let sid = agent.session_id().await;
+                        match build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                        {
+                            Ok(new_agent) => {
+                                agent = new_agent;
+                                msg
+                            }
+                            Err(e) => format!("error reloading agent: {e}"),
+                        }
+                    }
+                    Ok(None) => String::new(),
+                    Err(e) => format!("error: {e}"),
+                };
+                if !msg.is_empty() {
+                    let _ = draw_prompt_bar(
+                        &msg,
+                        current_agent.name,
+                        agent.provider_id,
+                        &agent.model_id,
+                        last_input_tokens,
+                        agent.context_window(),
+                        &theme,
+                    );
+                }
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            "/resume" => {
+                let current = agent.session_id().await;
+                let picked = io_runtime::memory::SessionStore::new()
+                    .and_then(|store| crate::session_cmd::pick_session(&store, current));
+                let msg = match picked {
+                    Ok(Some(id)) => {
+                        agent.end_session("resume").await;
+                        session_gate().store(false, std::sync::atomic::Ordering::SeqCst);
+                        match build_agent(SessionChoice::Existing(id), &current_agent, None).await {
+                            Ok(new_agent) => {
+                                agent = new_agent;
+                                last_input_tokens = 0;
+                                let turns = agent.session_turns().await;
+                                show_replay(&turns, &line_buf, &theme)?;
+                                is_splash = false;
+                                format!("Resumed session {}", crate::session_cmd::short_id(id))
+                            }
+                            Err(e) => format!("error: {e}"),
+                        }
+                    }
+                    Ok(None) => "No other sessions to resume.".to_string(),
+                    Err(e) if e.is::<picker::Dismissed>() => String::new(),
+                    Err(e) => format!("error: {e}"),
+                };
+                if !msg.is_empty() {
+                    let _ = draw_prompt_bar(
+                        &msg,
+                        current_agent.name,
+                        agent.provider_id,
+                        &agent.model_id,
+                        last_input_tokens,
+                        agent.context_window(),
+                        &theme,
+                    );
+                }
+                if from_splash && is_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            _ if input == "/export" || input.starts_with("/export ") => {
+                let session = agent.session_snapshot().await;
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let path =
+                    crate::session_cmd::export_path(&input["/export".len()..], &session, &cwd);
+                let msg = match std::fs::write(&path, io_runtime::export::to_markdown(&session)) {
+                    Ok(()) => format!("Exported to {}", path.display()),
+                    Err(e) => format!("error: {}: {e}", path.display()),
+                };
+                let _ = draw_prompt_bar(
+                    &msg,
+                    current_agent.name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    last_input_tokens,
+                    agent.context_window(),
+                    &theme,
+                );
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            _ if input == "/rename" || input.starts_with("/rename ") => {
+                let name = input["/rename".len()..].trim().to_string();
+                let msg = if name.is_empty() {
+                    "usage: /rename <name>".to_string()
+                } else {
+                    match agent.rename_session(&name).await {
+                        Ok(()) => format!("Session renamed to \"{name}\""),
+                        Err(e) => format!("error: {e}"),
+                    }
+                };
+                let _ = draw_prompt_bar(
+                    &msg,
+                    current_agent.name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    last_input_tokens,
+                    agent.context_window(),
+                    &theme,
+                );
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            "/fork" => {
+                let original = agent.session_id().await;
+                let msg = match agent.fork_session().await {
+                    Ok(id) => {
+                        match build_agent(SessionChoice::Existing(id), &current_agent, None).await {
+                            Ok(new_agent) => {
+                                agent = new_agent;
+                                format!(
+                                    "Forked: now on {} (the original is {})",
+                                    crate::session_cmd::short_id(id),
+                                    crate::session_cmd::short_id(original)
+                                )
+                            }
+                            Err(e) => format!("error: {e}"),
+                        }
+                    }
+                    Err(e) => format!("error: {e}"),
+                };
+                let _ = draw_prompt_bar(
+                    &msg,
+                    current_agent.name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    last_input_tokens,
+                    agent.context_window(),
+                    &theme,
+                );
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            "/status" | "/context" | "/hooks" | "/agents" | "/todos" | "/bug"
+            | "/terminal-setup" | "/doctor" => {
+                let root = detect_project_root();
+                let lines = match input.as_str() {
+                    "/status" => status_report(&agent, &current_agent, &root).await,
+                    "/context" => info_cmd::context_lines(
+                        &agent.context_breakdown().await,
+                        agent.context_window(),
+                        last_input_tokens,
+                    ),
+                    "/hooks" => info_cmd::hooks_lines(
+                        &io_runtime::config::Config::load()
+                            .map(|c| c.hooks)
+                            .unwrap_or_default(),
+                    ),
+                    "/agents" => info_cmd::agents_lines(current_agent.id),
+                    "/todos" => info_cmd::todos_lines(&agent.session_turns().await),
+                    "/bug" => info_cmd::bug_lines(
+                        env!("CARGO_PKG_VERSION"),
+                        agent.provider_id,
+                        &agent.model_id,
+                    ),
+                    "/terminal-setup" => info_cmd::terminal_setup_lines(),
+                    _ => doctor::render(&doctor::run_checks(&root)),
+                };
+                print_info_lines(&lines)?;
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            "/usage" => {
+                if let Err(e) = show_cost_summary(&agent).await {
+                    let _ = draw_prompt_bar(
+                        &format!("error: {e}"),
+                        current_agent.name,
+                        agent.provider_id,
+                        &agent.model_id,
+                        last_input_tokens,
+                        agent.context_window(),
+                        &theme,
+                    );
+                }
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            _ if input == "/logout" || input.starts_with("/logout ") => {
+                let arg = input["/logout".len()..].trim();
+                let msg = match login::logout((!arg.is_empty()).then_some(arg)) {
+                    Ok(msg) => {
+                        let sid = agent.session_id().await;
+                        if let Ok(new_agent) =
+                            build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                        {
+                            agent = new_agent;
+                        }
+                        msg
+                    }
+                    Err(e) => format!("error: {e}"),
+                };
+                let _ = draw_prompt_bar(
+                    &msg,
+                    current_agent.name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    last_input_tokens,
+                    agent.context_window(),
+                    &theme,
+                );
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            _ if input == "/add-dir" || input.starts_with("/add-dir ") => {
+                let arg = input["/add-dir".len()..].trim();
+                let msg = if arg.is_empty() {
+                    "usage: /add-dir <directory>".to_string()
+                } else {
+                    match permissions::add_dir(std::path::Path::new(arg)) {
+                        Ok(dir) => {
+                            let sid = agent.session_id().await;
+                            if let Ok(new_agent) =
+                                build_agent(SessionChoice::Existing(sid), &current_agent, None)
+                                    .await
+                            {
+                                agent = new_agent;
+                            }
+                            format!("Added {} for this session", dir.display())
+                        }
+                        Err(e) => format!("error: {e}"),
+                    }
+                };
+                let _ = draw_prompt_bar(
+                    &msg,
+                    current_agent.name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    last_input_tokens,
+                    agent.context_window(),
+                    &theme,
+                );
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            "/vim" => {
+                let on = !status::vim_enabled();
+                status::set_vim_enabled(on);
+                status::set_vim_label(&agent, None);
+                let paths =
+                    io_runtime::settings::SettingsPaths::for_project(&detect_project_root());
+                let saved = io_runtime::settings::set_value(
+                    &paths.user,
+                    "editorMode",
+                    serde_json::json!(if on { "vim" } else { "normal" }),
+                );
+                let msg = match saved {
+                    Ok(()) if on => "Vim mode on — Esc for Normal mode, i to insert",
+                    Ok(()) => "Vim mode off",
+                    Err(_) if on => "Vim mode on (could not save the setting)",
+                    Err(_) => "Vim mode off (could not save the setting)",
+                };
+                let _ = draw_prompt_bar(
+                    msg,
+                    current_agent.name,
+                    agent.provider_id,
+                    &agent.model_id,
+                    last_input_tokens,
+                    agent.context_window(),
+                    &theme,
+                );
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            "/transcript" => {
+                let lines = crate::session_cmd::transcript_lines(&agent.session_turns().await);
+                let _ = io_tui::pager::show(&lines, "transcript");
+                // The pager used the whole screen: bring the REPL back.
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+                );
+                let _ = render_scroll_view(&line_buf.lock().unwrap(), 0, &theme, PROMPT_BAR_HEIGHT);
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            "/memory" => {
+                match memory_cmd::edit_menu(&detect_project_root()) {
+                    Ok(Some(msg)) => {
+                        // Rebuild so edits to memory files take effect now.
+                        let sid = agent.session_id().await;
+                        match build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                        {
+                            Ok(new_agent) => agent = new_agent,
+                            Err(e) => {
+                                let _ = draw_prompt_bar(
+                                    &format!("error reloading agent: {e}"),
+                                    current_agent.name,
+                                    agent.provider_id,
+                                    &agent.model_id,
+                                    last_input_tokens,
+                                    agent.context_window(),
+                                    &theme,
+                                );
+                            }
+                        }
+                        let _ = draw_prompt_bar(
+                            &msg,
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = draw_prompt_bar(
+                            &format!("error: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
+                }
+                is_splash = true;
+                continue;
+            }
+            _ if memory_cmd::is_quick_add(&input) => {
+                match memory_cmd::quick_add(&input, &detect_project_root()) {
+                    Ok(Some(msg)) => {
+                        let sid = agent.session_id().await;
+                        if let Ok(new_agent) =
+                            build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                        {
+                            agent = new_agent;
+                        }
+                        let _ = draw_prompt_bar(
+                            &msg,
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = draw_prompt_bar(
+                            &format!("error: {e}"),
+                            current_agent.name,
+                            agent.provider_id,
+                            &agent.model_id,
+                            last_input_tokens,
+                            agent.context_window(),
+                            &theme,
+                        );
+                    }
+                }
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
+            _ if input == "/permissions" || input.starts_with("/permissions ") => {
+                let root = detect_project_root();
+                let paths = io_runtime::settings::SettingsPaths::for_project(&root);
+                let lines =
+                    match permissions::command(&input["/permissions".len()..], &paths, &root) {
+                        Ok(lines) => lines,
+                        Err(e) => vec![format!("error: {e}")],
+                    };
+                // Rebuild so new rules take effect now.
+                let sid = agent.session_id().await;
+                if let Ok(new_agent) =
+                    build_agent(SessionChoice::Existing(sid), &current_agent, None).await
+                {
+                    agent = new_agent;
+                }
+                print_info_lines(&lines)?;
+                if from_splash {
+                    is_splash = true;
+                }
+                continue;
+            }
             "/plan" => {
                 let target = if agent.interaction_mode() == io_runtime::InteractionMode::Plan {
                     io_runtime::InteractionMode::Default
@@ -1102,7 +1671,12 @@ pub async fn run_interactive(
             _ => {}
         }
 
-        let (prompt, images) = resolve_at_mentions_with_images(&input);
+        let (mut prompt, images) = resolve_at_mentions_with_images(&input);
+        if input == "/init" {
+            prompt = io_runtime::instructions::INIT_PROMPT.to_string();
+        } else if let Some(expanded) = crate::git_prompts::expand(&input) {
+            prompt = expanded;
+        }
         let image_count = images.len();
         let cancel_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         agent.set_cancel(cancel_flag.clone());
@@ -1152,8 +1726,44 @@ pub async fn run_interactive(
         let stream_scroll = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let stream_scroll2 = stream_scroll.clone();
         let line_buf_scroll = line_buf.clone();
+        // Ctrl+B moves a running `bash` command to the background; anything
+        // typed while the model works is queued and sent when it finishes.
+        let background = agent.background_handle();
+        let bar_agent = current_agent.name;
+        let bar_provider = agent.provider_id;
+        let bar_model = agent.model_id.clone();
+        let bar_tokens = last_input_tokens;
+        let bar_window = agent.context_window();
         let key_listener = tokio::task::spawn_blocking(move || {
             use crossterm::event;
+            let mut typed = String::new();
+            let mut queue: Vec<String> = Vec::new();
+            // Show the typed text in the prompt bar without disturbing the
+            // output being streamed above it: hold the terminal for the whole
+            // redraw and put the cursor back afterwards.
+            let show = |typed: &str, queued: usize| {
+                let text = if queued > 0 {
+                    format!("(+{queued} queued) {typed}")
+                } else {
+                    typed.to_string()
+                };
+                let _guard = std::io::stdout().lock();
+                let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::SavePosition);
+                let _ = draw_prompt_bar(
+                    &text,
+                    bar_agent,
+                    bar_provider,
+                    &bar_model,
+                    bar_tokens,
+                    bar_window,
+                    &theme,
+                );
+                let _ = crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::cursor::RestorePosition,
+                    crossterm::cursor::Hide
+                );
+            };
             loop {
                 if streaming_done2.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
@@ -1180,6 +1790,36 @@ pub async fn run_interactive(
                             cancel_for_listener.store(true, std::sync::atomic::Ordering::Relaxed);
                             let _ = esc_tx.send(());
                             break;
+                        }
+                        Ok(crossterm::event::Event::Key(k))
+                            if k.kind != crossterm::event::KeyEventKind::Release =>
+                        {
+                            use crossterm::event::{KeyCode, KeyModifiers};
+                            let plain = !k
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+                            match k.code {
+                                KeyCode::Char('b')
+                                    if k.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    if let Some(flag) = &background {
+                                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                                KeyCode::Char(c) if plain => {
+                                    typed.push(c);
+                                    show(&typed, queue.len());
+                                }
+                                KeyCode::Backspace => {
+                                    typed.pop();
+                                    show(&typed, queue.len());
+                                }
+                                KeyCode::Enter if !typed.trim().is_empty() => {
+                                    queue.push(std::mem::take(&mut typed));
+                                    show(&typed, queue.len());
+                                }
+                                _ => {}
+                            }
                         }
                         Ok(crossterm::event::Event::Mouse(m)) => {
                             let cur = stream_scroll2.load(std::sync::atomic::Ordering::Relaxed);
@@ -1212,6 +1852,7 @@ pub async fn run_interactive(
                     }
                 }
             }
+            (queue, typed)
         });
 
         tokio::select! {
@@ -1233,7 +1874,13 @@ pub async fn run_interactive(
             _ = esc_rx => {}
         }
         streaming_done.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = key_listener.await;
+        if let Ok((queued, unfinished)) = key_listener.await {
+            // Cancelling (Esc) drops what was queued; otherwise it goes next.
+            if !cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                pending_inputs.extend(queued);
+            }
+            seed = unfinished;
+        }
 
         // Approving a plan switches modes inside the agent; follow it.
         status::sync_from_agent(&agent);
@@ -1278,6 +1925,75 @@ pub async fn run_interactive(
     agent.end_session("exit").await;
     exit_tui()?;
     Ok(())
+}
+
+/// The `/status` report.
+async fn status_report(
+    agent: &io_runtime::Agent,
+    current_agent: &io_agents::AgentConfig,
+    root: &std::path::Path,
+) -> Vec<String> {
+    let settings = io_runtime::settings::Settings::load(root);
+    let config = io_runtime::config::Config::load().ok();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
+    let home = dirs::home_dir();
+    let styles = io_runtime::output_style::discover(root, home.as_deref());
+    let style = settings
+        .output_style
+        .clone()
+        .filter(|n| styles.iter().any(|s| &s.name == n))
+        .unwrap_or_else(|| "default".to_string());
+    let session = agent.session_snapshot().await;
+    let mcp = mcp_cmd::manager();
+    let thinking = agent.thinking();
+    let sandbox = if settings.sandbox.enabled {
+        if settings.sandbox.network {
+            "on (network allowed)"
+        } else {
+            "on (no network)"
+        }
+    } else {
+        "off"
+    };
+    let count = |list| settings.rules_in(list).len();
+    info_cmd::status_lines(&info_cmd::Status {
+        version: env!("CARGO_PKG_VERSION"),
+        cwd: &cwd.display().to_string(),
+        project_root: &root.display().to_string(),
+        session_id: &session.id.to_string()[..8],
+        session_name: session.metadata.name.as_deref(),
+        turns: session.turns.len(),
+        provider: agent.provider_id,
+        model: &agent.model_id,
+        agent: current_agent.id,
+        mode: agent.interaction_mode().label(),
+        permissions: config
+            .as_ref()
+            .map(|c| c.permissions.default.as_str())
+            .unwrap_or("?"),
+        thinking: &if thinking.enabled {
+            format!("on ({} tokens)", thinking.budget_tokens)
+        } else {
+            "off".to_string()
+        },
+        output_style: &style,
+        settings_files: settings
+            .files
+            .iter()
+            .map(|(scope, _)| scope.label().to_string())
+            .collect(),
+        rule_counts: (
+            count(io_runtime::settings::RuleList::Allow),
+            count(io_runtime::settings::RuleList::Ask),
+            count(io_runtime::settings::RuleList::Deny),
+        ),
+        mcp: (mcp.states().len(), mcp.tool_count()),
+        sandbox,
+        memory_files: io_runtime::instructions::discover(root, &cwd, home.as_deref())
+            .into_iter()
+            .map(|f| f.label)
+            .collect(),
+    })
 }
 
 /// Show `lines` as a block just above the prompt bar (used by /help, /mcp).

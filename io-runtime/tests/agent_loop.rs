@@ -1996,3 +1996,85 @@ async fn session_end_hooks_run_when_the_session_is_ended() {
     assert_eq!(payload["reason"], "exit");
     std::fs::remove_file(&marker).ok();
 }
+
+// ── Memory ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn nested_memory_files_surface_once_when_a_file_below_them_is_read() {
+    let root = std::env::temp_dir().join(format!("io-test-nested-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/CLAUDE.md"), "Always use snake_case here.").unwrap();
+    std::fs::write(root.join("src/a.rs"), "fn a() {}").unwrap();
+    std::fs::write(root.join("src/b.rs"), "fn b() {}").unwrap();
+    let read = |name: &str| serde_json::json!({"file_path": root.join("src").join(name).to_str().unwrap()});
+
+    let provider = MockProvider::new(vec![
+        tool_response("read", read("a.rs")),
+        tool_response("read", read("b.rs")),
+        text_response("done"),
+    ]);
+    let agent = make_agent(provider.clone(), PermissionChecker::new("allow"))
+        .with_nested_memory(root.clone(), Default::default());
+    agent.run_turn("look around").await.unwrap();
+
+    let requests = provider.recorded_requests();
+    let (first, _) = last_tool_result(&requests[1]);
+    assert!(
+        first.contains("<nested-instructions file=\"src/CLAUDE.md\">"),
+        "{first}"
+    );
+    assert!(first.contains("Always use snake_case here."));
+    let (second, _) = last_tool_result(&requests[2]);
+    assert!(
+        !second.contains("nested-instructions"),
+        "only surfaced once: {second}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ── Turn cap and session management ───────────────────────────────────────────
+
+#[tokio::test]
+async fn the_iteration_cap_stops_a_turn_and_says_so() {
+    let provider = MockProvider::new(vec![
+        tool_response("glob", serde_json::json!({"pattern": "*.nothing"})),
+        tool_response("glob", serde_json::json!({"pattern": "*.nothing"})),
+        tool_response("glob", serde_json::json!({"pattern": "*.nothing"})),
+        text_response("never reached"),
+    ]);
+    let agent =
+        make_agent(provider.clone(), PermissionChecker::new("allow")).with_max_iterations(2);
+    agent.run_turn("keep going").await.unwrap();
+    assert_eq!(provider.recorded_requests().len(), 2);
+    assert!(agent.hit_iteration_limit());
+
+    // A normal turn afterwards clears the flag.
+    let provider = MockProvider::new(vec![text_response("fine")]);
+    let agent = make_agent(provider, PermissionChecker::new("allow")).with_max_iterations(2);
+    agent.run_turn("hi").await.unwrap();
+    assert!(!agent.hit_iteration_limit());
+}
+
+#[tokio::test]
+async fn sessions_can_be_renamed_and_forked() {
+    let db = temp_path("io-test-fork", ".db");
+    let provider = MockProvider::new(vec![text_response("one"), text_response("two")]);
+    let agent = make_agent_at(provider, PermissionChecker::new("allow"), db.clone(), None);
+    agent.run_turn("first").await.unwrap();
+    agent.rename_session("  my work ").await.unwrap();
+
+    let original = agent.session_id().await;
+    let copy = agent.fork_session().await.unwrap();
+    assert_ne!(original, copy);
+
+    let store = SessionStore::with_path(db).unwrap();
+    let forked = store.load_session(copy).unwrap();
+    assert_eq!(forked.metadata.name.as_deref(), Some("my work (fork)"));
+    assert_eq!(forked.turns.len(), 1);
+    let kept = store.load_session(original).unwrap();
+    assert_eq!(kept.metadata.name.as_deref(), Some("my work"));
+
+    // Clearing the name works too.
+    agent.rename_session("").await.unwrap();
+    assert!(agent.session_snapshot().await.metadata.name.is_none());
+}

@@ -100,6 +100,40 @@ pub struct Agent {
     hooks: Hooks,
     /// Extended-thinking settings, adjustable mid-session (`/think`).
     thinking: Mutex<ThinkingConfig>,
+    /// Project root and the memory files already in context, so memory files
+    /// in subdirectories can be surfaced the first time a file there is used.
+    nested_memory: Mutex<
+        Option<(
+            std::path::PathBuf,
+            std::collections::HashSet<std::path::PathBuf>,
+        )>,
+    >,
+    /// Most model calls in one turn (`--max-turns`); 0 means the default.
+    max_iterations: std::sync::atomic::AtomicUsize,
+    /// Whether the last turn stopped because it ran out of iterations.
+    hit_iteration_limit: AtomicBool,
+}
+
+/// Rough size of what each part of the next request costs, in characters
+/// (about four per token). For `/context`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContextBreakdown {
+    pub system_prompt: usize,
+    pub memory_files: usize,
+    pub tool_definitions: usize,
+    pub summary: usize,
+    pub history: usize,
+}
+
+impl ContextBreakdown {
+    pub fn total_chars(&self) -> usize {
+        self.system_prompt + self.memory_files + self.tool_definitions + self.summary + self.history
+    }
+
+    /// The usual rough conversion; good enough to see what is taking the room.
+    pub fn tokens(chars: usize) -> usize {
+        chars.div_ceil(4)
+    }
 }
 
 /// Appended to the system prompt while plan mode is active.
@@ -157,7 +191,107 @@ impl Agent {
             pricing_override,
             hooks: Hooks::default(),
             thinking: Mutex::new(ThinkingConfig::default()),
+            nested_memory: Mutex::new(None),
+            max_iterations: std::sync::atomic::AtomicUsize::new(0),
+            hit_iteration_limit: AtomicBool::new(false),
         }
+    }
+
+    /// Cap the number of model calls per turn (default 20).
+    pub fn with_max_iterations(self, n: usize) -> Self {
+        self.max_iterations.store(n, Ordering::Relaxed);
+        self
+    }
+
+    /// Whether the most recent turn was cut short by the iteration cap.
+    pub fn hit_iteration_limit(&self) -> bool {
+        self.hit_iteration_limit.load(Ordering::Relaxed)
+    }
+
+    /// How much of the context each part of the conversation takes.
+    pub async fn context_breakdown(&self) -> ContextBreakdown {
+        let tool_definitions = self
+            .tools
+            .specs()
+            .iter()
+            .map(|t| t.name.len() + t.description.len() + t.input_schema.to_string().len())
+            .sum();
+        let session = self.session.lock().await;
+        ContextBreakdown {
+            system_prompt: self.system_prompt.len(),
+            memory_files: self.project_context.as_deref().map(str::len).unwrap_or(0),
+            tool_definitions,
+            summary: session.summary.as_deref().map(str::len).unwrap_or(0),
+            history: session
+                .turns
+                .iter()
+                .map(|t| {
+                    t.user_message.len() + t.assistant_message.as_deref().map(str::len).unwrap_or(0)
+                })
+                .sum(),
+        }
+    }
+
+    /// A flag that, once set, moves a running foreground `bash` command to a
+    /// background job (Ctrl+B in the REPL).
+    pub fn background_handle(&self) -> Option<Arc<AtomicBool>> {
+        self.tools.background_handle()
+    }
+
+    /// A copy of the current session (for export).
+    pub async fn session_snapshot(&self) -> Session {
+        self.session.lock().await.clone()
+    }
+
+    /// Name the current session (shown in `/resume` and `io session list`).
+    pub async fn rename_session(&self, name: &str) -> anyhow::Result<()> {
+        let snapshot = {
+            let mut s = self.session.lock().await;
+            let name = name.trim();
+            s.metadata.name = (!name.is_empty()).then(|| name.to_string());
+            s.clone()
+        };
+        self.memory.save_session(&snapshot).await
+    }
+
+    /// Copy the current session under a new id and return it, leaving this
+    /// one untouched, so the conversation can branch.
+    pub async fn fork_session(&self) -> anyhow::Result<SessionId> {
+        let mut copy = self.session.lock().await.clone();
+        copy.id = SessionId::new();
+        copy.updated_at = chrono::Utc::now();
+        copy.metadata.name = copy.metadata.name.as_ref().map(|n| format!("{n} (fork)"));
+        self.memory.save_session(&copy).await?;
+        Ok(copy.id)
+    }
+
+    /// Surface `CLAUDE.md` / `AGENTS.md` files in subdirectories of `root` the
+    /// first time a tool touches a file below them. `loaded` holds the memory
+    /// files already in the context (see [`crate::instructions::loaded_set`]).
+    pub fn with_nested_memory(
+        self,
+        root: std::path::PathBuf,
+        loaded: std::collections::HashSet<std::path::PathBuf>,
+    ) -> Self {
+        *self.nested_memory.lock().unwrap() = Some((root, loaded));
+        self
+    }
+
+    /// Instructions from not-yet-loaded memory files covering `input`'s path.
+    fn nested_memory_for(&self, input: &serde_json::Value) -> String {
+        let Some(path) = input
+            .get("path")
+            .or_else(|| input.get("file_path"))
+            .and_then(|v| v.as_str())
+        else {
+            return String::new();
+        };
+        let mut guard = self.nested_memory.lock().unwrap();
+        let Some((root, loaded)) = guard.as_mut() else {
+            return String::new();
+        };
+        let found = crate::instructions::nested_for(root, std::path::Path::new(path), loaded);
+        crate::instructions::render_nested(&found)
     }
 
     /// Attach lifecycle hooks (see [`crate::hooks`]).
@@ -391,14 +525,21 @@ impl Agent {
         // A provider failure mid-turn. Set instead of returning immediately so
         // partial progress (text, executed tools) is still saved to the session.
         let mut turn_error: Option<anyhow::Error> = None;
-        const MAX_ITERATIONS: usize = 20;
+        const DEFAULT_MAX_ITERATIONS: usize = 20;
+        let max_iterations = match self.max_iterations.load(Ordering::Relaxed) {
+            0 => DEFAULT_MAX_ITERATIONS,
+            n => n,
+        };
+        // Cleared by the two ways a turn ends on its own; still set after the
+        // loop means the cap cut it short.
+        let mut exhausted = true;
         // Track files written during this turn to detect write-then-execute sequences.
         let mut written_this_turn: Vec<String> = Vec::new();
 
         // Propagate cancellation to tools (e.g. spawn_agent)
         self.tools.set_cancel(self.cancel.lock().unwrap().clone());
 
-        for _ in 0..MAX_ITERATIONS {
+        for _ in 0..max_iterations {
             if self.cancel.lock().unwrap().load(Ordering::Relaxed) {
                 return Err(Cancelled.into());
             }
@@ -569,10 +710,12 @@ impl Agent {
             // A stream that died mid-response: keep the partial text but do
             // not execute any tool calls parsed from a truncated stream.
             if turn_error.is_some() {
+                exhausted = false;
                 break;
             }
 
             if iter_tool_uses.is_empty() {
+                exhausted = false;
                 break;
             }
 
@@ -643,6 +786,8 @@ impl Agent {
                 content: tool_results,
             });
         }
+
+        self.hit_iteration_limit.store(exhausted, Ordering::Relaxed);
 
         // A failure before anything was produced: fail the turn outright
         // rather than persisting an empty record.
@@ -891,6 +1036,14 @@ impl Agent {
                         data: i.data,
                     }));
                 let mut output = run.output;
+                if run.success
+                    && matches!(
+                        g.name.as_str(),
+                        "read" | "write" | "edit" | "multi_edit" | "notebook_edit"
+                    )
+                {
+                    output.push_str(&self.nested_memory_for(&g.input));
+                }
                 // post_tool_use feedback (formatter/linter output, etc.) is
                 // appended to what the model sees.
                 let feedback = self

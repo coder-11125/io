@@ -6,12 +6,40 @@ use io_runtime::config::{Config, ThinkingConfig};
 use io_runtime::{Agent, InteractionMode};
 use std::sync::Mutex;
 
+static VIM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the prompt uses Vim-style editing (`/vim`, `editorMode` in settings).
+pub fn vim_enabled() -> bool {
+    VIM.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn set_vim_enabled(on: bool) {
+    VIM.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Show (or with `None` clear) the Vim mode next to the working-mode badge.
+pub fn set_vim_label(agent: &Agent, label: Option<&str>) {
+    let base = badge_text(agent.interaction_mode(), &agent.thinking());
+    let text = match (label, base.is_empty()) {
+        (Some(l), true) => l.to_string(),
+        (Some(l), false) => format!("{base} · {l}"),
+        (None, _) => base,
+    };
+    io_tui::render::set_status_badge(&text);
+}
+
 /// The mode a freshly built agent starts in. Agents are rebuilt on every
 /// provider/model/agent switch, so the mode lives here rather than on them.
 static MODE: Mutex<InteractionMode> = Mutex::new(InteractionMode::Default);
 
 pub fn current_mode() -> InteractionMode {
     *MODE.lock().unwrap()
+}
+
+/// Start in `mode` (from `permissions.defaultMode` or `--permission-mode`).
+/// Only meaningful before the first agent is built.
+pub fn set_initial_mode(mode: InteractionMode) {
+    *MODE.lock().unwrap() = mode;
 }
 
 /// The status-row text for a mode and thinking setting, e.g.

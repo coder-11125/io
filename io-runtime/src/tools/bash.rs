@@ -93,6 +93,10 @@ impl BashJobManager {
 pub struct BashTool {
     jobs: Arc<BashJobManager>,
     cancel: StdMutex<Arc<AtomicBool>>,
+    /// Run commands inside an OS sandbox (see [`crate::os_sandbox`]).
+    sandbox: Option<crate::os_sandbox::SandboxPolicy>,
+    /// Set by the UI (Ctrl+B) to move the foreground command to a background job.
+    background: Arc<AtomicBool>,
 }
 
 impl BashTool {
@@ -100,7 +104,16 @@ impl BashTool {
         Self {
             jobs: Arc::new(BashJobManager::new()),
             cancel: StdMutex::new(Arc::new(AtomicBool::new(false))),
+            sandbox: None,
+            background: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Confine every command to `policy`. If no sandbox backend is available
+    /// commands fail rather than run unconfined.
+    pub fn with_sandbox(mut self, policy: crate::os_sandbox::SandboxPolicy) -> Self {
+        self.sandbox = Some(policy);
+        self
     }
 
     fn shell() -> String {
@@ -129,7 +142,7 @@ impl BashTool {
         workdir: &str,
         timeout_ms: Option<u64>,
     ) -> CommandOutput {
-        let mut child = match spawn_child(shell, command, workdir) {
+        let mut child = match spawn_child(shell, command, workdir, self.sandbox.as_ref()) {
             Ok(c) => c,
             Err(e) => return CommandOutput::failed(format!("failed to spawn command: {e}")),
         };
@@ -165,6 +178,7 @@ impl BashTool {
                         status: success,
                         timed_out: false,
                         cancelled: false,
+                        backgrounded: None,
                     };
                 }
                 _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if deadline.is_some() => {
@@ -181,6 +195,42 @@ impl BashTool {
                             let _ = t.await;
                         }
                         break CommandOutput::failed("").cancelled();
+                    }
+                    // Ctrl+B: keep the command running as a background job.
+                    if self.background.swap(false, Ordering::Relaxed) {
+                        let so_far_out = String::from_utf8_lossy(&out_buf.lock().await).to_string();
+                        let so_far_err = String::from_utf8_lossy(&err_buf.lock().await).to_string();
+                        let status = Arc::new(StdMutex::new(JobStatus::Running));
+                        let waiter = spawn_waiter(
+                            wait_rx,
+                            wait_task.take(),
+                            pgid,
+                            None,
+                            cancel.clone(),
+                            status.clone(),
+                        );
+                        let id = format!("job-{}", self.jobs.next_id.fetch_add(1, Ordering::Relaxed));
+                        let job = BashJob {
+                            id: id.clone(),
+                            command: command.to_string(),
+                            started: Instant::now(),
+                            pgid,
+                            status,
+                            stdout: out_buf,
+                            stderr: err_buf,
+                            readers: StdMutex::new(Some((out_h, err_h))),
+                            waiter: StdMutex::new(Some(waiter)),
+                        };
+                        self.jobs.jobs.lock().unwrap().insert(id.clone(), Arc::new(job));
+                        return CommandOutput {
+                            stdout: so_far_out,
+                            stderr: so_far_err,
+                            exit_code: 0,
+                            status: true,
+                            timed_out: false,
+                            cancelled: false,
+                            backgrounded: Some(id),
+                        };
                     }
                 }
             }
@@ -211,58 +261,25 @@ impl BashTool {
         workdir: &str,
         timeout_ms: Option<u64>,
     ) -> Result<String, String> {
-        let mut child = spawn_child(shell, command, workdir)
+        let mut child = spawn_child(shell, command, workdir, self.sandbox.as_ref())
             .map_err(|e| format!("failed to spawn command: {e}"))?;
         let pgid = child.id();
         let (out_buf, err_buf, out_h, err_h) = start_pumps(&mut child);
         let status = Arc::new(StdMutex::new(JobStatus::Running));
         let status_w = status.clone();
         let cancel = self.cancel.lock().unwrap().clone();
-        let mut cancel_poll = tokio::time::interval(Duration::from_millis(CANCEL_POLL_MS));
         let deadline = timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
 
         // Same wait-task pattern as run_foreground: child.wait() lives in its
         // own task so the kill paths never fight for the child borrow.
-        let (wait_tx, mut wait_rx) = tokio::sync::oneshot::channel();
+        let (wait_tx, wait_rx) = tokio::sync::oneshot::channel();
         let wait_task = tokio::spawn(async move {
             let st = child.wait().await;
             let _ = wait_tx.send(st);
         });
         let mut wait_task = Some(wait_task);
 
-        let waiter = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    res = &mut wait_rx => {
-                        let status = res.ok().and_then(|r| r.ok());
-                        let code = status.as_ref().and_then(|s| s.code());
-                        if let Some(t) = wait_task.take() {
-                            let _ = t.await;
-                        }
-                        *status_w.lock().unwrap() = JobStatus::Exited { code };
-                        break;
-                    }
-                    _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if deadline.is_some() => {
-                        kill_process_group(pgid);
-                        if let Some(t) = wait_task.take() {
-                            let _ = t.await;
-                        }
-                        *status_w.lock().unwrap() = JobStatus::TimedOut;
-                        break;
-                    }
-                    _ = cancel_poll.tick() => {
-                        if cancel.load(Ordering::Relaxed) {
-                            kill_process_group(pgid);
-                            if let Some(t) = wait_task.take() {
-                                let _ = t.await;
-                            }
-                            *status_w.lock().unwrap() = JobStatus::Cancelled;
-                            break;
-                        }
-                    }
-                }
-            }
-        });
+        let waiter = spawn_waiter(wait_rx, wait_task.take(), pgid, deadline, cancel, status_w);
 
         let id = format!("job-{}", self.jobs.next_id.fetch_add(1, Ordering::Relaxed));
         let job = BashJob {
@@ -407,6 +424,10 @@ impl Tool for BashTool {
         *self.cancel.lock().unwrap() = cancel;
     }
 
+    fn background_handle(&self) -> Option<Arc<AtomicBool>> {
+        Some(self.background.clone())
+    }
+
     async fn execute(&self, input: ToolInput) -> ToolOutput {
         let action = input
             .args
@@ -507,6 +528,8 @@ struct CommandOutput {
     status: bool,
     timed_out: bool,
     cancelled: bool,
+    /// Set when the command was moved to a background job (its id).
+    backgrounded: Option<String>,
 }
 
 impl CommandOutput {
@@ -518,6 +541,7 @@ impl CommandOutput {
             status: false,
             timed_out: false,
             cancelled: false,
+            backgrounded: None,
         }
     }
 
@@ -547,6 +571,15 @@ impl CommandOutput {
         if text.len() > MAX_OUTPUT_BYTES {
             text.truncate(MAX_OUTPUT_BYTES);
             text.push_str("\n[output truncated]");
+        }
+        if let Some(id) = &self.backgrounded {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!(
+                "[moved to background as {id}; it keeps running — use action=output or status with job_id={id}]"
+            ));
+            return ToolOutput::ok(text);
         }
         if self.timed_out {
             if !text.is_empty() {
@@ -580,17 +613,80 @@ impl CommandOutput {
 /// 60 s CPU, 200 MB file size) prepended, piped stdio, and — on Unix — the
 /// child in its own process group so a timeout/cancel can kill the whole
 /// tree, not just the direct shell.
-fn spawn_child(shell: &str, command: &str, workdir: &str) -> std::io::Result<Child> {
+fn spawn_child(
+    shell: &str,
+    command: &str,
+    workdir: &str,
+    sandbox: Option<&crate::os_sandbox::SandboxPolicy>,
+) -> std::io::Result<Child> {
     let guarded = format!("ulimit -v 524288 -t 60 -f 204800 2>/dev/null; {command}");
-    let mut cmd = tokio::process::Command::new(shell);
-    cmd.arg("-c")
-        .arg(&guarded)
-        .current_dir(workdir)
+    let mut cmd = match sandbox {
+        None => {
+            let mut cmd = tokio::process::Command::new(shell);
+            cmd.arg("-c").arg(&guarded);
+            cmd
+        }
+        Some(policy) => {
+            let backend = crate::os_sandbox::find_backend().map_err(std::io::Error::other)?;
+            let (program, args) =
+                crate::os_sandbox::command_line(&backend, policy, shell, &guarded, workdir);
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.args(args);
+            cmd
+        }
+    };
+    cmd.current_dir(workdir)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
     cmd.process_group(0);
     cmd.spawn()
+}
+
+/// The task that watches a background job: it records how the job ends
+/// (exit, timeout or cancellation) and kills the process group on the latter two.
+fn spawn_waiter(
+    mut wait_rx: tokio::sync::oneshot::Receiver<std::io::Result<std::process::ExitStatus>>,
+    mut wait_task: Option<JoinHandle<()>>,
+    pgid: Option<u32>,
+    deadline: Option<tokio::time::Instant>,
+    cancel: Arc<AtomicBool>,
+    status: Arc<StdMutex<JobStatus>>,
+) -> JoinHandle<()> {
+    let mut cancel_poll = tokio::time::interval(Duration::from_millis(CANCEL_POLL_MS));
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                res = &mut wait_rx => {
+                    let exit = res.ok().and_then(|r| r.ok());
+                    let code = exit.as_ref().and_then(|s| s.code());
+                    if let Some(t) = wait_task.take() {
+                        let _ = t.await;
+                    }
+                    *status.lock().unwrap() = JobStatus::Exited { code };
+                    break;
+                }
+                _ = async { tokio::time::sleep_until(deadline.unwrap()).await }, if deadline.is_some() => {
+                    kill_process_group(pgid);
+                    if let Some(t) = wait_task.take() {
+                        let _ = t.await;
+                    }
+                    *status.lock().unwrap() = JobStatus::TimedOut;
+                    break;
+                }
+                _ = cancel_poll.tick() => {
+                    if cancel.load(Ordering::Relaxed) {
+                        kill_process_group(pgid);
+                        if let Some(t) = wait_task.take() {
+                            let _ = t.await;
+                        }
+                        *status.lock().unwrap() = JobStatus::Cancelled;
+                        break;
+                    }
+                }
+            }
+        }
+    })
 }
 
 /// Kill the whole process group of `pgid` (the direct child was spawned with
@@ -663,6 +759,77 @@ mod tests {
 
     fn tool() -> BashTool {
         BashTool::new()
+    }
+
+    #[tokio::test]
+    async fn a_running_command_can_be_moved_to_the_background() {
+        let tool = std::sync::Arc::new(tool());
+        let flag = tool
+            .background_handle()
+            .expect("bash supports backgrounding");
+        let runner = tool.clone();
+        let run = tokio::spawn(async move {
+            runner
+                .execute(input(serde_json::json!({
+                    "command": "echo started; sleep 1; echo finished",
+                    "timeout": 20000
+                })))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        flag.store(true, Ordering::Relaxed);
+        let out = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("returns promptly instead of waiting for the command")
+            .unwrap();
+        assert!(out.success, "{}", out.data);
+        assert!(out.data.contains("started"), "{}", out.data);
+        assert!(
+            out.data.contains("moved to background as job-"),
+            "{}",
+            out.data
+        );
+        assert!(!out.data.contains("finished"));
+
+        // The job carries on and can be followed with the normal job actions.
+        let job_id = out
+            .data
+            .split("job_id=")
+            .nth(1)
+            .and_then(|r| r.split(|c: char| !c.is_alphanumeric() && c != '-').next())
+            .unwrap()
+            .to_string();
+        let status = wait_status(&tool, &job_id, "exited").await;
+        assert!(status.contains("exited"), "{status}");
+        let output = tool
+            .execute(input(
+                serde_json::json!({"action": "output", "job_id": job_id}),
+            ))
+            .await;
+        assert!(output.data.contains("finished"), "{}", output.data);
+    }
+
+    #[tokio::test]
+    async fn a_sandboxed_bash_never_runs_unconfined() {
+        let policy = crate::os_sandbox::SandboxPolicy::new(std::env::temp_dir(), false, vec![]);
+        let marker = std::env::temp_dir().join(format!("io_sbx_marker_{}", std::process::id()));
+        let out = BashTool::new()
+            .with_sandbox(policy)
+            .execute(input(serde_json::json!({
+                "command": format!("touch '{}'", marker.display())
+            })))
+            .await;
+        match crate::os_sandbox::find_backend() {
+            // No backend: fail closed, and nothing ran.
+            Err(_) => {
+                assert!(!out.success, "{}", out.data);
+                assert!(!marker.exists());
+            }
+            // A backend that works here lets the write through (the temp dir
+            // is the sandbox root); one that cannot start reports a failure.
+            Ok(_) => assert_eq!(out.success, marker.exists(), "{}", out.data),
+        }
+        std::fs::remove_file(&marker).ok();
     }
 
     async fn wait_status(tool: &BashTool, id: &str, expect: &str) -> String {

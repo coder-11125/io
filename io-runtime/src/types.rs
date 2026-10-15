@@ -50,6 +50,9 @@ pub struct SessionMetadata {
     pub project_root: Option<String>,
     pub model: String,
     pub provider: String,
+    /// A name given with `/rename`, shown in `/resume` and `io session list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +152,7 @@ impl Session {
                 project_root: None,
                 model,
                 provider,
+                name: None,
             },
             summary: None,
         }

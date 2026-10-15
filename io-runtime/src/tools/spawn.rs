@@ -35,6 +35,8 @@ pub struct SpawnAgentTool {
     cancel: Mutex<Arc<AtomicBool>>,
     /// Tool hooks inherited by spawned sub-agents (see [`Hooks::for_sub_agent`]).
     hooks: Hooks,
+    /// OS sandbox for sub-agents' `bash`, matching the parent's.
+    sandbox: Option<crate::os_sandbox::SandboxPolicy>,
 }
 
 impl SpawnAgentTool {
@@ -73,7 +75,14 @@ impl SpawnAgentTool {
             project_context,
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             hooks: Hooks::default(),
+            sandbox: None,
         }
+    }
+
+    /// Run sub-agents' `bash` inside the same OS sandbox as the parent's.
+    pub fn with_sandbox(mut self, policy: Option<crate::os_sandbox::SandboxPolicy>) -> Self {
+        self.sandbox = policy;
+        self
     }
 
     /// Give spawned sub-agents the parent's tool hooks, so a `pre_tool_use`
@@ -149,13 +158,20 @@ impl Tool for SpawnAgentTool {
             ));
         }
 
-        let tools = match &config.tool_access {
+        let mut tools = match &config.tool_access {
             ToolAccess::Only(names) => {
                 let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
                 filtered_registry(&name_refs)
             }
             ToolAccess::All => unreachable!(),
         };
+        if let Some(policy) = &self.sandbox {
+            if tools.get("bash").is_some() {
+                tools.register(Box::new(
+                    crate::tools::BashTool::new().with_sandbox(policy.clone()),
+                ));
+            }
+        }
 
         if self.cancel.lock().unwrap().load(Ordering::Relaxed) {
             return ToolOutput::err("cancelled");
