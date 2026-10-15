@@ -306,6 +306,18 @@ pub fn draw_file_popup(
     Ok(count as u16)
 }
 
+/// First visible match when `rows` of `total` fit and `selected` is highlighted:
+/// the window follows the selection, which stays on the last row while it
+/// scrolls down and on the first row when it scrolls back up to the top.
+pub fn slash_window_start(total: usize, rows: usize, selected: Option<usize>) -> usize {
+    let selected = selected.unwrap_or(0).min(total.saturating_sub(1));
+    if selected >= rows {
+        selected + 1 - rows
+    } else {
+        0
+    }
+}
+
 /// Draw a bordered slash-command picker.
 ///
 /// `splash_pos` — when `Some((col, top_row, box_w))` the popup is drawn below
@@ -369,10 +381,11 @@ pub fn draw_slash_popup(
         ResetColor,
     )?;
 
-    for (i, &idx) in matches[..n].iter().enumerate() {
+    let start = slash_window_start(matches.len(), n, selected);
+    for (i, &idx) in matches[start..start + n].iter().enumerate() {
         let row = top_row + 1 + i as u16;
         let (name, desc) = SLASH_COMMANDS[idx];
-        let is_sel = selected == Some(i);
+        let is_sel = selected == Some(start + i);
         let indicator = if is_sel { "▶" } else { " " };
         let pad = " ".repeat(name_w - name.len() + 2);
         let content = format!("{indicator} {name}{pad}{desc}");
@@ -416,11 +429,22 @@ pub fn draw_slash_popup(
         )?;
     }
 
+    // With more matches than rows, say where the selection is in the list.
+    let position = if matches.len() > n {
+        let at = selected.map_or(start + 1, |s| s + 1);
+        let label = format!(" {at}/{} ", matches.len());
+        format!(
+            "{}{label}─",
+            "─".repeat(inner_w.saturating_sub(label.len() + 1))
+        )
+    } else {
+        "─".repeat(inner_w)
+    };
     execute!(
         std::io::stdout(),
         cursor::MoveTo(col, top_row + n as u16 + 1),
         SetForegroundColor(Color::DarkGrey),
-        Print(format!("╰{}╯", "─".repeat(inner_w))),
+        Print(format!("╰{position}╯")),
         ResetColor,
     )?;
 
@@ -1819,6 +1843,20 @@ mod tests {
         // An email address is not a mention.
         let (text, _) = resolve_at_mentions_with_images("write to me@example.com");
         assert_eq!(text, "write to me@example.com");
+    }
+
+    #[test]
+    fn the_slash_popup_window_follows_the_selection() {
+        // Everything fits, or nothing is selected: start at the top.
+        assert_eq!(slash_window_start(5, 10, Some(4)), 0);
+        assert_eq!(slash_window_start(40, 10, None), 0);
+        // Within the first screenful the window stays put.
+        assert_eq!(slash_window_start(40, 10, Some(9)), 0);
+        // Past it, the selection stays on the last visible row.
+        assert_eq!(slash_window_start(40, 10, Some(10)), 1);
+        assert_eq!(slash_window_start(40, 10, Some(39)), 30);
+        // Wrapping to the end shows the last screenful; a stale index clamps.
+        assert_eq!(slash_window_start(40, 10, Some(99)), 30);
     }
 
     #[test]
